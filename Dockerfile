@@ -61,6 +61,7 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 WORKDIR /app
-EXPOSE 8000
+# 8000 = BentoML service, 8001 = lightweight health server for RunPod /ping
+EXPOSE 8000 8001
 
 CMD ["/app/start.sh"]
