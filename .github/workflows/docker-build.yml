@@ -29,15 +29,16 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:${{ github.sha }}
           build-args: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           provenance: false
           sbom: false
           no-cache: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:${{ github.sha }}
+          outputs: |
+            type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/ltx-video,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true
