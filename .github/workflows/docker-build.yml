@@ -54,28 +54,33 @@ jobs:
           set -euo pipefail
           echo "Updating RunPod template ${RUNPOD_TEMPLATE_ID} -> ${NEW_IMAGE}"
 
-          # RunPod GraphQL saveTemplate mutation. We only change imageName;
-          # all other template fields are preserved server-side because
-          # saveTemplate accepts partial input keyed on the existing id.
-          payload=$(jq -nc \
-            --arg id "${RUNPOD_TEMPLATE_ID}" \
-            --arg img "${NEW_IMAGE}" \
-            '{query: "mutation($input: SaveTemplateInput!) { saveTemplate(input: $input) { id imageName } }",
-              variables: {input: {id: $id, imageName: $img}}}')
+          # RunPod REST API: PATCH /v1/templates/<id> accepts partial
+          # updates. Unlike the legacy GraphQL saveTemplate mutation,
+          # which demands every required field (containerDiskInGb,
+          # dockerArgs, env, name, volumeInGb) on every call, the REST
+          # endpoint merges the given fields server-side. This is the
+          # same endpoint runpodctl template update uses internally
+          # (source: runpod/runpodctl v2.1.9 internal/api/templates.go,
+          # UpdateTemplate -> c.Patch("/templates/"+id, req)).
+          payload=$(jq -nc --arg img "${NEW_IMAGE}" '{imageName: $img}')
 
-          response=$(curl -sS -X POST https://api.runpod.io/graphql \
-            -H "Content-Type: application/json" \
+          http_status=$(curl -sS -o /tmp/rp-resp.json -w '%{http_code}' \
+            -X PATCH "https://rest.runpod.io/v1/templates/${RUNPOD_TEMPLATE_ID}" \
             -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+            -H "Content-Type: application/json" \
             -d "$payload")
 
-          echo "RunPod response: $response"
+          echo "HTTP status: $http_status"
+          echo "Response body:"
+          cat /tmp/rp-resp.json || true
+          echo
 
-          if echo "$response" | jq -e '.errors' >/dev/null; then
-            echo "RunPod API returned errors; failing the step." >&2
+          if [ "$http_status" != "200" ]; then
+            echo "RunPod REST API returned non-200 status ($http_status); failing the step." >&2
             exit 1
           fi
 
-          returned=$(echo "$response" | jq -r '.data.saveTemplate.imageName')
+          returned=$(jq -r '.imageName // empty' /tmp/rp-resp.json)
           if [ "$returned" != "${NEW_IMAGE}" ]; then
             echo "RunPod returned unexpected imageName: '$returned' (wanted '${NEW_IMAGE}')" >&2
             exit 1
