@@ -29,12 +29,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---- Install download tool (lightweight, for model baking) ------------------
 RUN uv pip install --system --no-cache "huggingface-hub[hf_xet]"
 
-# ---- Baked-in models (stable layers — placed before code for cache efficiency)
-# LTX-2.3 models: BF16 checkpoint (~46 GB), distilled LoRA (~7.6 GB), upscaler (~1 GB)
-RUN hf download Lightricks/LTX-2.3 \
-        ltx-2.3-22b-dev.safetensors \
-        ltx-2.3-22b-distilled-lora-384.safetensors \
-        ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+# ---- Baked-in models — one RUN per file so BuildKit can compress,
+# push, and cache each layer independently. Largest file first because
+# the layer cache is linear: invalidating an earlier layer forces every
+# later one to rebuild, so the most-stable (biggest) file goes on top.
+
+# LTX-2.3 22B BF16 dev checkpoint (~46 GB)
+RUN hf download Lightricks/LTX-2.3 ltx-2.3-22b-dev.safetensors \
+        --local-dir /models \
+    && rm -rf /models/.cache
+
+# LTX-2.3 distilled LoRA (~7.6 GB)
+RUN hf download Lightricks/LTX-2.3 ltx-2.3-22b-distilled-lora-384.safetensors \
+        --local-dir /models \
+    && rm -rf /models/.cache
+
+# LTX-2.3 spatial upscaler (~1 GB)
+RUN hf download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
         --local-dir /models \
     && rm -rf /models/.cache
 
