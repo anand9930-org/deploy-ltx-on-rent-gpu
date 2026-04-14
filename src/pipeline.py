@@ -36,7 +36,7 @@ class LTXVideoGenerator:
             model_dir, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
         )
         distilled_lora_path = os.path.join(
-            model_dir, "ltx-2.3-22b-distilled-lora-384.safetensors"
+            model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
         )
         gemma_root = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
 

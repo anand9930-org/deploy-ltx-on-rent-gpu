@@ -21,7 +21,7 @@ class TestEnsureModelsDownloaded:
         # Create fake model files
         (tmp_path / "ltx-2.3-22b-dev-fp8.safetensors").touch()
         (tmp_path / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors").touch()
-        (tmp_path / "ltx-2.3-22b-distilled-lora-384.safetensors").touch()
+        (tmp_path / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors").touch()
         gemma_dir = tmp_path / "gemma-3-12b-it-qat-q4_0-unquantized"
         gemma_dir.mkdir()
         (gemma_dir / "model.safetensors").touch()

@@ -50,13 +50,13 @@ def ensure_models_downloaded(model_dir: str) -> None:
 
     # 3. Distilled LoRA (~7.6 GB, compatible with FP8 checkpoint)
     lora_path = os.path.join(
-        model_dir, "ltx-2.3-22b-distilled-lora-384.safetensors"
+        model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
     )
     if not os.path.exists(lora_path):
         logger.info("Downloading distilled LoRA (~7.6 GB) ...")
         hf_hub_download(
             repo_id="Lightricks/LTX-2.3",
-            filename="ltx-2.3-22b-distilled-lora-384.safetensors",
+            filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
             local_dir=model_dir,
             token=hf_token,
         )

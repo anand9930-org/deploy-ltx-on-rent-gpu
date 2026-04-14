@@ -16,7 +16,7 @@ src/download_models.py  Idempotent model downloader from HuggingFace
 | File | Size | Source |
 |------|------|--------|
 | `ltx-2.3-22b-dev-fp8.safetensors` | 29 GB | `Lightricks/LTX-2.3-fp8` |
-| `ltx-2.3-22b-distilled-lora-384.safetensors` | 7.6 GB | `Lightricks/LTX-2.3` |
+| `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | 7.6 GB | `Lightricks/LTX-2.3` |
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 1 GB | `Lightricks/LTX-2.3` |
 | `gemma-3-12b-it-qat-q4_0-unquantized/` | 26 GB | `google/gemma-3-12b-it-qat-q4_0-unquantized` |
 
