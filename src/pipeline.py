@@ -97,6 +97,17 @@ class LTXVideoGenerator:
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
 
+        # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the transformer
+        # forward on diffusion steps where the input hasn't changed
+        # enough (rescaled relative-L1 below TEACACHE_THRESHOLD). Works
+        # across any GPU + attention backend — it never touches the
+        # attention kernel, just caches the module's output. Validated
+        # on LTX-Video with ~1.6–2.1× lossless speedup.
+        from src.teacache import enable_teacache, teacache_config_from_env
+        teacache_cfg = teacache_config_from_env()
+        if teacache_cfg is not None:
+            enable_teacache(self._pipeline, **teacache_cfg)
+
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
         try:
