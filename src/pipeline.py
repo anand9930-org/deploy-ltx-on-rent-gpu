@@ -140,6 +140,22 @@ class LTXVideoGenerator:
         if registry is not None:
             pipeline_kwargs["registry"] = registry
 
+        # torch.compile — LTX-2's regional compile (per transformer block,
+        # not whole model) via COMPILE_TRANSFORMER SDOps in
+        # ltx_core/model/transformer/compiling.py. Each transformer block
+        # gets wrapped with torch.compile(m); small blocks compile fast
+        # and are cached, so the effective cost is paid once per pod boot.
+        # Expected ~15-30% Stage 1 speedup on Ada + Hopper; transparent to
+        # numerics. Default ON; set ENABLE_TORCH_COMPILE=0 to disable.
+        torch_compile_enabled = os.getenv("ENABLE_TORCH_COMPILE", "1").strip().lower() not in (
+            "0", "false", "no", "off", "",
+        )
+        if torch_compile_enabled:
+            pipeline_kwargs["torch_compile"] = True
+            logger.info("torch.compile ENABLED (regional per transformer block)")
+        else:
+            logger.info("torch.compile disabled via ENABLE_TORCH_COMPILE=%s", os.getenv("ENABLE_TORCH_COMPILE"))
+
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
 
