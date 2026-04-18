@@ -217,6 +217,13 @@ class _PatchedContextManager:
                 self._state.skips,
                 100.0 * self._state.skip_rate,
             )
+            # Explicitly drop tensor refs — without this, our cached
+            # (prev_vx, prev_ax) hold GPU memory across the stage
+            # teardown, contributing to the Stage 1 → Stage 2 pinned-
+            # memory pressure that crashes pin_memory() on 24 GB cards.
+            self._state.prev_input = None
+            self._state.prev_vx = None
+            self._state.prev_ax = None
         return self._inner.__exit__(exc_type, exc_val, exc_tb)
 
 

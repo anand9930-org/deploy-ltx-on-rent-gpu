@@ -3,6 +3,8 @@
 All VRAM optimisation techniques live here.
 """
 
+import functools
+import gc
 import logging
 import os
 import tempfile
@@ -25,6 +27,50 @@ def _round_to(value: int, divisor: int) -> int:
 
 def _round_frames(n: int) -> int:
     return ((n - 1) // 8) * 8 + 1
+
+
+def _install_stage2_cleanup_hook(pipeline) -> None:
+    """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
+
+    LTX-2's layer-streaming path pins the full transformer's weights to
+    host memory at each stage entry. Between Stage 1 teardown and
+    Stage 2 setup LTX calls ``torch._C._host_emptyCache()`` best-effort,
+    but on 24 GB GPUs that call intermittently fails to release enough
+    pinned pages and the first ``tensor.data.pin_memory()`` call inside
+    Stage 2's ``_LayerStore.__init__`` raises
+
+        torch.AcceleratorError: CUDA error: invalid argument
+
+    We force a synchronous cleanup cycle (Python GC → device
+    empty_cache → CUDA sync → host empty_cache) right before Stage 2's
+    transformer context manager enters, so the pinned arena is in a
+    known-drained state. Idempotent; safe to call multiple times.
+    """
+    stage = getattr(pipeline, "stage_2", None)
+    if stage is None:
+        logger.warning("Stage 2 cleanup hook: pipeline has no stage_2")
+        return
+    if getattr(stage, "_stage2_cleanup_hooked", False):
+        return
+
+    original_ctx = stage._transformer_ctx
+
+    @functools.wraps(original_ctx)
+    def hooked_ctx(*args, **kwargs):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            if hasattr(torch._C, "_host_emptyCache"):
+                try:
+                    torch._C._host_emptyCache()
+                except Exception:  # pragma: no cover — best effort
+                    logger.debug("Stage 2 cleanup: _host_emptyCache raised", exc_info=True)
+        logger.info("Stage 2 boundary cleanup done")
+        return original_ctx(*args, **kwargs)
+
+    stage._transformer_ctx = hooked_ctx
+    stage._stage2_cleanup_hooked = True
 
 
 class LTXVideoGenerator:
@@ -96,6 +142,13 @@ class LTXVideoGenerator:
 
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
+
+        # Always-on: aggressive allocator flush at the Stage 1 → Stage 2
+        # boundary. Fixes intermittent
+        #   torch.AcceleratorError: CUDA error: invalid argument
+        # coming out of layer_streaming.py:63 on 24 GB cards. See
+        # _install_stage2_cleanup_hook above.
+        _install_stage2_cleanup_hook(self._pipeline)
 
         # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the transformer
         # forward on diffusion steps where the input hasn't changed
