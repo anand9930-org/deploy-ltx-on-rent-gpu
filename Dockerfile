@@ -38,6 +38,23 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --no-cache /app
 
+# ---- Install FlashAttention 3 (Hopper-only, community wheel index) ---------
+# FA3 has no PyPI wheel. Building from source needs ~80-150 GB RAM and does
+# not fit on GH-hosted runners (issue Dao-AILab/flash-attention#1043), so we
+# install a prebuilt wheel from the windreamer community index — cp39-abi3
+# stable-ABI wheels (usable from 3.11) built against torch 2.8.0 + cu128,
+# rebuilt bi-weekly from Dao-AILab/flash-attention main. Apache-2.0,
+# unsigned; acceptable for research validation, swap for a SHA-pinned
+# self-hosted build before shipping to customer traffic.
+#
+# Do NOT install xformers alongside FA3. LTX-2's
+# `ltx_core.model.transformer.attention` only imports `flash_attn_interface`
+# when `memory_efficient_attention is None` (xformers unimportable) — having
+# xformers present silently shadows FA3.
+RUN pip install --no-cache-dir flash_attn_3 \
+        --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch280/ \
+    && python3 -c "import flash_attn_interface; print('flash_attn_interface loaded OK')"
+
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
 COPY service.py /app/service.py

@@ -156,6 +156,16 @@ class LTXVideoGenerator:
         else:
             logger.info("torch.compile disabled via ENABLE_TORCH_COMPILE=%s", os.getenv("ENABLE_TORCH_COMPILE"))
 
+        # Optional FA3 enablement. When `LTX_ATTENTION_TYPE=flash_attention_3`
+        # is set, patch LTX's model configurator so every Attention module
+        # constructed by the pipeline routes through the FA3 wrapper. Must
+        # run before the TI2VidTwoStagesPipeline's Builder constructs any
+        # transformer, which happens lazily on the first __call__.
+        _requested_attn = os.environ.get("LTX_ATTENTION_TYPE", "").lower()
+        if _requested_attn == "flash_attention_3":
+            from src.attention_override import enable_flash_attention_3
+            enable_flash_attention_3()
+
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
 
@@ -176,6 +186,36 @@ class LTXVideoGenerator:
         teacache_cfg = teacache_config_from_env()
         if teacache_cfg is not None:
             enable_teacache(self._pipeline, **teacache_cfg)
+
+        # Boot-time attention-backend fingerprint. LTX-2's
+        # `AttentionFunction.DEFAULT` (the value used when the checkpoint
+        # doesn't override) resolves at runtime to `XFormersAttention` if
+        # xformers is importable, else `PytorchAttention`. xformers gives
+        # us FA2 for our BF16 non-causal shapes; without it we fall back
+        # to torch SDPA's dispatcher, which can pick the math backend for
+        # some shapes. Log everything unambiguously so pod logs record
+        # what's live and any A/B comparison is attributable.
+        try:
+            import xformers  # noqa: F401
+            _has_xformers = f"yes (xformers {xformers.__version__})"
+        except ImportError:
+            _has_xformers = "no"
+        try:
+            import flash_attn_interface  # noqa: F401
+            _has_fa3 = "yes"
+        except ImportError:
+            _has_fa3 = "no"
+        try:
+            from ltx_core.model.transformer.attention import AttentionFunction
+            _attn_resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
+        except Exception as _e:
+            _attn_resolved = f"unknown ({type(_e).__name__})"
+        logger.info(
+            "Attention fingerprint — xformers=%s, flash_attn_interface=%s, "
+            "LTX default resolves to: %s, requested: %s",
+            _has_xformers, _has_fa3, _attn_resolved,
+            _requested_attn or "default",
+        )
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None

@@ -30,7 +30,11 @@ jobs:
         with:
           context: .
           push: true
+          # Separate image name so this combined branch doesn't clobber
+          # either parent's published image. RunPod templates for this
+          # branch should point at
+          #   <DOCKERHUB_USERNAME>/ltx-video-fa3-teacache:latest
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-fa3-teacache:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-fa3-teacache:${{ github.sha }}
           no-cache: true
