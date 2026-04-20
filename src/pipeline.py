@@ -12,6 +12,17 @@ import uuid
 import torch
 
 logger = logging.getLogger(__name__)
+# BentoML's default log level filters our INFO narration out of the pod
+# logs. Force our own logger to INFO so pipeline init / VRAM / quant
+# progress are visible without having to promote every call to WARNING.
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+    logger.addHandler(_h)
+    logger.propagate = False
 
 DEFAULT_NEGATIVE_PROMPT = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
@@ -103,28 +114,94 @@ def _is_container_like(obj) -> bool:
 
 def _dump_prompt_encoder_structure(pipeline) -> None:
     """One-shot diagnostic: log the nn.Modules reachable from
-    ``pipeline.prompt_encoder`` so we can see where Gemma is nested."""
+    ``pipeline.prompt_encoder`` so we can see where Gemma is nested.
+
+    Logged at WARNING so it survives BentoML's default log-level filter
+    (INFO is silenced in the serving container).
+    """
     prompt_encoder = getattr(pipeline, "prompt_encoder", None)
     if prompt_encoder is None:
-        logger.info("prompt_encoder: (missing)")
+        logger.warning("[diag] pipeline.prompt_encoder is None")
         return
-    logger.info("prompt_encoder top-level type: %s", type(prompt_encoder).__name__)
+
+    logger.warning(
+        "[diag] prompt_encoder type=%s, module=%s",
+        type(prompt_encoder).__name__, type(prompt_encoder).__module__,
+    )
+
+    # Raw vars() contents — every attribute, every type, regardless of
+    # whether we think it's "interesting". This is the ground truth on
+    # what LTX-2's PromptEncoder actually holds at this moment.
+    try:
+        pe_vars = vars(prompt_encoder)
+    except TypeError:
+        pe_vars = {}
+    logger.warning("[diag] prompt_encoder has %d vars() entries", len(pe_vars))
+    for name, attr in list(pe_vars.items())[:40]:
+        type_name = type(attr).__name__
+        extra = ""
+        if isinstance(attr, torch.nn.Module):
+            try:
+                extra = f" total_params={sum(p.numel() for p in attr.parameters())}"
+            except Exception:
+                extra = " total_params=?"
+        elif isinstance(attr, (list, tuple)):
+            extra = f" len={len(attr)}"
+            if attr:
+                extra += f" first_item_type={type(attr[0]).__name__}"
+        elif isinstance(attr, dict):
+            extra = f" len={len(attr)}"
+            if attr:
+                try:
+                    first_key = next(iter(attr.keys()))
+                    first_val = attr[first_key]
+                    extra += f" first_key={first_key!r} first_val_type={type(first_val).__name__}"
+                except Exception:
+                    pass
+        elif torch.is_tensor(attr):
+            extra = f" shape={tuple(attr.shape)} dtype={attr.dtype}"
+        logger.warning("  [diag] prompt_encoder.%s : %s%s", name, type_name, extra)
+
+    # Also scan non-dunder dir() entries that aren't in vars(), in case
+    # LTX-2 uses __slots__ or properties for the Gemma handle.
+    dir_extras: list[str] = []
+    for name in dir(prompt_encoder):
+        if name.startswith("__") or name in pe_vars:
+            continue
+        try:
+            attr = getattr(prompt_encoder, name)
+        except Exception:
+            continue
+        if callable(attr) and not isinstance(attr, torch.nn.Module):
+            continue
+        dir_extras.append(f"{name}:{type(attr).__name__}")
+    if dir_extras:
+        logger.warning(
+            "[diag] prompt_encoder has %d dir()-only attrs: %s",
+            len(dir_extras), ", ".join(dir_extras[:20]),
+        )
+
+    # Recursive nn.Module search
     found = list(_find_nn_modules_in(prompt_encoder))
     if not found:
-        logger.info("prompt_encoder: no nn.Module descendants found")
+        logger.warning(
+            "[diag] No nn.Module found anywhere reachable from prompt_encoder. "
+            "Gemma is likely either lazy-loaded at first forward, held behind "
+            "a property, or wrapped in a non-standard container."
+        )
         return
-    for path, mod in found[:12]:  # cap log volume
+    logger.warning("[diag] Found %d nn.Module(s) under prompt_encoder:", len(found))
+    for path, mod in found[:20]:
         try:
-            n_params = sum(p.numel() for p in mod.parameters(recurse=False))
             n_params_total = sum(p.numel() for p in mod.parameters())
         except Exception:
-            n_params = n_params_total = -1
-        logger.info(
-            "  %s = %s  (own_params=%d, total_params=%d)",
-            path, type(mod).__name__, n_params, n_params_total,
+            n_params_total = -1
+        logger.warning(
+            "  [diag] %s = %s  (total_params=%d)",
+            path, type(mod).__name__, n_params_total,
         )
-    if len(found) > 12:
-        logger.info("  ... and %d more nn.Modules", len(found) - 12)
+    if len(found) > 20:
+        logger.warning("  [diag] ... and %d more", len(found) - 20)
 
 
 def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tuple[int, list]:
