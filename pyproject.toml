@@ -9,9 +9,12 @@ dependencies = [
     "huggingface-hub>=0.27.0",
     "hf-xet>=0.1.0",
     "transformers>=4.52,<5.0",
-    # Runtime decoder for GPTQ W4A16 Gemma checkpoints (RedHatAI).
-    # transformers auto-dispatches via config.json["quantization_config"].
-    "compressed-tensors>=0.9.0",
+    # Post-load weight-only quantization of the Gemma text encoder:
+    # LTX-2's PromptEncoder loads BF16 weights normally, then we walk the
+    # module tree and replace nn.Linear with HQQLinear. Gemma drops from
+    # ~26 GB BF16 to ~7 GB (4-bit) or ~13 GB (8-bit) with BF16 activations
+    # preserved, so downstream LTX consumers see an unchanged interface.
+    "hqq>=0.2.0",
 ]
 
 [project.optional-dependencies]

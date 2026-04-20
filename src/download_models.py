@@ -6,16 +6,12 @@ from huggingface_hub import hf_hub_download, snapshot_download
 logger = logging.getLogger(__name__)
 
 
-# Gemma checkpoint choice is driven by GEMMA_QUANT (see src/pipeline.py).
-# w4a16 is a community GPTQ-quantized checkpoint with published ~98% parity;
-# bf16 is the official Google QAT-dequantized copy.
-_GEMMA_REPOS: dict[str, tuple[str, str, str]] = {
-    # quant : (repo_id, local_dir_name, approx_size_label)
-    "bf16":  ("google/gemma-3-12b-it-qat-q4_0-unquantized",
-              "gemma-3-12b-it-qat-q4_0-unquantized", "~26 GB"),
-    "w4a16": ("RedHatAI/gemma-3-12b-it-quantized.w4a16",
-              "gemma-3-12b-it-w4a16", "~7 GB"),
-}
+# Gemma source is always the Google QAT-dequantized BF16 checkpoint. Any
+# runtime weight reduction happens post-load (see src/pipeline.py post-load
+# quant walker) so the on-disk format stays compatible with LTX-2's custom
+# safetensors loader.
+_GEMMA_REPO_ID = "google/gemma-3-12b-it-qat-q4_0-unquantized"
+_GEMMA_DIR_NAME = "gemma-3-12b-it-qat-q4_0-unquantized"
 
 
 def ensure_models_downloaded(model_dir: str) -> None:
@@ -29,14 +25,8 @@ def ensure_models_downloaded(model_dir: str) -> None:
     if not hf_token:
         raise RuntimeError(
             "HF_TOKEN env var required. Gemma 3 model needs license acceptance at "
-            "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
+            f"https://huggingface.co/{_GEMMA_REPO_ID}"
         )
-
-    gemma_quant = os.getenv("GEMMA_QUANT", "bf16").strip().lower()
-    if gemma_quant not in _GEMMA_REPOS:
-        logger.warning("Unknown GEMMA_QUANT=%r; falling back to bf16", gemma_quant)
-        gemma_quant = "bf16"
-    gemma_repo_id, gemma_dir_name, gemma_size = _GEMMA_REPOS[gemma_quant]
 
     # 1. LTX-2.3 BF16 checkpoint (~46 GB, runtime fp8_cast downcasts on the fly)
     checkpoint_path = os.path.join(model_dir, "ltx-2.3-22b-dev.safetensors")
@@ -81,63 +71,43 @@ def ensure_models_downloaded(model_dir: str) -> None:
     else:
         logger.info("Distilled LoRA already cached.")
 
-    # 4. Gemma 3 12B text encoder. Checkpoint selected by GEMMA_QUANT:
-    #    w4a16 (default) -> RedHatAI GPTQ, ~7 GB, weight-only (BF16 activations)
-    #    bf16            -> Google QAT-dequantized, ~26 GB, reference baseline
-    gemma_dir = os.path.join(model_dir, gemma_dir_name)
+    # 4. Gemma 3 12B text encoder (~26 GB BF16, Google QAT-dequantized).
+    gemma_dir = os.path.join(model_dir, _GEMMA_DIR_NAME)
     gemma_has_weights = os.path.isdir(gemma_dir) and any(
         f.endswith(".safetensors")
         for f in os.listdir(gemma_dir)
         if os.path.isfile(os.path.join(gemma_dir, f))
     )
     if not gemma_has_weights:
-        logger.info(
-            "Downloading Gemma 3 12B text encoder [%s] (%s) from %s ...",
-            gemma_quant, gemma_size, gemma_repo_id,
-        )
+        logger.info("Downloading Gemma 3 12B text encoder (~26 GB) from %s ...", _GEMMA_REPO_ID)
         try:
             snapshot_download(
-                repo_id=gemma_repo_id,
+                repo_id=_GEMMA_REPO_ID,
                 local_dir=gemma_dir,
                 token=hf_token,
             )
         except Exception as e:
             logger.error(
-                "Failed to download Gemma 3 [%s] from %s: %s. "
-                "For the Google repo you may need to accept the license at "
-                "https://huggingface.co/%s and wait for approval.",
-                gemma_quant, gemma_repo_id, e, gemma_repo_id,
+                "Failed to download Gemma 3 from %s: %s. "
+                "Accept the license at https://huggingface.co/%s and wait for approval.",
+                _GEMMA_REPO_ID, e, _GEMMA_REPO_ID,
             )
             raise
     else:
-        logger.info("Gemma 3 text encoder [%s] already cached at %s", gemma_quant, gemma_dir)
+        logger.info("Gemma 3 text encoder already cached at %s", gemma_dir)
 
-    # LTX-2's loader hardcodes a SentencePiece `tokenizer.model` lookup
-    # (ltx_core/text_encoders/gemma/encoders/base_encoder.py:178).
-    # Community-quantized Gemma repos (RedHatAI W4A16 etc.) ship only the
-    # fast `tokenizer.json`, so fetch the SentencePiece binary from Google's
-    # canonical repo and drop it in. Same vocab, same license gate.
+    # Safety net for the rare case the snapshot lacks tokenizer.model (some
+    # upstream mirrors have dropped the SentencePiece binary). LTX-2's loader
+    # requires it (ltx_core/text_encoders/gemma/encoders/base_encoder.py:178).
     tokenizer_model_path = os.path.join(gemma_dir, "tokenizer.model")
     if not os.path.exists(tokenizer_model_path):
-        logger.info(
-            "tokenizer.model missing in %s — pulling from google/gemma-3-12b-it-qat-q4_0-unquantized",
-            gemma_dir,
+        logger.info("tokenizer.model missing in %s — pulling it explicitly", gemma_dir)
+        hf_hub_download(
+            repo_id=_GEMMA_REPO_ID,
+            filename="tokenizer.model",
+            local_dir=gemma_dir,
+            token=hf_token,
         )
-        try:
-            hf_hub_download(
-                repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
-                filename="tokenizer.model",
-                local_dir=gemma_dir,
-                token=hf_token,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to fetch tokenizer.model from Google repo: %s. "
-                "LTX-2 requires this SentencePiece file; accept the license at "
-                "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized",
-                e,
-            )
-            raise
 
     logger.info("All models verified / downloaded to %s", model_dir)
 
