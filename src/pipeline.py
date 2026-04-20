@@ -18,28 +18,146 @@ DEFAULT_NEGATIVE_PROMPT = (
     "low resolution, watermark, text, oversaturated"
 )
 
-# Gemma text-encoder quantization.
-#
-# NOTE: GEMMA_QUANT=w4a16 is plumbed but does NOT currently produce valid
-# output — LTX-2's PromptEncoder uses a custom safetensors loader (not
-# transformers.AutoModel), so compressed-tensors W4A16 unpacking never
-# runs and the DiT receives garbage conditioning → black video. Default
-# is bf16 until the loader path is fixed to understand compressed-tensors
-# or until we switch to a quant format LTX-2's loader accepts natively.
-# Verified on Blackwell B6000 2026-04-20: w4a16 boots but emits ~60 KB
-# flat-color MP4 for a 5 s 1024x1536 generation.
-_GEMMA_DIRS: dict[str, str] = {
-    "bf16": "gemma-3-12b-it-qat-q4_0-unquantized",
-    "w4a16": "gemma-3-12b-it-w4a16",
-}
+# Post-load Gemma quantization. Gemma is always loaded from disk as BF16
+# (LTX-2's custom safetensors loader can't decode compressed-tensors / GPTQ
+# formats — see docs/gemma-compat-checklist.md). After the pipeline is
+# built, we walk the prompt-encoder subtree and replace every nn.Linear
+# with an HQQ-quantized equivalent. Activations stay BF16; the DiT sees an
+# unchanged interface. Supported modes:
+#   none  — default, BF16 runtime (~26 GB Gemma), known-good
+#   hqq4  — 4-bit HQQ, ~7 GB Gemma, enables 48 GB pure-GPU
+#   hqq8  — 8-bit HQQ, ~13 GB Gemma, conservative floor
+_POST_LOAD_QUANT_MODES = ("none", "hqq4", "hqq8")
 
 
-def _resolve_gemma_quant() -> str:
-    raw = os.getenv("GEMMA_QUANT", "bf16").strip().lower()
-    if raw not in _GEMMA_DIRS:
-        logger.warning("Unknown GEMMA_QUANT=%r; falling back to bf16", raw)
-        raw = "bf16"
+def _resolve_post_load_quant() -> str:
+    raw = os.getenv("GEMMA_POST_LOAD_QUANT", "none").strip().lower()
+    if raw not in _POST_LOAD_QUANT_MODES:
+        logger.warning("Unknown GEMMA_POST_LOAD_QUANT=%r; falling back to none", raw)
+        raw = "none"
     return raw
+
+
+def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> int:
+    """Walk the pipeline's prompt_encoder subtree and replace every
+    ``nn.Linear`` with an ``HQQLinear``. Returns the count of layers replaced.
+
+    Design: we target the prompt_encoder subtree only, not the whole pipeline,
+    so the DiT / VAE / upscaler stay untouched. HQQ runs calibration-free,
+    so no sample input is needed. ``compute_dtype=bfloat16`` preserves the
+    activation path downstream LTX consumers expect.
+    """
+    from hqq.core.quantize import BaseQuantizeConfig, HQQLinear
+    import torch.nn as nn
+
+    prompt_encoder = getattr(pipeline, "prompt_encoder", None)
+    if prompt_encoder is None:
+        raise RuntimeError(
+            "LTX-2 pipeline has no `prompt_encoder` attribute — "
+            "cannot locate the Gemma quant target"
+        )
+
+    quant_config = BaseQuantizeConfig(
+        nbits=nbits,
+        group_size=group_size,
+        quant_zero=False,
+        quant_scale=False,
+        offload_meta=False,
+        view_as_float=False,
+    )
+
+    replaced: list[str] = []
+
+    def _walk(module: nn.Module, path: str) -> None:
+        for name, child in list(module.named_children()):
+            child_path = f"{path}.{name}" if path else name
+            if isinstance(child, nn.Linear) and not isinstance(child, HQQLinear):
+                device = child.weight.device
+                hqq_layer = HQQLinear(
+                    child,
+                    quant_config=quant_config,
+                    compute_dtype=torch.bfloat16,
+                    device=device,
+                    initialize=True,
+                    del_orig=True,
+                )
+                setattr(module, name, hqq_layer)
+                replaced.append(child_path)
+            else:
+                _walk(child, child_path)
+
+    # prompt_encoder itself may or may not be an nn.Module — walk it either
+    # way via attribute traversal. Most LTX-2 prompt encoders wrap an
+    # underlying Gemma nn.Module that we can recurse into safely.
+    if isinstance(prompt_encoder, nn.Module):
+        _walk(prompt_encoder, "prompt_encoder")
+    else:
+        # Non-nn.Module wrapper: recurse into its attributes looking for
+        # nn.Modules, then walk those.
+        for attr_name in dir(prompt_encoder):
+            if attr_name.startswith("_"):
+                continue
+            try:
+                attr = getattr(prompt_encoder, attr_name)
+            except Exception:
+                continue
+            if isinstance(attr, nn.Module):
+                _walk(attr, f"prompt_encoder.{attr_name}")
+
+    return len(replaced)
+
+
+def _install_first_encode_magnitude_hook(pipeline) -> None:
+    """Attach a one-shot forward hook on the prompt_encoder that logs the
+    output magnitude on the first call. Catches the silent-failure mode
+    where a broken quant produces near-zero hidden states (which would
+    otherwise only show up as a flat-black MP4 after the full job).
+    """
+    prompt_encoder = getattr(pipeline, "prompt_encoder", None)
+    if not isinstance(prompt_encoder, torch.nn.Module):
+        logger.warning(
+            "prompt_encoder is not nn.Module (type=%s); magnitude hook skipped",
+            type(prompt_encoder).__name__,
+        )
+        return
+
+    state = {"logged": False}
+
+    def _collect_tensors(obj):
+        if torch.is_tensor(obj):
+            yield obj
+        elif isinstance(obj, (tuple, list)):
+            for item in obj:
+                yield from _collect_tensors(item)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                yield from _collect_tensors(v)
+
+    def hook(module, args, output):
+        if state["logged"]:
+            return
+        state["logged"] = True
+        for i, tensor in enumerate(_collect_tensors(output)):
+            if not tensor.is_floating_point():
+                continue
+            try:
+                max_abs = tensor.detach().abs().max().item()
+                mean_abs = tensor.detach().abs().mean().item()
+            except Exception:
+                logger.exception("Magnitude hook: failed to read output[%d]", i)
+                continue
+            logger.info(
+                "First Gemma encode output[%d]: shape=%s dtype=%s max_abs=%.4g mean_abs=%.4g",
+                i, tuple(tensor.shape), tensor.dtype, max_abs, mean_abs,
+            )
+            if max_abs < 1e-3:
+                logger.error(
+                    "FIRST-ENCODE OUTPUT[%d] IS NEAR-ZERO (max_abs=%.2e) — "
+                    "quantization likely produced garbage; expect black video",
+                    i, max_abs,
+                )
+
+    prompt_encoder.register_forward_hook(hook)
 
 
 def _round_to(value: int, divisor: int) -> int:
@@ -61,26 +179,28 @@ class LTXVideoGenerator:
         distilled_lora_path = os.path.join(
             model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
         )
+        gemma_root = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
 
-        self._gemma_quant = _resolve_gemma_quant()
-        gemma_root = os.path.join(model_dir, _GEMMA_DIRS[self._gemma_quant])
-        logger.info("Gemma quant: %s (root=%s)", self._gemma_quant, gemma_root)
+        self._post_load_quant = _resolve_post_load_quant()
+        logger.info("Gemma post-load quant: %s", self._post_load_quant)
 
-        # Pure-GPU mode: when Gemma is small enough (w4a16 ~= 7 GB) and the
-        # GPU has >= 40 GB, the CPU<->GPU swapping machinery (StateDictRegistry
-        # + per-layer streaming) becomes unnecessary — every model fits
-        # resident, so we skip the PCIe roundtrips entirely.
+        # Pure-GPU mode: post-load hqq4/hqq8 shrinks Gemma to 7–13 GB, so
+        # the CPU<->GPU swapping machinery (StateDictRegistry + per-layer
+        # streaming) becomes unnecessary on any 40 GB+ GPU. With BF16 Gemma
+        # (26 GB), pure-GPU mode needs 80 GB+ and we stick with the
+        # streaming fallback for safety on smaller cards.
         gpu_vram_gb = (
             torch.cuda.get_device_properties(0).total_memory / 1e9
             if torch.cuda.is_available() else 0
         )
         self._gpu_vram_gb = gpu_vram_gb
-        self._pure_gpu_mode = self._gemma_quant in ("w4a16",) and gpu_vram_gb >= 40
+        quant_reduces_vram = self._post_load_quant != "none"
+        self._pure_gpu_mode = quant_reduces_vram and gpu_vram_gb >= 40
         if self._pure_gpu_mode:
             logger.info(
-                "Pure-GPU mode ENABLED: Gemma=%s + %.0f GB VRAM, "
+                "Pure-GPU mode ENABLED: post-load quant=%s + %.0f GB VRAM, "
                 "registry and layer streaming will be bypassed",
-                self._gemma_quant, gpu_vram_gb,
+                self._post_load_quant, gpu_vram_gb,
             )
 
         logger.info("Initializing LTX-2.3 pipeline ...")
@@ -143,6 +263,39 @@ class LTXVideoGenerator:
 
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
+
+        # Post-load Gemma quantization. Runs after BF16 weights are in
+        # place; replaces nn.Linear → HQQLinear in the prompt-encoder
+        # subtree. Guarded with a magnitude hook that logs the first
+        # encoded output so a broken quant can't silently produce black
+        # video the way on-disk W4A16 did (see docs/gemma-compat-checklist.md).
+        if self._post_load_quant != "none":
+            nbits = {"hqq4": 4, "hqq8": 8}[self._post_load_quant]
+            logger.info("Applying post-load HQQ quant (nbits=%d) to prompt encoder ...", nbits)
+            try:
+                n_replaced = _apply_hqq_post_load_quant(self._pipeline, nbits=nbits)
+                logger.info(
+                    "Post-load HQQ%d quant applied: %d Linear layers replaced",
+                    nbits, n_replaced,
+                )
+                if n_replaced == 0:
+                    logger.error(
+                        "Post-load quant replaced 0 Linear layers — check that "
+                        "`pipeline.prompt_encoder` exposes an nn.Module subtree. "
+                        "Gemma will still run but VRAM win was not realised."
+                    )
+                self._log_vram("after post-load quant")
+            except Exception:
+                logger.exception(
+                    "Post-load HQQ quant failed; falling back to BF16 Gemma "
+                    "(pure-GPU mode may OOM on <80 GB GPUs)"
+                )
+                self._post_load_quant = "none"
+                self._pure_gpu_mode = False
+
+        # One-shot magnitude check on the first Gemma encode. Fires only
+        # once; logs ERROR if output is near-zero (silent-failure guard).
+        _install_first_encode_magnitude_hook(self._pipeline)
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
@@ -226,8 +379,8 @@ class LTXVideoGenerator:
             # then only 2-3 layers live on GPU at any time during inference.
             # max_batch_size=4 batches guidance passes to reduce PCIe round-trips.
             #
-            # Pure-GPU mode (w4a16 Gemma + >=40 GB VRAM) bypasses streaming
-            # entirely: DiT + Gemma + VAE + upscaler all stay resident.
+            # Pure-GPU mode (post-load hqq4/hqq8 + >=40 GB VRAM) bypasses
+            # streaming entirely: DiT + Gemma + VAE + upscaler all stay resident.
             if self._pure_gpu_mode:
                 streaming = None
                 logger.info(
@@ -271,6 +424,24 @@ class LTXVideoGenerator:
             if video_chunks_number is not None:
                 encode_kwargs["video_chunks_number"] = video_chunks_number
             self._encode_video(**encode_kwargs)
+
+            # Black-MP4 guard: an h264-encoded flat-color 1024x1536 clip of
+            # 5+ seconds is typically <200 KB. Real content is >500 KB.
+            # This is the second line of defence if the magnitude hook
+            # above missed a silent quant failure.
+            try:
+                mp4_bytes = os.path.getsize(output_path)
+            except OSError:
+                mp4_bytes = -1
+            if mp4_bytes >= 0 and mp4_bytes < 200_000 and num_frames >= 25:
+                logger.error(
+                    "Job %s: output MP4 is suspiciously small (%d bytes) — "
+                    "likely a flat-black/constant-colour video. Check Gemma "
+                    "quant + pipeline numerics.",
+                    job_id, mp4_bytes,
+                )
+            else:
+                logger.info("Job %s: output MP4 size=%d bytes", job_id, mp4_bytes)
 
             return {
                 "output_path": output_path,
