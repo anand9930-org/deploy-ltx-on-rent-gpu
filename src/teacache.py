@@ -129,6 +129,11 @@ def _make_wrapped_forward(
 
         # First step of this stage: nothing cached, always compute.
         if state.prev_input is None or ref_input is None:
+            if state.step == 1 and ref_input is not None:
+                logger.info(
+                    "TeaCache: first step — reference latent shape=%s dtype=%s",
+                    tuple(ref_input.shape), ref_input.dtype,
+                )
             vx, ax = original_forward(video, audio, perturbations)
             state.update_from_miss(ref_input, vx, ax)
             return vx, ax

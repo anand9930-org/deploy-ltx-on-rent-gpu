@@ -29,6 +29,23 @@ def _round_frames(n: int) -> int:
     return ((n - 1) // 8) * 8 + 1
 
 
+def _round_user_inputs(width: int, height: int, num_frames: int) -> tuple[int, int, int]:
+    """Round user-supplied dims to pipeline grid and log when we change anything.
+
+    LTX-2.3 requires width/height divisible by 64 (latent stride × patch size)
+    and frame counts of the form 8k+1. Silently clamping surprises callers when
+    a request that "worked" locally comes back at a different resolution; the
+    log line makes the adjustment discoverable from pod output.
+    """
+    w, h, f = _round_to(width, 64), _round_to(height, 64), _round_frames(num_frames)
+    if (w, h, f) != (width, height, num_frames):
+        logger.info(
+            "Input rounded to pipeline grid: %dx%d×%d → %dx%d×%d",
+            width, height, num_frames, w, h, f,
+        )
+    return w, h, f
+
+
 def _install_stage2_cleanup_hook(pipeline) -> None:
     """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
 
@@ -59,6 +76,7 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     def hooked_ctx(*args, **kwargs):
         gc.collect()
         if torch.cuda.is_available():
+            alloc_before = torch.cuda.memory_allocated(0) / 1e9
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
@@ -66,7 +84,13 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
                     torch._C._host_emptyCache()
                 except Exception:  # pragma: no cover — best effort
                     logger.debug("Stage 2 cleanup: _host_emptyCache raised", exc_info=True)
-        logger.info("Stage 2 boundary cleanup done")
+            alloc_after = torch.cuda.memory_allocated(0) / 1e9
+            logger.info(
+                "Stage 2 boundary cleanup done: VRAM %.2f → %.2f GB allocated",
+                alloc_before, alloc_after,
+            )
+        else:
+            logger.info("Stage 2 boundary cleanup done (no CUDA)")
         return original_ctx(*args, **kwargs)
 
     stage._transformer_ctx = hooked_ctx
@@ -184,38 +208,33 @@ class LTXVideoGenerator:
         # on LTX-Video with ~1.6–2.1× lossless speedup.
         from src.teacache import enable_teacache, teacache_config_from_env
         teacache_cfg = teacache_config_from_env()
-        if teacache_cfg is not None:
+        self._teacache_enabled = teacache_cfg is not None
+        if self._teacache_enabled:
             enable_teacache(self._pipeline, **teacache_cfg)
 
         # Boot-time attention-backend fingerprint. LTX-2's
-        # `AttentionFunction.DEFAULT` (the value used when the checkpoint
-        # doesn't override) resolves at runtime to `XFormersAttention` if
-        # xformers is importable, else `PytorchAttention`. xformers gives
-        # us FA2 for our BF16 non-causal shapes; without it we fall back
-        # to torch SDPA's dispatcher, which can pick the math backend for
-        # some shapes. Log everything unambiguously so pod logs record
-        # what's live and any A/B comparison is attributable.
+        # `AttentionFunction.DEFAULT` resolves to `PytorchAttention` (torch
+        # SDPA dispatcher) in this image. We probe ltx_core's actual
+        # module-level binding of `flash_attn_interface` (not our env) so
+        # the log reflects what the pipeline will use.
         try:
-            import xformers  # noqa: F401
-            _has_xformers = f"yes (xformers {xformers.__version__})"
-        except ImportError:
-            _has_xformers = "no"
-        try:
-            import flash_attn_interface  # noqa: F401
-            _has_fa3 = "yes"
-        except ImportError:
-            _has_fa3 = "no"
-        try:
+            from ltx_core.model.transformer import attention as _ltx_attn
             from ltx_core.model.transformer.attention import AttentionFunction
+            _has_fa3_live = _ltx_attn.flash_attn_interface is not None
             _attn_resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
         except Exception as _e:
+            _has_fa3_live = None
             _attn_resolved = f"unknown ({type(_e).__name__})"
         logger.info(
-            "Attention fingerprint — xformers=%s, flash_attn_interface=%s, "
+            "Attention fingerprint — ltx_core.fa3=%s, "
             "LTX default resolves to: %s, requested: %s",
-            _has_xformers, _has_fa3, _attn_resolved,
-            _requested_attn or "default",
+            _has_fa3_live, _attn_resolved, _requested_attn or "default",
         )
+        if _requested_attn == "flash_attention_3" and _has_fa3_live is False:
+            logger.warning(
+                "FA3 requested but ltx_core.attention.flash_attn_interface is None "
+                "— first attention call will fail."
+            )
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
@@ -258,9 +277,7 @@ class LTXVideoGenerator:
         rescale_scale: float = 0.7,
     ) -> dict:
         """Run inference and encode MP4. Returns dict with output_path, output_filename, etc."""
-        width = _round_to(width, 64)
-        height = _round_to(height, 64)
-        num_frames = _round_frames(num_frames)
+        width, height, num_frames = _round_user_inputs(width, height, num_frames)
         job_id = uuid.uuid4().hex[:12]
 
         logger.info(
@@ -291,6 +308,8 @@ class LTXVideoGenerator:
 
             # Run pipeline
             start_time = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(0)
 
             # Streaming: builds models on CPU, streams layers to GPU on demand.
             # Required for <48GB GPUs — without it, LoRA fusion OOMs because
@@ -300,8 +319,13 @@ class LTXVideoGenerator:
             # max_batch_size=4 batches guidance passes to reduce PCIe round-trips.
             gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
             streaming = 2 if gpu_vram_gb < 40 else None
-            if streaming:
-                logger.info("Job %s: streaming enabled (GPU VRAM: %.0f GB < 40 GB)", job_id, gpu_vram_gb)
+            max_batch_size = 4 if streaming else 1
+
+            logger.info(
+                "Job %s: GPU=%.0fGB, streaming=%s, max_batch_size=%d, teacache=%s",
+                job_id, gpu_vram_gb, streaming, max_batch_size,
+                getattr(self, "_teacache_enabled", False),
+            )
 
             call_kwargs = dict(
                 prompt=prompt, negative_prompt=negative_prompt, seed=seed,
@@ -309,7 +333,7 @@ class LTXVideoGenerator:
                 frame_rate=frame_rate, num_inference_steps=num_inference_steps,
                 images=[],
                 streaming_prefetch_count=streaming,
-                max_batch_size=4 if streaming else 1,
+                max_batch_size=max_batch_size,
             )
             if video_guider_params is not None:
                 call_kwargs["video_guider_params"] = video_guider_params
@@ -321,7 +345,14 @@ class LTXVideoGenerator:
             result = self._pipeline(**call_kwargs)
             video, audio = result if isinstance(result, tuple) else (result, None)
             generation_time = time.time() - start_time
-            logger.info("Job %s: generation took %.1fs", job_id, generation_time)
+            if torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated(0) / 1e9
+                logger.info(
+                    "Job %s: generation took %.1fs (peak VRAM %.2f GB, audio=%s)",
+                    job_id, generation_time, peak, audio is not None,
+                )
+            else:
+                logger.info("Job %s: generation took %.1fs", job_id, generation_time)
 
             # Encode video
             output_filename = f"ltx_{job_id}.mp4"
@@ -331,7 +362,12 @@ class LTXVideoGenerator:
                 encode_kwargs["audio"] = audio
             if video_chunks_number is not None:
                 encode_kwargs["video_chunks_number"] = video_chunks_number
+            encode_start = time.time()
             self._encode_video(**encode_kwargs)
+            logger.info(
+                "Job %s: mp4 encode %.1fs → %s",
+                job_id, time.time() - encode_start, output_path,
+            )
 
             return {
                 "output_path": output_path,

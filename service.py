@@ -18,6 +18,18 @@ from pydantic import Field
 from src import storage
 from src.pipeline import DEFAULT_NEGATIVE_PROMPT, LTXVideoGenerator
 
+# BentoML leaves the root logger at WARNING by default, which suppresses the
+# INFO lines our pipeline emits for feature activation, VRAM, timing, and
+# TeaCache stats. Configure once at import time so pod logs actually show
+# them. Respect LOG_LEVEL so operators can dial it up/down without a rebuild.
+_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=_level,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+# BentoML sets its own handlers; just make sure our loggers propagate.
+logging.getLogger("src").setLevel(_level)
+
 logger = logging.getLogger(__name__)
 
 

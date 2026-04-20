@@ -7,6 +7,7 @@ so that the rest of the application can start without Supabase credentials
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,24 @@ def upload_video(file_path: str, object_key: str) -> str:
     client = _get_client()
     bucket = os.getenv("SUPABASE_BUCKET", "ltx-videos")
 
-    logger.info("Uploading %s to supabase://%s/%s", file_path, bucket, object_key)
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    logger.info(
+        "Uploading %s (%.1f MB) to supabase://%s/%s",
+        file_path, size_mb, bucket, object_key,
+    )
 
+    upload_start = time.time()
     with open(file_path, "rb") as f:
         client.storage.from_(bucket).upload(
             path=object_key,
             file=f,
             file_options={"content-type": "video/mp4"},
         )
+    logger.info(
+        "Upload completed in %.1fs (%.1f MB/s)",
+        time.time() - upload_start,
+        size_mb / max(time.time() - upload_start, 1e-6),
+    )
 
     expiry = int(os.getenv("SUPABASE_URL_EXPIRY_SECONDS", "604800"))
     res = client.storage.from_(bucket).create_signed_url(

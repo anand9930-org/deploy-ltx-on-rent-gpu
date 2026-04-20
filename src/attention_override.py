@@ -1,11 +1,10 @@
 """FlashAttention 3 enablement for LTX-2.3.
 
-LTX-2's ``AttentionFunction.DEFAULT`` resolves to XFormersAttention (if
-xformers is installed) or PytorchAttention — never FA3. To force FA3 we
-monkey-patch the model configurator at process boot to inject
-``attention_type=flash_attention_3`` into the transformer config dict before
-the LTXModel is built. Every ``Attention`` module constructed thereafter
-captures ``FlashAttention3()`` as its callable.
+LTX-2's ``AttentionFunction.DEFAULT`` resolves to PytorchAttention — never
+FA3. To force FA3 we monkey-patch the model configurator at process boot to
+inject ``attention_type=flash_attention_3`` into the transformer config dict
+before the LTXModel is built. Every ``Attention`` module constructed
+thereafter captures ``FlashAttention3()`` as its callable.
 
 A defensive SDPA fallback is installed on ``FlashAttention3.__call__`` for
 any non-None mask. Static trace of the 22B AV pipeline confirmed every
