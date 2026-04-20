@@ -3,6 +3,8 @@
 All VRAM optimisation techniques live here.
 """
 
+import functools
+import gc
 import logging
 import os
 import tempfile
@@ -479,6 +481,83 @@ def _round_frames(n: int) -> int:
     return ((n - 1) // 8) * 8 + 1
 
 
+def _install_stage2_cleanup_hook(pipeline) -> None:
+    """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
+
+    LTX-2's layer-streaming path pins the full transformer's weights to
+    host memory at each stage entry. Between Stage 1 teardown and
+    Stage 2 setup LTX calls ``torch._C._host_emptyCache()`` best-effort,
+    but on small cards that call intermittently fails to release enough
+    pinned pages and the first ``tensor.data.pin_memory()`` call inside
+    Stage 2's ``_LayerStore.__init__`` raises
+
+        torch.AcceleratorError: CUDA error: invalid argument
+
+    We force a synchronous cleanup cycle (Python GC → device empty_cache
+    → CUDA sync → host empty_cache) right before Stage 2's transformer
+    context manager enters. Harmless on 48 GB+ cards; essential on 24 GB.
+    Idempotent; safe to call multiple times.
+    """
+    stage = getattr(pipeline, "stage_2", None)
+    if stage is None:
+        logger.warning("Stage 2 cleanup hook: pipeline has no stage_2")
+        return
+    if getattr(stage, "_stage2_cleanup_hooked", False):
+        return
+
+    original_ctx = stage._transformer_ctx
+
+    @functools.wraps(original_ctx)
+    def hooked_ctx(*args, **kwargs):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            if hasattr(torch._C, "_host_emptyCache"):
+                try:
+                    torch._C._host_emptyCache()
+                except Exception:  # pragma: no cover — best effort
+                    logger.debug("Stage 2 cleanup: _host_emptyCache raised", exc_info=True)
+        logger.info("Stage 2 boundary cleanup done")
+        return original_ctx(*args, **kwargs)
+
+    stage._transformer_ctx = hooked_ctx
+    stage._stage2_cleanup_hooked = True
+
+
+def _log_attention_fingerprint() -> None:
+    """One-shot diagnostic: what attention backend will LTX-2 actually use?
+
+    LTX-2's ``AttentionFunction.DEFAULT`` resolves at runtime to
+    ``XFormersAttention`` if xformers is importable (best perf on Ada
+    and Hopper for BF16 non-causal shapes), else ``PytorchAttention``
+    (SDPA, which still dispatches to FA2 on sm_89+ in modern PyTorch).
+
+    We log what's live so pod logs have an unambiguous record for any
+    A/B comparison between builds.
+    """
+    try:
+        import xformers  # noqa: F401
+        xformers_status = f"yes ({xformers.__version__})"
+    except ImportError:
+        xformers_status = "no"
+    try:
+        import flash_attn_interface  # noqa: F401
+        fa3_status = "yes"
+    except ImportError:
+        fa3_status = "no"
+    try:
+        from ltx_core.model.transformer.attention import AttentionFunction
+        resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
+    except Exception as e:
+        resolved = f"unknown ({type(e).__name__})"
+    logger.info(
+        "Attention fingerprint — xformers=%s, flash_attn_interface=%s, "
+        "LTX default resolves to: %s",
+        xformers_status, fa3_status, resolved,
+    )
+
+
 class LTXVideoGenerator:
     """Initialises the LTX-2.3 two-stage pipeline and runs inference."""
 
@@ -585,8 +664,36 @@ class LTXVideoGenerator:
         if registry is not None:
             pipeline_kwargs["registry"] = registry
 
+        # torch.compile — LTX-2's regional compile (per transformer block,
+        # not whole model). Each block gets wrapped with torch.compile(m);
+        # small blocks compile fast and are cached, so the effective cost
+        # is paid once per pod boot. Expected ~15–30 % Stage 1 speedup on
+        # Ada + Hopper; transparent to numerics. Default ON — toggle off
+        # with ENABLE_TORCH_COMPILE=0. Only affects the DiT, so it's
+        # orthogonal to Gemma's HQQ quant.
+        torch_compile_enabled = os.getenv(
+            "ENABLE_TORCH_COMPILE", "1"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        if torch_compile_enabled:
+            pipeline_kwargs["torch_compile"] = True
+            logger.info("torch.compile ENABLED (regional per transformer block)")
+        else:
+            logger.info(
+                "torch.compile disabled via ENABLE_TORCH_COMPILE=%s",
+                os.getenv("ENABLE_TORCH_COMPILE"),
+            )
+
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
+
+        # Always-on: aggressive allocator flush at Stage 1 → Stage 2
+        # boundary. Fixes intermittent pin_memory crashes on small
+        # cards; negligible overhead on big ones.
+        _install_stage2_cleanup_hook(self._pipeline)
+
+        # Boot-time attention fingerprint — log which backend LTX-2
+        # resolved to, so we can reason about any A/B perf comparison.
+        _log_attention_fingerprint()
 
         # Diagnostic: dump the nn.Module roots reachable from prompt_encoder
         # so we know where Gemma sits inside LTX-2's custom wrapper. Logged
@@ -633,6 +740,17 @@ class LTXVideoGenerator:
         # One-shot magnitude check on the first Gemma encode. Fires only
         # once; logs ERROR if output is near-zero (silent-failure guard).
         _install_first_encode_magnitude_hook(nn_roots_for_hook)
+
+        # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the DiT forward
+        # on diffusion steps where the input hasn't changed enough
+        # (rescaled relative-L1 below TEACACHE_THRESHOLD). GPU-agnostic
+        # (pure Python cache layer, no kernel dependency) and orthogonal
+        # to Gemma's HQQ quant. Validated 1.6–2.1× lossless speedup on
+        # LTX-Video. Default OFF so the caller opts in explicitly.
+        from src.teacache import enable_teacache, teacache_config_from_env
+        teacache_cfg = teacache_config_from_env()
+        if teacache_cfg is not None:
+            enable_teacache(self._pipeline, **teacache_cfg)
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
