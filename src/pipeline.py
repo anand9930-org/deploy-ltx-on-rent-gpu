@@ -338,7 +338,64 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tu
         "Installed _CachedBuilderWrapper on prompt_encoder._text_encoder_builder"
     )
 
+    # Neuter LTX-2's gpu_model context manager. Its __exit__ calls
+    # model.to("meta") to release storage — that wipes our cached HQQ
+    # weights after the first job, so generation 2 crashes with
+    # "Tensor.item() cannot be called on meta tensors". In pure-GPU mode
+    # we explicitly want the model to stay resident between jobs.
+    _neuter_gpu_model_context_manager()
+
     return len(replaced), [gemma_model]
+
+
+def _neuter_gpu_model_context_manager() -> None:
+    """Replace ``ltx_pipelines.utils.gpu_model.gpu_model`` and any
+    re-exported reference with a no-op context manager. Keeps the model
+    reference alive and on its current device across enter/exit.
+
+    LTX-2's default ``gpu_model`` does ``model.to("meta")`` on exit,
+    which is incompatible with caching-based quant strategies. This
+    patch is idempotent — subsequent calls find the replacement already
+    installed and skip.
+    """
+    import contextlib
+    import sys
+
+    @contextlib.contextmanager
+    def _noop_gpu_model(model, *args, **kwargs):
+        yield model
+
+    # Flag so we know we've already patched.
+    _marker = "__hqq_neutered__"
+
+    # Patch the source module so any fresh import picks up the no-op.
+    try:
+        from ltx_pipelines.utils import gpu_model as _gpu_module
+        if not getattr(_gpu_module.gpu_model, _marker, False):
+            setattr(_noop_gpu_model, _marker, True)
+            _gpu_module.gpu_model = _noop_gpu_model
+            logger.info(
+                "Neutered ltx_pipelines.utils.gpu_model.gpu_model "
+                "(no-op context manager for pure-GPU mode)"
+            )
+    except Exception:
+        logger.exception("Could not patch ltx_pipelines.utils.gpu_model module")
+
+    # Patch any already-imported re-exports (PromptEncoder's parent
+    # module imports gpu_model at module-level, so the `blocks` module
+    # holds its own reference that must be updated).
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        gm = getattr(mod, "gpu_model", None)
+        if gm is None or getattr(gm, _marker, False):
+            continue
+        # Only patch names that look like LTX-2 — avoid stomping unrelated
+        # modules that happen to define their own "gpu_model".
+        if not (mod_name.startswith("ltx_") or mod_name.startswith("LTX-2")):
+            continue
+        setattr(mod, "gpu_model", _noop_gpu_model)
+        logger.info("Neutered %s.gpu_model", mod_name)
 
 
 def _install_first_encode_magnitude_hook(nn_roots) -> None:
