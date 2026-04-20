@@ -112,3 +112,26 @@ These ship with `bitsandbytes` quantization metadata that some loaders respect e
 - Pure-GPU mode code: `src/pipeline.py:40-70` (`_pure_gpu_mode` flag), `src/pipeline.py:97-106` (registry skip), `src/pipeline.py:219-232` (streaming skip).
 - LTX-2 loader path to fix (if we go G1): `/app/LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py:329` → `PromptEncoder.__init__` → `base_encoder.py` `module_ops_from_gemma_root`.
 - Full strategy survey: conversation history 2026-04-20, "all the possible ways for a pure gpu pipeline that could run on 48gb ram".
+
+---
+
+## Optimizations ported from `feat/fa3-teacache`
+
+Imported in one pass after HQQ4 landed. All new features are orthogonal to HQQ — they target the DiT transformer, not Gemma.
+
+- [x] **TeaCache** — `src/teacache.py` ported verbatim. Gated on `ENABLE_TEACACHE=1`, threshold 0.03 lossless / 0.05 aggressive. Patches `DiffusionStage._transformer_ctx` so the streaming + batch-split machinery is untouched.
+- [x] **Stage 1→2 cleanup hook** — `_install_stage2_cleanup_hook`. Always on; flushes allocators at the stage boundary. Harmless on 48 GB+ cards, essential on 24 GB.
+- [x] **torch.compile (regional)** — `ENABLE_TORCH_COMPILE=1` default on. Per-block compile with inductor; 15–30 % Stage-1 speedup on Ada + Hopper.
+- [x] **Attention fingerprint log** — `_log_attention_fingerprint` boots a one-shot diagnostic reporting `xformers` / `flash_attn_interface` availability and which callable LTX-2 resolved to.
+- [x] **Gemma `use_fast=True` sed** in Dockerfile — shaves 1–2 s off text encoding by forcing the Rust tokenizer.
+- [x] **xformers install** — LTX-2's `AttentionFunction.DEFAULT` auto-picks `XFormersAttention` when xformers is importable. Works on Ada sm_89 (no monkey-patching needed). Replaces the FA3 override which was Hopper-only.
+
+### Deliberately NOT ported (Hopper-only)
+
+- [ ] ~~FA3 (`flash_attn_interface`)~~ — Hopper sm_90 only, doesn't run on L40S. Skipped.
+- [ ] ~~`src/attention_override.py` FA3 monkey-patch~~ — dependent on the wheel above.
+- [ ] ~~windreamer wheel install in Dockerfile~~ — same reason.
+
+### Deferred follow-ups
+
+- [ ] **SageAttention 2** — INT8/FP8 attention kernels for Ada, ~2–3× over FA2. Needs a monkey-patch similar to the old FA3 one. Highest-ceiling optimization remaining on this branch.
