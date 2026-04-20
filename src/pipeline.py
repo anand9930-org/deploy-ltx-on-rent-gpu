@@ -856,7 +856,14 @@ class LTXVideoGenerator:
                 frame_rate=frame_rate, num_inference_steps=num_inference_steps,
                 images=[],
                 streaming_prefetch_count=streaming,
-                max_batch_size=4 if streaming else 1,
+                # Guided Stage-1 makes up to 4 transformer calls per step
+                # (CFG + STG + modality). BatchSplitAdapter splits calls
+                # exceeding max_batch_size into sequential chunks, so the
+                # old `1 if pure_gpu` forced 4 serial B=1 passes per step
+                # — wasted kernel launches on a 48 GB card that could hold
+                # B=4 easily. Stage 2 uses SimpleDenoiser (B=1 ≤ 4) so
+                # this is a no-op there.
+                max_batch_size=4,
             )
             if video_guider_params is not None:
                 call_kwargs["video_guider_params"] = video_guider_params
