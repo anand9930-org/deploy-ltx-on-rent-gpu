@@ -6,6 +6,18 @@ from huggingface_hub import hf_hub_download, snapshot_download
 logger = logging.getLogger(__name__)
 
 
+# Gemma checkpoint choice is driven by GEMMA_QUANT (see src/pipeline.py).
+# w4a16 is a community GPTQ-quantized checkpoint with published ~98% parity;
+# bf16 is the official Google QAT-dequantized copy.
+_GEMMA_REPOS: dict[str, tuple[str, str, str]] = {
+    # quant : (repo_id, local_dir_name, approx_size_label)
+    "bf16":  ("google/gemma-3-12b-it-qat-q4_0-unquantized",
+              "gemma-3-12b-it-qat-q4_0-unquantized", "~26 GB"),
+    "w4a16": ("RedHatAI/gemma-3-12b-it-quantized.w4a16",
+              "gemma-3-12b-it-w4a16", "~7 GB"),
+}
+
+
 def ensure_models_downloaded(model_dir: str) -> None:
     """Download all required LTX-2.3 models to *model_dir* if not already present.
 
@@ -19,6 +31,12 @@ def ensure_models_downloaded(model_dir: str) -> None:
             "HF_TOKEN env var required. Gemma 3 model needs license acceptance at "
             "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
         )
+
+    gemma_quant = os.getenv("GEMMA_QUANT", "w4a16").strip().lower()
+    if gemma_quant not in _GEMMA_REPOS:
+        logger.warning("Unknown GEMMA_QUANT=%r; falling back to w4a16", gemma_quant)
+        gemma_quant = "w4a16"
+    gemma_repo_id, gemma_dir_name, gemma_size = _GEMMA_REPOS[gemma_quant]
 
     # 1. LTX-2.3 BF16 checkpoint (~46 GB, runtime fp8_cast downcasts on the fly)
     checkpoint_path = os.path.join(model_dir, "ltx-2.3-22b-dev.safetensors")
@@ -63,32 +81,36 @@ def ensure_models_downloaded(model_dir: str) -> None:
     else:
         logger.info("Distilled LoRA already cached.")
 
-    # 4. Gemma 3 12B text encoder (~26 GB, full snapshot)
-    gemma_dir = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
+    # 4. Gemma 3 12B text encoder. Checkpoint selected by GEMMA_QUANT:
+    #    w4a16 (default) -> RedHatAI GPTQ, ~7 GB, weight-only (BF16 activations)
+    #    bf16            -> Google QAT-dequantized, ~26 GB, reference baseline
+    gemma_dir = os.path.join(model_dir, gemma_dir_name)
     gemma_has_weights = os.path.isdir(gemma_dir) and any(
         f.endswith(".safetensors")
         for f in os.listdir(gemma_dir)
         if os.path.isfile(os.path.join(gemma_dir, f))
     )
     if not gemma_has_weights:
-        logger.info("Downloading Gemma 3 12B text encoder (~26 GB) ...")
+        logger.info(
+            "Downloading Gemma 3 12B text encoder [%s] (%s) from %s ...",
+            gemma_quant, gemma_size, gemma_repo_id,
+        )
         try:
             snapshot_download(
-                repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
+                repo_id=gemma_repo_id,
                 local_dir=gemma_dir,
                 token=hf_token,
             )
         except Exception as e:
             logger.error(
-                "Failed to download Gemma 3: %s. "
-                "You may need to accept the license at "
-                "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized "
-                "and wait for approval.",
-                e,
+                "Failed to download Gemma 3 [%s] from %s: %s. "
+                "For the Google repo you may need to accept the license at "
+                "https://huggingface.co/%s and wait for approval.",
+                gemma_quant, gemma_repo_id, e, gemma_repo_id,
             )
             raise
     else:
-        logger.info("Gemma 3 text encoder already cached.")
+        logger.info("Gemma 3 text encoder [%s] already cached at %s", gemma_quant, gemma_dir)
 
     logger.info("All models verified / downloaded to %s", model_dir)
 
