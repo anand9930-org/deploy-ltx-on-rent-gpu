@@ -18,12 +18,16 @@ DEFAULT_NEGATIVE_PROMPT = (
     "low resolution, watermark, text, oversaturated"
 )
 
-# Gemma text-encoder quantization. Weight-only quant (w4a16) keeps BF16
-# activations out of the encoder, so the LTX downstream sees the same
-# hidden-state dtype + shape it would from BF16 weights. Default is w4a16
-# because it drops Gemma from ~26 GB to ~7 GB, which lets us skip the
-# CPU<->GPU layer-streaming machinery on any 40 GB+ GPU (pure-GPU mode).
-# Override with GEMMA_QUANT=bf16 for a byte-identical baseline run.
+# Gemma text-encoder quantization.
+#
+# NOTE: GEMMA_QUANT=w4a16 is plumbed but does NOT currently produce valid
+# output — LTX-2's PromptEncoder uses a custom safetensors loader (not
+# transformers.AutoModel), so compressed-tensors W4A16 unpacking never
+# runs and the DiT receives garbage conditioning → black video. Default
+# is bf16 until the loader path is fixed to understand compressed-tensors
+# or until we switch to a quant format LTX-2's loader accepts natively.
+# Verified on Blackwell B6000 2026-04-20: w4a16 boots but emits ~60 KB
+# flat-color MP4 for a 5 s 1024x1536 generation.
 _GEMMA_DIRS: dict[str, str] = {
     "bf16": "gemma-3-12b-it-qat-q4_0-unquantized",
     "w4a16": "gemma-3-12b-it-w4a16",
@@ -31,10 +35,10 @@ _GEMMA_DIRS: dict[str, str] = {
 
 
 def _resolve_gemma_quant() -> str:
-    raw = os.getenv("GEMMA_QUANT", "w4a16").strip().lower()
+    raw = os.getenv("GEMMA_QUANT", "bf16").strip().lower()
     if raw not in _GEMMA_DIRS:
-        logger.warning("Unknown GEMMA_QUANT=%r; falling back to w4a16", raw)
-        raw = "w4a16"
+        logger.warning("Unknown GEMMA_QUANT=%r; falling back to bf16", raw)
+        raw = "bf16"
     return raw
 
 

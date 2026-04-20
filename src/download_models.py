@@ -32,10 +32,10 @@ def ensure_models_downloaded(model_dir: str) -> None:
             "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
         )
 
-    gemma_quant = os.getenv("GEMMA_QUANT", "w4a16").strip().lower()
+    gemma_quant = os.getenv("GEMMA_QUANT", "bf16").strip().lower()
     if gemma_quant not in _GEMMA_REPOS:
-        logger.warning("Unknown GEMMA_QUANT=%r; falling back to w4a16", gemma_quant)
-        gemma_quant = "w4a16"
+        logger.warning("Unknown GEMMA_QUANT=%r; falling back to bf16", gemma_quant)
+        gemma_quant = "bf16"
     gemma_repo_id, gemma_dir_name, gemma_size = _GEMMA_REPOS[gemma_quant]
 
     # 1. LTX-2.3 BF16 checkpoint (~46 GB, runtime fp8_cast downcasts on the fly)
