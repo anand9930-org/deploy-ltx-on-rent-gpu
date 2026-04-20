@@ -112,6 +112,33 @@ def ensure_models_downloaded(model_dir: str) -> None:
     else:
         logger.info("Gemma 3 text encoder [%s] already cached at %s", gemma_quant, gemma_dir)
 
+    # LTX-2's loader hardcodes a SentencePiece `tokenizer.model` lookup
+    # (ltx_core/text_encoders/gemma/encoders/base_encoder.py:178).
+    # Community-quantized Gemma repos (RedHatAI W4A16 etc.) ship only the
+    # fast `tokenizer.json`, so fetch the SentencePiece binary from Google's
+    # canonical repo and drop it in. Same vocab, same license gate.
+    tokenizer_model_path = os.path.join(gemma_dir, "tokenizer.model")
+    if not os.path.exists(tokenizer_model_path):
+        logger.info(
+            "tokenizer.model missing in %s — pulling from google/gemma-3-12b-it-qat-q4_0-unquantized",
+            gemma_dir,
+        )
+        try:
+            hf_hub_download(
+                repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
+                filename="tokenizer.model",
+                local_dir=gemma_dir,
+                token=hf_token,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to fetch tokenizer.model from Google repo: %s. "
+                "LTX-2 requires this SentencePiece file; accept the license at "
+                "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized",
+                e,
+            )
+            raise
+
     logger.info("All models verified / downloaded to %s", model_dir)
 
 
