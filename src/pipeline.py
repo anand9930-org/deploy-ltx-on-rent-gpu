@@ -38,14 +38,104 @@ def _resolve_post_load_quant() -> str:
     return raw
 
 
-def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> int:
-    """Walk the pipeline's prompt_encoder subtree and replace every
-    ``nn.Linear`` with an ``HQQLinear``. Returns the count of layers replaced.
+def _find_nn_modules_in(obj, max_depth: int = 6):
+    """Recursively walk an arbitrary object graph and yield every nn.Module
+    reachable via ``vars()`` / ``named_children()`` — including attributes
+    that start with an underscore. Used to locate the Gemma nn.Module that
+    LTX-2's PromptEncoder (a plain Python class, not an nn.Module) stashes
+    somewhere inside itself.
 
-    Design: we target the prompt_encoder subtree only, not the whole pipeline,
-    so the DiT / VAE / upscaler stay untouched. HQQ runs calibration-free,
-    so no sample input is needed. ``compute_dtype=bfloat16`` preserves the
-    activation path downstream LTX consumers expect.
+    Yields (path, module) pairs with cycle detection.
+    """
+    import torch.nn as nn
+
+    visited: set[int] = set()
+
+    def _walk(node, depth: int, path: str):
+        node_id = id(node)
+        if node_id in visited or depth > max_depth:
+            return
+        visited.add(node_id)
+        if isinstance(node, nn.Module):
+            yield path, node
+            # Don't descend into the Module's children here — caller handles
+            # that via named_modules(). We still descend through any plain
+            # Python attributes the Module might hold (unusual but cheap).
+            try:
+                obj_vars = vars(node)
+            except TypeError:
+                return
+            for name, attr in list(obj_vars.items()):
+                if isinstance(attr, nn.Module):
+                    continue  # reachable via named_children
+                if _is_container_like(attr):
+                    yield from _walk(attr, depth + 1, f"{path}.{name}")
+            return
+        # Non-nn.Module container: scan attrs for nn.Modules + sub-wrappers
+        try:
+            obj_vars = vars(node)
+        except TypeError:
+            return
+        for name, attr in list(obj_vars.items()):
+            child_path = f"{path}.{name}" if path else name
+            if isinstance(attr, nn.Module):
+                yield from _walk(attr, depth + 1, child_path)
+            elif _is_container_like(attr):
+                yield from _walk(attr, depth + 1, child_path)
+
+    yield from _walk(obj, 0, "prompt_encoder")
+
+
+def _is_container_like(obj) -> bool:
+    """True if obj is worth recursing into (has ``__dict__`` and isn't a
+    trivial leaf). Excludes tensors, callables, and primitive types."""
+    import types
+    if obj is None:
+        return False
+    if isinstance(obj, (str, int, float, bool, bytes, bytearray)):
+        return False
+    if torch.is_tensor(obj):
+        return False
+    if isinstance(obj, (types.FunctionType, types.MethodType, type)):
+        return False
+    return hasattr(obj, "__dict__") or isinstance(obj, (list, tuple, dict))
+
+
+def _dump_prompt_encoder_structure(pipeline) -> None:
+    """One-shot diagnostic: log the nn.Modules reachable from
+    ``pipeline.prompt_encoder`` so we can see where Gemma is nested."""
+    prompt_encoder = getattr(pipeline, "prompt_encoder", None)
+    if prompt_encoder is None:
+        logger.info("prompt_encoder: (missing)")
+        return
+    logger.info("prompt_encoder top-level type: %s", type(prompt_encoder).__name__)
+    found = list(_find_nn_modules_in(prompt_encoder))
+    if not found:
+        logger.info("prompt_encoder: no nn.Module descendants found")
+        return
+    for path, mod in found[:12]:  # cap log volume
+        try:
+            n_params = sum(p.numel() for p in mod.parameters(recurse=False))
+            n_params_total = sum(p.numel() for p in mod.parameters())
+        except Exception:
+            n_params = n_params_total = -1
+        logger.info(
+            "  %s = %s  (own_params=%d, total_params=%d)",
+            path, type(mod).__name__, n_params, n_params_total,
+        )
+    if len(found) > 12:
+        logger.info("  ... and %d more nn.Modules", len(found) - 12)
+
+
+def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tuple[int, list]:
+    """Walk the pipeline's prompt_encoder subtree and replace every
+    ``nn.Linear`` with an ``HQQLinear``. Returns (count_replaced, nn_module_roots).
+
+    Recurses through arbitrary wrapper objects (LTX-2's PromptEncoder is a
+    plain Python class holding the Gemma nn.Module deeper down), so on-disk
+    BF16 weights stay compatible with LTX-2's custom loader but runtime
+    Linear layers get quantized. ``compute_dtype=bfloat16`` keeps the DiT
+    interface unchanged.
     """
     from hqq.core.quantize import BaseQuantizeConfig, HQQLinear
     import torch.nn as nn
@@ -66,60 +156,83 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> in
         view_as_float=False,
     )
 
+    # Locate every nn.Module root reachable from prompt_encoder. Quantize
+    # the Linear layers inside each. (Most pipelines have a single big
+    # Gemma root; some may also expose a small head/projection sibling.)
+    nn_roots: list[tuple[str, nn.Module]] = list(_find_nn_modules_in(prompt_encoder))
+    if not nn_roots:
+        raise RuntimeError(
+            "Post-load quant: no nn.Module found anywhere under prompt_encoder. "
+            "LTX-2's PromptEncoder wrapper does not expose its Gemma model via "
+            "any attribute reachable by vars(). See boot log structure dump."
+        )
+
+    # De-duplicate roots: if module A is a descendant of module B via
+    # named_modules(), we only need to walk B. Keep the roots with the
+    # shortest path that cover everything.
+    root_ids: set[int] = set()
+    unique_roots: list[tuple[str, nn.Module]] = []
+    for path, root in nn_roots:
+        if id(root) in root_ids:
+            continue
+        # Skip roots that are contained inside an already-picked root.
+        if any(
+            id(root) in {id(sub) for sub in picked.modules()}
+            for _, picked in unique_roots
+        ):
+            continue
+        unique_roots.append((path, root))
+        root_ids.add(id(root))
+
     replaced: list[str] = []
 
-    def _walk(module: nn.Module, path: str) -> None:
+    def _quant_linears(module: nn.Module, path: str) -> None:
         for name, child in list(module.named_children()):
             child_path = f"{path}.{name}" if path else name
             if isinstance(child, nn.Linear) and not isinstance(child, HQQLinear):
-                device = child.weight.device
                 hqq_layer = HQQLinear(
                     child,
                     quant_config=quant_config,
                     compute_dtype=torch.bfloat16,
-                    device=device,
+                    device=child.weight.device,
                     initialize=True,
                     del_orig=True,
                 )
                 setattr(module, name, hqq_layer)
                 replaced.append(child_path)
             else:
-                _walk(child, child_path)
+                _quant_linears(child, child_path)
 
-    # prompt_encoder itself may or may not be an nn.Module — walk it either
-    # way via attribute traversal. Most LTX-2 prompt encoders wrap an
-    # underlying Gemma nn.Module that we can recurse into safely.
-    if isinstance(prompt_encoder, nn.Module):
-        _walk(prompt_encoder, "prompt_encoder")
-    else:
-        # Non-nn.Module wrapper: recurse into its attributes looking for
-        # nn.Modules, then walk those.
-        for attr_name in dir(prompt_encoder):
-            if attr_name.startswith("_"):
-                continue
-            try:
-                attr = getattr(prompt_encoder, attr_name)
-            except Exception:
-                continue
-            if isinstance(attr, nn.Module):
-                _walk(attr, f"prompt_encoder.{attr_name}")
+    for path, root in unique_roots:
+        logger.info("Quantizing Linears under %s (%s)", path, type(root).__name__)
+        _quant_linears(root, path)
 
-    return len(replaced)
+    return len(replaced), [root for _, root in unique_roots]
 
 
-def _install_first_encode_magnitude_hook(pipeline) -> None:
-    """Attach a one-shot forward hook on the prompt_encoder that logs the
-    output magnitude on the first call. Catches the silent-failure mode
-    where a broken quant produces near-zero hidden states (which would
-    otherwise only show up as a flat-black MP4 after the full job).
+def _install_first_encode_magnitude_hook(nn_roots) -> None:
+    """Register a one-shot forward hook on the largest nn.Module root we
+    identified (that's Gemma). Logs the magnitude of the first forward's
+    output — catches near-zero silent-failure mode that would otherwise
+    only surface as a flat-black MP4.
     """
-    prompt_encoder = getattr(pipeline, "prompt_encoder", None)
-    if not isinstance(prompt_encoder, torch.nn.Module):
-        logger.warning(
-            "prompt_encoder is not nn.Module (type=%s); magnitude hook skipped",
-            type(prompt_encoder).__name__,
-        )
+    if not nn_roots:
+        logger.warning("Magnitude hook: no nn.Module roots to attach to")
         return
+
+    # Largest root by total parameter count ≈ Gemma (12B params vs
+    # anything else in the prompt encoder).
+    def _param_count(m):
+        try:
+            return sum(p.numel() for p in m.parameters())
+        except Exception:
+            return 0
+
+    gemma_candidate = max(nn_roots, key=_param_count)
+    logger.info(
+        "Magnitude hook target: %s (%d params)",
+        type(gemma_candidate).__name__, _param_count(gemma_candidate),
+    )
 
     state = {"logged": False}
 
@@ -137,9 +250,11 @@ def _install_first_encode_magnitude_hook(pipeline) -> None:
         if state["logged"]:
             return
         state["logged"] = True
+        saw_tensor = False
         for i, tensor in enumerate(_collect_tensors(output)):
             if not tensor.is_floating_point():
                 continue
+            saw_tensor = True
             try:
                 max_abs = tensor.detach().abs().max().item()
                 mean_abs = tensor.detach().abs().mean().item()
@@ -156,8 +271,10 @@ def _install_first_encode_magnitude_hook(pipeline) -> None:
                     "quantization likely produced garbage; expect black video",
                     i, max_abs,
                 )
+        if not saw_tensor:
+            logger.warning("Magnitude hook: no floating-point tensors in output")
 
-    prompt_encoder.register_forward_hook(hook)
+    gemma_candidate.register_forward_hook(hook)
 
 
 def _round_to(value: int, divisor: int) -> int:
@@ -264,25 +381,33 @@ class LTXVideoGenerator:
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
 
+        # Diagnostic: dump the nn.Module roots reachable from prompt_encoder
+        # so we know where Gemma sits inside LTX-2's custom wrapper. Logged
+        # once at init; useful for quant-path debugging.
+        _dump_prompt_encoder_structure(self._pipeline)
+
         # Post-load Gemma quantization. Runs after BF16 weights are in
         # place; replaces nn.Linear → HQQLinear in the prompt-encoder
         # subtree. Guarded with a magnitude hook that logs the first
         # encoded output so a broken quant can't silently produce black
         # video the way on-disk W4A16 did (see docs/gemma-compat-checklist.md).
+        nn_roots_for_hook: list = []
         if self._post_load_quant != "none":
             nbits = {"hqq4": 4, "hqq8": 8}[self._post_load_quant]
             logger.info("Applying post-load HQQ quant (nbits=%d) to prompt encoder ...", nbits)
             try:
-                n_replaced = _apply_hqq_post_load_quant(self._pipeline, nbits=nbits)
+                n_replaced, nn_roots_for_hook = _apply_hqq_post_load_quant(
+                    self._pipeline, nbits=nbits,
+                )
                 logger.info(
                     "Post-load HQQ%d quant applied: %d Linear layers replaced",
                     nbits, n_replaced,
                 )
                 if n_replaced == 0:
                     logger.error(
-                        "Post-load quant replaced 0 Linear layers — check that "
-                        "`pipeline.prompt_encoder` exposes an nn.Module subtree. "
-                        "Gemma will still run but VRAM win was not realised."
+                        "Post-load quant replaced 0 Linear layers — check the "
+                        "structure dump above. Gemma will still run but VRAM win "
+                        "was not realised."
                     )
                 self._log_vram("after post-load quant")
             except Exception:
@@ -292,10 +417,15 @@ class LTXVideoGenerator:
                 )
                 self._post_load_quant = "none"
                 self._pure_gpu_mode = False
+        else:
+            # Even without quant, attach the magnitude hook so BF16 runs get
+            # observability on Gemma output magnitude — helps compare against
+            # a quantized run later.
+            nn_roots_for_hook = [m for _, m in _find_nn_modules_in(self._pipeline.prompt_encoder)]
 
         # One-shot magnitude check on the first Gemma encode. Fires only
         # once; logs ERROR if output is near-zero (silent-failure guard).
-        _install_first_encode_magnitude_hook(self._pipeline)
+        _install_first_encode_magnitude_hook(nn_roots_for_hook)
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
