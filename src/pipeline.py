@@ -18,6 +18,25 @@ DEFAULT_NEGATIVE_PROMPT = (
     "low resolution, watermark, text, oversaturated"
 )
 
+# Gemma text-encoder quantization. Weight-only quant (w4a16) keeps BF16
+# activations out of the encoder, so the LTX downstream sees the same
+# hidden-state dtype + shape it would from BF16 weights. Default is w4a16
+# because it drops Gemma from ~26 GB to ~7 GB, which lets us skip the
+# CPU<->GPU layer-streaming machinery on any 40 GB+ GPU (pure-GPU mode).
+# Override with GEMMA_QUANT=bf16 for a byte-identical baseline run.
+_GEMMA_DIRS: dict[str, str] = {
+    "bf16": "gemma-3-12b-it-qat-q4_0-unquantized",
+    "w4a16": "gemma-3-12b-it-w4a16",
+}
+
+
+def _resolve_gemma_quant() -> str:
+    raw = os.getenv("GEMMA_QUANT", "w4a16").strip().lower()
+    if raw not in _GEMMA_DIRS:
+        logger.warning("Unknown GEMMA_QUANT=%r; falling back to w4a16", raw)
+        raw = "w4a16"
+    return raw
+
 
 def _round_to(value: int, divisor: int) -> int:
     return (value // divisor) * divisor
@@ -38,7 +57,27 @@ class LTXVideoGenerator:
         distilled_lora_path = os.path.join(
             model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
         )
-        gemma_root = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
+
+        self._gemma_quant = _resolve_gemma_quant()
+        gemma_root = os.path.join(model_dir, _GEMMA_DIRS[self._gemma_quant])
+        logger.info("Gemma quant: %s (root=%s)", self._gemma_quant, gemma_root)
+
+        # Pure-GPU mode: when Gemma is small enough (w4a16 ~= 7 GB) and the
+        # GPU has >= 40 GB, the CPU<->GPU swapping machinery (StateDictRegistry
+        # + per-layer streaming) becomes unnecessary — every model fits
+        # resident, so we skip the PCIe roundtrips entirely.
+        gpu_vram_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1e9
+            if torch.cuda.is_available() else 0
+        )
+        self._gpu_vram_gb = gpu_vram_gb
+        self._pure_gpu_mode = self._gemma_quant in ("w4a16",) and gpu_vram_gb >= 40
+        if self._pure_gpu_mode:
+            logger.info(
+                "Pure-GPU mode ENABLED: Gemma=%s + %.0f GB VRAM, "
+                "registry and layer streaming will be bypassed",
+                self._gemma_quant, gpu_vram_gb,
+            )
 
         logger.info("Initializing LTX-2.3 pipeline ...")
         self._log_vram("before pipeline init")
@@ -58,14 +97,18 @@ class LTXVideoGenerator:
             quantization = None
             logger.warning("QuantizationPolicy not available")
 
-        # CPU weight caching — only one model on GPU at a time
+        # CPU weight caching — only one model on GPU at a time.
+        # Skipped in pure-GPU mode since all models fit resident.
         registry = None
-        try:
-            from ltx_core.loader import StateDictRegistry
-            registry = StateDictRegistry()
-            logger.info("Using StateDictRegistry (CPU weight caching)")
-        except ImportError:
-            logger.warning("StateDictRegistry not available")
+        if self._pure_gpu_mode:
+            logger.info("Pure-GPU mode: skipping StateDictRegistry")
+        else:
+            try:
+                from ltx_core.loader import StateDictRegistry
+                registry = StateDictRegistry()
+                logger.info("Using StateDictRegistry (CPU weight caching)")
+            except ImportError:
+                logger.warning("StateDictRegistry not available")
 
         # Distilled LoRA
         from ltx_core.loader import (
@@ -178,10 +221,22 @@ class LTXVideoGenerator:
             # With streaming, build+fuse happens on CPU (plenty of RAM),
             # then only 2-3 layers live on GPU at any time during inference.
             # max_batch_size=4 batches guidance passes to reduce PCIe round-trips.
-            gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-            streaming = 2 if gpu_vram_gb < 40 else None
-            if streaming:
-                logger.info("Job %s: streaming enabled (GPU VRAM: %.0f GB < 40 GB)", job_id, gpu_vram_gb)
+            #
+            # Pure-GPU mode (w4a16 Gemma + >=40 GB VRAM) bypasses streaming
+            # entirely: DiT + Gemma + VAE + upscaler all stay resident.
+            if self._pure_gpu_mode:
+                streaming = None
+                logger.info(
+                    "Job %s: pure-GPU mode — streaming disabled (%.0f GB VRAM)",
+                    job_id, self._gpu_vram_gb,
+                )
+            else:
+                streaming = 2 if self._gpu_vram_gb < 40 else None
+                if streaming:
+                    logger.info(
+                        "Job %s: streaming enabled (GPU VRAM: %.0f GB < 40 GB)",
+                        job_id, self._gpu_vram_gb,
+                    )
 
             call_kwargs = dict(
                 prompt=prompt, negative_prompt=negative_prompt, seed=seed,
