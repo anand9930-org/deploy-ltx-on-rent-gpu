@@ -30,7 +30,8 @@ Load Gemma as BF16 through LTX-2's normal path, then replace `nn.Linear`
 modules in-place with quantized equivalents. On-disk stays BF16 (loader
 happy); runtime memory drops.
 
-- [ ] **HQQ 4-bit post-load** — dependency `hqq`, ~7 GB runtime. Calibration-free, published near-lossless. **First candidate.**
+- [~] **HQQ 4-bit post-load** — ✅ **plumbed** (commit `69a75ba`), `GEMMA_POST_LOAD_QUANT=hqq4`. Live end-to-end test pending.
+- [~] **HQQ 8-bit post-load** — ✅ **plumbed** (commit `69a75ba`), `GEMMA_POST_LOAD_QUANT=hqq8`. Backup if hqq4 drifts.
 - [ ] **BitsAndBytes NF4 post-load** — dependency `bitsandbytes`, ~7 GB runtime, `compute_dtype=bfloat16` preserves activations. Backup if HQQ has issues.
 - [ ] **BitsAndBytes 8-bit (LLM.int8) post-load** — ~13 GB runtime. Conservative floor — essentially always works, effectively lossless. Keep as safety net.
 - [ ] **TorchAO `Int8WeightOnlyConfig`** via `torchao.quantization.quantize_(gemma, config)` — ~13 GB runtime, modern PyTorch-native API.
