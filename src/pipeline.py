@@ -204,15 +204,58 @@ def _dump_prompt_encoder_structure(pipeline) -> None:
         logger.warning("  [diag] ... and %d more", len(found) - 20)
 
 
-def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tuple[int, list]:
-    """Walk the pipeline's prompt_encoder subtree and replace every
-    ``nn.Linear`` with an ``HQQLinear``. Returns (count_replaced, nn_module_roots).
+class _CachedBuilderWrapper:
+    """Proxy for a ``SingleGPUModelBuilder`` that always returns a pre-built,
+    pre-quantized model instance.
 
-    Recurses through arbitrary wrapper objects (LTX-2's PromptEncoder is a
-    plain Python class holding the Gemma nn.Module deeper down), so on-disk
-    BF16 weights stay compatible with LTX-2's custom loader but runtime
-    Linear layers get quantized. ``compute_dtype=bfloat16`` keeps the DiT
-    interface unchanged.
+    LTX-2's ``PromptEncoder`` calls ``builder.build(device, dtype)`` on every
+    ``__call__`` (once for the text encoder, once for the embeddings
+    processor) and frees the result via a context manager after use. Without
+    caching, HQQ quantization would run fresh on every job, which is
+    unacceptable. This wrapper holds our quantized Gemma across calls,
+    re-parking it on the requested device each time (the ``gpu_model``
+    context manager upstream may have moved it to CPU on the previous exit).
+
+    Non-``build`` attribute access is forwarded to the original builder so
+    any LTX-2 internals that introspect the dataclass fields still work.
+    """
+
+    def __init__(self, original_builder, cached_model):
+        self._original_builder = original_builder
+        self._cached_model = cached_model
+
+    def build(self, device=None, dtype=None, **kwargs):
+        model = self._cached_model
+        if device is not None:
+            try:
+                first_param = next(model.parameters(), None)
+                if first_param is None or first_param.device != device:
+                    model = model.to(device)
+                    self._cached_model = model
+            except Exception:
+                logger.warning(
+                    "CachedBuilder: failed to move cached Gemma to %s; "
+                    "using whatever device the model currently lives on",
+                    device,
+                )
+        return model
+
+    def __getattr__(self, name):
+        return getattr(self._original_builder, name)
+
+
+def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tuple[int, list]:
+    """Materialize LTX-2's lazy Gemma builder, quantize every ``nn.Linear``
+    with ``HQQLinear``, and install a caching wrapper so future builds
+    return our quantized instance. Returns (count_replaced, [gemma_model]).
+
+    Rationale: the PromptEncoder's ``_text_encoder_builder`` is a
+    ``SingleGPUModelBuilder`` that defers model construction until
+    ``.build(device, dtype)`` is called inside ``__call__`` / a context
+    manager. Walking ``vars()`` at init finds no ``nn.Module`` because the
+    model doesn't exist yet. We force construction here, quantize, and
+    swap the builder so all future ``.build()`` calls reuse the same
+    quantized weights.
     """
     from hqq.core.quantize import BaseQuantizeConfig, HQQLinear
     import torch.nn as nn
@@ -224,6 +267,39 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tu
             "cannot locate the Gemma quant target"
         )
 
+    builder = getattr(prompt_encoder, "_text_encoder_builder", None)
+    if builder is None:
+        raise RuntimeError(
+            "prompt_encoder has no `_text_encoder_builder` — LTX-2 internals changed"
+        )
+    if isinstance(builder, _CachedBuilderWrapper):
+        logger.warning("Post-load quant already applied; skipping")
+        return 0, [builder._cached_model]
+
+    # Pull the target device/dtype from the prompt_encoder's stored values.
+    device = getattr(prompt_encoder, "_device", None)
+    dtype = getattr(prompt_encoder, "_dtype", None) or torch.bfloat16
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    logger.info(
+        "Materializing Gemma via builder.build(device=%s, dtype=%s) — this "
+        "is the first time weights leave disk for the pod.",
+        device, dtype,
+    )
+    gemma_model = builder.build(device=device, dtype=dtype).eval()
+    try:
+        first_param = next(gemma_model.parameters())
+        logger.info(
+            "Gemma materialized: type=%s, total_params=%d, dtype=%s, device=%s",
+            type(gemma_model).__name__,
+            sum(p.numel() for p in gemma_model.parameters()),
+            first_param.dtype,
+            first_param.device,
+        )
+    except StopIteration:
+        raise RuntimeError("Gemma builder returned a model with zero parameters")
+
     quant_config = BaseQuantizeConfig(
         nbits=nbits,
         group_size=group_size,
@@ -232,34 +308,6 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tu
         offload_meta=False,
         view_as_float=False,
     )
-
-    # Locate every nn.Module root reachable from prompt_encoder. Quantize
-    # the Linear layers inside each. (Most pipelines have a single big
-    # Gemma root; some may also expose a small head/projection sibling.)
-    nn_roots: list[tuple[str, nn.Module]] = list(_find_nn_modules_in(prompt_encoder))
-    if not nn_roots:
-        raise RuntimeError(
-            "Post-load quant: no nn.Module found anywhere under prompt_encoder. "
-            "LTX-2's PromptEncoder wrapper does not expose its Gemma model via "
-            "any attribute reachable by vars(). See boot log structure dump."
-        )
-
-    # De-duplicate roots: if module A is a descendant of module B via
-    # named_modules(), we only need to walk B. Keep the roots with the
-    # shortest path that cover everything.
-    root_ids: set[int] = set()
-    unique_roots: list[tuple[str, nn.Module]] = []
-    for path, root in nn_roots:
-        if id(root) in root_ids:
-            continue
-        # Skip roots that are contained inside an already-picked root.
-        if any(
-            id(root) in {id(sub) for sub in picked.modules()}
-            for _, picked in unique_roots
-        ):
-            continue
-        unique_roots.append((path, root))
-        root_ids.add(id(root))
 
     replaced: list[str] = []
 
@@ -280,11 +328,17 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tu
             else:
                 _quant_linears(child, child_path)
 
-    for path, root in unique_roots:
-        logger.info("Quantizing Linears under %s (%s)", path, type(root).__name__)
-        _quant_linears(root, path)
+    _quant_linears(gemma_model, "gemma")
 
-    return len(replaced), [root for _, root in unique_roots]
+    # Install the caching wrapper so PromptEncoder.__call__ reuses our
+    # quantized instance. PromptEncoder isn't a frozen dataclass so this
+    # straight assignment works.
+    prompt_encoder._text_encoder_builder = _CachedBuilderWrapper(builder, gemma_model)
+    logger.info(
+        "Installed _CachedBuilderWrapper on prompt_encoder._text_encoder_builder"
+    )
+
+    return len(replaced), [gemma_model]
 
 
 def _install_first_encode_magnitude_hook(nn_roots) -> None:
@@ -388,6 +442,19 @@ class LTXVideoGenerator:
             if torch.cuda.is_available() else 0
         )
         self._gpu_vram_gb = gpu_vram_gb
+
+        # HQQ quantization is incompatible with LTX-2's per-layer streaming
+        # path (packed INT4 weights + their scales can't be shuffled layer
+        # by layer through _streaming_model the way raw BF16 weights can).
+        # Disable quant on any GPU that would need streaming.
+        if self._post_load_quant != "none" and gpu_vram_gb < 40:
+            logger.warning(
+                "GEMMA_POST_LOAD_QUANT=%s requested but GPU VRAM %.0f GB < 40 GB — "
+                "HQQ is incompatible with layer streaming; disabling quant",
+                self._post_load_quant, gpu_vram_gb,
+            )
+            self._post_load_quant = "none"
+
         quant_reduces_vram = self._post_load_quant != "none"
         self._pure_gpu_mode = quant_reduces_vram and gpu_vram_gb >= 40
         if self._pure_gpu_mode:
