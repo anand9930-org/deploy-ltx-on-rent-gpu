@@ -343,59 +343,65 @@ def _apply_hqq_post_load_quant(pipeline, nbits: int, group_size: int = 64) -> tu
     # weights after the first job, so generation 2 crashes with
     # "Tensor.item() cannot be called on meta tensors". In pure-GPU mode
     # we explicitly want the model to stay resident between jobs.
-    _neuter_gpu_model_context_manager()
+    # Failure here is logged but non-fatal: HQQ quant stays applied even
+    # if we can't fully neuter gpu_model.
+    try:
+        _neuter_gpu_model_context_manager()
+    except Exception:
+        logger.exception(
+            "Could not neuter gpu_model — HQQ is installed but the first job's "
+            "gpu_model.__exit__ may still wipe weights. Second job will crash."
+        )
 
     return len(replaced), [gemma_model]
 
 
 def _neuter_gpu_model_context_manager() -> None:
     """Replace ``ltx_pipelines.utils.gpu_model.gpu_model`` and any
-    re-exported reference with a no-op context manager. Keeps the model
+    re-exported references with a no-op context manager. Keeps the model
     reference alive and on its current device across enter/exit.
 
     LTX-2's default ``gpu_model`` does ``model.to("meta")`` on exit,
-    which is incompatible with caching-based quant strategies. This
-    patch is idempotent — subsequent calls find the replacement already
-    installed and skip.
+    which is incompatible with caching-based quant strategies. Idempotent.
+
+    Patches are applied to specific known consumers by direct import
+    rather than walking sys.modules, which previously tripped over
+    torch._classes' __getattr__ raising RuntimeError.
     """
     import contextlib
-    import sys
 
     @contextlib.contextmanager
     def _noop_gpu_model(model, *args, **kwargs):
         yield model
 
-    # Flag so we know we've already patched.
-    _marker = "__hqq_neutered__"
+    _marker = "_hqq_neutered"
+    setattr(_noop_gpu_model, _marker, True)
 
-    # Patch the source module so any fresh import picks up the no-op.
+    patched: list[str] = []
+
+    # 1. Source module — governs any future `import gpu_model from` calls.
     try:
-        from ltx_pipelines.utils import gpu_model as _gpu_module
-        if not getattr(_gpu_module.gpu_model, _marker, False):
-            setattr(_noop_gpu_model, _marker, True)
-            _gpu_module.gpu_model = _noop_gpu_model
-            logger.info(
-                "Neutered ltx_pipelines.utils.gpu_model.gpu_model "
-                "(no-op context manager for pure-GPU mode)"
-            )
+        from ltx_pipelines.utils import gpu_model as _source_mod
+        if not getattr(getattr(_source_mod, "gpu_model", None), _marker, False):
+            _source_mod.gpu_model = _noop_gpu_model
+            patched.append("ltx_pipelines.utils.gpu_model")
     except Exception:
-        logger.exception("Could not patch ltx_pipelines.utils.gpu_model module")
+        logger.warning("Could not patch source module ltx_pipelines.utils.gpu_model", exc_info=True)
 
-    # Patch any already-imported re-exports (PromptEncoder's parent
-    # module imports gpu_model at module-level, so the `blocks` module
-    # holds its own reference that must be updated).
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        gm = getattr(mod, "gpu_model", None)
-        if gm is None or getattr(gm, _marker, False):
-            continue
-        # Only patch names that look like LTX-2 — avoid stomping unrelated
-        # modules that happen to define their own "gpu_model".
-        if not (mod_name.startswith("ltx_") or mod_name.startswith("LTX-2")):
-            continue
-        setattr(mod, "gpu_model", _noop_gpu_model)
-        logger.info("Neutered %s.gpu_model", mod_name)
+    # 2. Known consumer — ltx_pipelines.utils.blocks imports gpu_model at
+    # module top level, so it holds its own reference that needs updating.
+    try:
+        from ltx_pipelines.utils import blocks as _blocks_mod
+        if not getattr(getattr(_blocks_mod, "gpu_model", None), _marker, False):
+            _blocks_mod.gpu_model = _noop_gpu_model
+            patched.append("ltx_pipelines.utils.blocks")
+    except Exception:
+        logger.warning("Could not patch ltx_pipelines.utils.blocks.gpu_model", exc_info=True)
+
+    if patched:
+        logger.info("Neutered gpu_model in: %s", ", ".join(patched))
+    else:
+        logger.warning("gpu_model was not patched anywhere — second job may crash")
 
 
 def _install_first_encode_magnitude_hook(nn_roots) -> None:
