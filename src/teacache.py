@@ -210,12 +210,23 @@ class _PatchedContextManager:
                     exc_info=True,
                 )
         if self._state is not None:
+            total = self._state.computes + self._state.skips
+            # Effective DiT-call speedup: total steps / actual computes.
+            # 0 skips → 1.00x (baseline). Higher means more steps elided.
+            effective_speedup = (
+                (total / self._state.computes) if self._state.computes > 0 else 0.0
+            )
             logger.info(
-                "TeaCache [%s]: computes=%d skips=%d skip_rate=%.1f%%",
+                "TeaCache [%s] STATS: threshold=%.3f  total_steps=%d  "
+                "computed=%d  skipped=%d  skip_rate=%.1f%%  "
+                "effective_DiT_speedup=%.2fx",
                 self._stage_name,
+                self._threshold,
+                total,
                 self._state.computes,
                 self._state.skips,
                 100.0 * self._state.skip_rate,
+                effective_speedup,
             )
             # Explicitly drop tensor refs — without this, our cached
             # (prev_vx, prev_ax) hold GPU memory across the stage

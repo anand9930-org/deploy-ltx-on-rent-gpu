@@ -749,8 +749,34 @@ class LTXVideoGenerator:
         # LTX-Video. Default OFF so the caller opts in explicitly.
         from src.teacache import enable_teacache, teacache_config_from_env
         teacache_cfg = teacache_config_from_env()
-        if teacache_cfg is not None:
-            enable_teacache(self._pipeline, **teacache_cfg)
+        self._teacache_enabled = teacache_cfg is not None
+        self._teacache_cfg = teacache_cfg
+        if self._teacache_enabled:
+            n_patched = enable_teacache(self._pipeline, **teacache_cfg)
+            logger.info(
+                "=" * 70 + "\n"
+                "TeaCache: ENABLED  threshold=%.3f  stages=%s  patched=%d\n"
+                "  Env: ENABLE_TEACACHE=%s  TEACACHE_THRESHOLD=%s  TEACACHE_STAGES=%s\n"
+                "  Skip-rate stats logged per stage on each generation.\n"
+                + "=" * 70,
+                teacache_cfg["threshold"],
+                ",".join(teacache_cfg["stages"]),
+                n_patched,
+                os.getenv("ENABLE_TEACACHE", "<unset>"),
+                os.getenv("TEACACHE_THRESHOLD", "<unset>"),
+                os.getenv("TEACACHE_STAGES", "<unset>"),
+            )
+        else:
+            logger.info(
+                "=" * 70 + "\n"
+                "TeaCache: DISABLED  (set ENABLE_TEACACHE=1 to turn on)\n"
+                "  Env: ENABLE_TEACACHE=%s  TEACACHE_THRESHOLD=%s  TEACACHE_STAGES=%s\n"
+                "  Recommended thresholds: 0.03 (lossless ~1.6x), 0.05 (~2.1x)\n"
+                + "=" * 70,
+                os.getenv("ENABLE_TEACACHE", "<unset>"),
+                os.getenv("TEACACHE_THRESHOLD", "<unset>"),
+                os.getenv("TEACACHE_STAGES", "<unset>"),
+            )
 
         # Optional components (guiders, tiling)
         self._MultiModalGuiderParams = None
@@ -802,6 +828,15 @@ class LTXVideoGenerator:
             "Job %s: prompt=%r, %dx%d, %d frames, %d steps, seed=%d",
             job_id, prompt[:80], width, height, num_frames, num_inference_steps, seed,
         )
+        if self._teacache_enabled:
+            logger.info(
+                "Job %s: TeaCache ON (threshold=%.3f, stages=%s) — expect skip-rate stats per stage below",
+                job_id,
+                self._teacache_cfg["threshold"],
+                ",".join(self._teacache_cfg["stages"]),
+            )
+        else:
+            logger.info("Job %s: TeaCache OFF", job_id)
 
         try:
             # Guidance params
