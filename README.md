@@ -20,7 +20,9 @@ src/download_models.py  Idempotent model downloader from HuggingFace
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 1 GB | `Lightricks/LTX-2.3` |
 | `gemma-3-12b-it-qat-q4_0-unquantized/` | 26 GB | `google/gemma-3-12b-it-qat-q4_0-unquantized` |
 
-**GPU requirement:** RTX 4090 or L4 (24GB VRAM, Ada Lovelace architecture for FP8 support).
+**GPU requirement:** RTX 4090 or L4 (24GB VRAM, Ada Lovelace architecture for FP8 support). Bigger GPUs (H100 80GB, L40S 48GB) automatically skip CPU↔GPU layer streaming for pure-GPU inference.
+
+**Attention backend:** SageAttention 2.2.0 is installed and picked up automatically via `AttentionFunction.DEFAULT`. On Hopper (H100) it dispatches to `sageattn_qk_int8_pv_fp8_cuda_sm90` (INT8 QK + FP8 PV) for both a step-time and accuracy win over the XFormers / FA2-class fallback. If the `sageattention` wheel fails to import, we fall back to XFormers → PyTorch SDPA.
 
 ## Prerequisites
 

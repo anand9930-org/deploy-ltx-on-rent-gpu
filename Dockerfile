@@ -25,6 +25,9 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
         -e /app/LTX-2/packages/ltx-core \
         -e /app/LTX-2/packages/ltx-pipelines
 
+# ---- SageAttention (Hopper sm_90 FP8 kernel auto-dispatch) -----------------
+RUN uv pip install --system --no-cache sageattention==2.2.0 --no-build-isolation
+
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --no-cache /app
