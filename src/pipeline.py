@@ -954,5 +954,32 @@ class LTXVideoGenerator:
 
         except Exception:
             logger.exception("Job %s failed", job_id)
-            torch.cuda.empty_cache()
             raise
+        finally:
+            # End-of-job cleanup. Necessary because _neuter_gpu_model_context_manager
+            # disables LTX-2's per-context teardown to keep our HQQ-cached Gemma
+            # alive (gpu_model.__exit__'s `model.to("meta")` would wipe it). The
+            # neutering is module-wide, so DiT / VAE / upscaler also stop being
+            # released on context exit. Without explicit cleanup here, those
+            # tensors stay live across jobs — and torch.compile's captured
+            # graphs hold strong references to the DiT weights, so simple
+            # variable-scope exit + gc.collect isn't enough either.
+            #
+            # Repro: 3 sequential 1088x1920 jobs on 48 GB L40S — Job 3 OOMs at
+            # `safetensors.f.get_tensor(...).to(device)` with 43.66 GB allocated
+            # of 44.40 GB total at job entry, while baseline (Gemma only) is
+            # ~9 GB. See pod logs 2026-04-21T05:53:35.
+            #
+            # Order matters: _dynamo.reset() drops the graph captures FIRST,
+            # then gc.collect() reclaims the now-unreferenced tensors, then
+            # empty_cache() returns the storage to CUDA. Skipping any of these
+            # leaves a partial leak.
+            try:
+                torch._dynamo.reset()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                self._log_vram(f"after job {job_id} cleanup")
+            except Exception:
+                logger.exception("Job %s: end-of-job cleanup raised; continuing", job_id)

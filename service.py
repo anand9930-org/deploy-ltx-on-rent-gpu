@@ -24,7 +24,14 @@ logger = logging.getLogger(__name__)
 @bentoml.service(
     name="ltx-video-generator",
     resources={"gpu": 1},
-    traffic={"timeout": 300, "max_concurrency": 3},
+    # max_concurrency=1: the pipeline holds non-reentrant GPU state (HQQ-cached
+    # Gemma, FP8 DiT weights, torch.compile graph captures). Allowing parallel
+    # entry into generate() races over VRAM and crashes all in-flight jobs (see
+    # pod logs 2026-04-21T05:23:22 — 3 simultaneous submissions OOM'd within
+    # 5 s, one process held 44.39 GiB and the failed-pipeline cleanup path
+    # didn't release it, so even a solo retry afterwards OOM'd). Bump only
+    # after adding an in-process semaphore around generate().
+    traffic={"timeout": 300, "max_concurrency": 1},
     workers=1,
 )
 class LTXVideoService:
