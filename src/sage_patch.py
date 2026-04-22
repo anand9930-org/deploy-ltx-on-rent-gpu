@@ -32,10 +32,14 @@ def _install() -> str:
 
     from ltx_core.model.transformer import attention as _attn
 
+    _fallback_mask_attention = _attn.PytorchAttention()
+
     class SageAttention(_attn.AttentionCallable):
-        """sageattn auto-dispatches to the optimal per-arch kernel.
+        """sageattn for mask-free calls, torch SDPA fallback when a mask is supplied.
 
         sm_90 (Hopper) → sageattn_qk_int8_pv_fp8_cuda_sm90 (INT8 QK + FP8 PV).
+        The Gemma text-encoder connector passes a padding mask, which sageattn
+        cannot consume; those calls route to PytorchAttention (torch SDPA).
         """
 
         def __call__(
@@ -47,7 +51,7 @@ def _install() -> str:
             mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
             if mask is not None:
-                raise NotImplementedError("Mask is not supported for SageAttention")
+                return _fallback_mask_attention(q, k, v, heads, mask)
             b, _, dim_head = q.shape
             dim_head //= heads
             q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
