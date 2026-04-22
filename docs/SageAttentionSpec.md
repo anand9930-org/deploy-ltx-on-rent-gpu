@@ -115,13 +115,17 @@ If the tensor is non-finite, an `ERROR`-level log fires naming the saturating ke
 
 On H100, 1920×1088, 121 frames, 30 steps, `seed=42`:
 
-| Job | Scenario | Time |
-|---|---|---|
-| `ltx_4dc6cc188c42.mp4` | Cold start (first request after pod boot) | 237 s |
-| `ltx_f16a079daf19.mp4` | Warm | 142 s |
-| `ltx_2f678934fcaf.mp4` | Warm (UGC-style prompt) | 141 s |
+| Job | Backend | State | Prompt | Time |
+|---|---|---|---|---|
+| `ltx_4dc6cc188c42.mp4` | Sage2++ ON | cold (first request post-boot) | cabin at sunset | 237 s |
+| `ltx_f16a079daf19.mp4` | Sage2++ ON | warm | cabin + narrator voiceover | 142 s |
+| `ltx_2f678934fcaf.mp4` | Sage2++ ON | warm | UGC beach vlog | 141 s |
+| `ltx_61ad6c1b2736.mp4` | Sage OFF (XFormers) | cold | UGC beach vlog | 150 s |
+| `ltx_08e16810a63e.mp4` | Sage OFF (XFormers) | warm | UGC beach vlog | 133 s |
 
-All three passed the `first output finite` check and produced valid non-black video.
+All Sage-ON runs passed the `first output finite` check and produced valid non-black video. Warm-vs-warm on the same UGC prompt/seed: Sage-ON = 141 s, Sage-OFF = 133 s → **XFormers is ~6 % faster than Sage2++ on this shape**.
+
+For the investigation of why, see [`SageAttentionDeepDive.md`](SageAttentionDeepDive.md).
 
 ## 8. Measuring perf — A/B with vs without Sage
 
