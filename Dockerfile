@@ -26,7 +26,10 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
         -e /app/LTX-2/packages/ltx-pipelines
 
 # ---- SageAttention (Hopper sm_90 FP8 kernel auto-dispatch) -----------------
-RUN uv pip install --system --no-cache sageattention==2.2.0 --no-build-isolation
+# Prebuilt wheel from Comfy-Org/wheels — cu128 / torch2.8 / cp311 / manylinux2_34.
+# thu-ml upstream doesn't ship v2.x wheels on PyPI; this is the ABI-matched drop-in.
+RUN uv pip install --system --no-cache \
+    "https://github.com/Comfy-Org/wheels/releases/download/sageattention-latest/sageattention-2.2.0%2Bcu128torch2.8-cp311-cp311-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
 
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
