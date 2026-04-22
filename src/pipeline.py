@@ -43,7 +43,8 @@ class LTXVideoGenerator:
         logger.info("Initializing LTX-2.3 pipeline ...")
         self._log_vram("before pipeline init")
 
-        from . import sage_patch  # noqa: F401 — installs SageAttention before pipeline import
+        if os.getenv("USE_SAGE_ATTENTION", "1") != "0":
+            from . import sage_patch  # noqa: F401 — installs SageAttention before pipeline import
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
         from ltx_pipelines.utils.media_io import encode_video
 
