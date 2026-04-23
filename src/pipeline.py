@@ -98,78 +98,137 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     stage._stage2_cleanup_hooked = True
 
 
-_TRANSFORMER_BLOCK_RE = re.compile(r"^(transformer_blocks\.\d+)(\..+)$")
+# The Lightricks FP8 safetensors store DiT weights with this prefix on
+# disk; `LTXV_MODEL_COMFY_RENAMING_MAP` strips it when the loader reads
+# them. Our probe reads RAW keys so we strip it too — otherwise the
+# exclusion names we emit won't match the in-memory module paths.
+_COMFY_PREFIX = "model.diffusion_model."
+
+# torch.compile wraps each transformer block in an OptimizedModule whose
+# inner attributes are reached through `_orig_mod`. After compile,
+# `model.named_modules()` yields paths like
+# `transformer_blocks.1._orig_mod.attn1.to_gate_logits`. We strip the
+# injected segment before the substring check so exclusions can use
+# the plain (pre-compile) form regardless of whether compile ran.
+_ORIG_MOD_SEGMENT_RE = re.compile(r"\._orig_mod(?=\.|$)")
+
+
+def _strip_comfy_prefix(name: str) -> str:
+    return name[len(_COMFY_PREFIX):] if name.startswith(_COMFY_PREFIX) else name
+
+
+def _normalize_for_match(name: str) -> str:
+    """Canonicalize a module/key path for exclusion matching.
+
+    Removes the `_orig_mod.` segment injected by torch.compile AND the
+    `model.diffusion_model.` prefix that may persist on raw safetensors
+    keys. The result is the canonical in-memory module path used by
+    `EXCLUDED_LAYER_SUBSTRINGS` and by our probe output.
+    """
+    return _ORIG_MOD_SEGMENT_RE.sub("", _strip_comfy_prefix(name))
 
 
 def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
-    """Return the set of module names that must stay BF16.
+    """Return module paths that must stay as nn.Linear (BF16).
 
-    Reads the safetensors headers of each ``paths`` entry (no tensor
-    data loaded) and collects every ``.weight`` key whose dtype is not
-    ``float8_e4m3fn``. For each transformer-block entry we emit BOTH
-    the plain path (``transformer_blocks.1.audio_attn1.to_q``) AND the
-    torch.compile variant (``transformer_blocks.1._orig_mod.audio_attn1.to_q``).
+    Opens each `.safetensors` header (no tensor data loaded) and
+    collects every `.weight` key whose dtype is not `float8_e4m3fn`.
+    Each name is canonicalized by stripping `model.diffusion_model.`
+    so it matches the post-rename module path the LTX loader produces.
 
-    Why both forms: LTX wraps each block with ``torch.compile`` when
-    ``ENABLE_TORCH_COMPILE=1``, which inserts ``_orig_mod`` between the
-    block index and its submodule chain. ``_should_skip_layer`` does a
-    plain substring check, and the bare path isn't a substring of the
-    ``_orig_mod``-injected module name (the dot boundary lands in the
-    wrong place). Emitting both variants is safe — only one ever
-    matches at swap time, depending on whether compile ran.
+    Why we probe: the Lightricks `*-fp8.safetensors` checkpoints leave
+    a subset of transformer block 1 in BF16 (AV cross modules, a few
+    MLPs) that upstream's hard-coded `EXCLUDED_LAYER_SUBSTRINGS` does
+    not cover. Without these extras, `_apply_fp8_prepare_to_model`
+    swaps those modules to FP8Linear and `load_state_dict` fails with
+    size mismatches at first inference.
 
-    Upstream's baseline ``EXCLUDED_LAYER_SUBSTRINGS`` entries like
-    ``"transformer_blocks.0."`` don't need this because they stop at
-    the block boundary and still match regardless of what's injected
-    after the dot.
+    Logs a dtype histogram per file, a sample of transformer-block
+    extras, and a warning if zero transformer-block BF16 entries were
+    found (which would mean the crash that motivated this probe isn't
+    actually being prevented).
     """
     from safetensors import safe_open  # lazy — downloads pull safetensors
 
     bare: set[str] = set()
     for path in paths:
+        dtype_counts: dict[str, int] = {}
+        bf16_samples: list[str] = []
+        file_bare_adds = 0
         with safe_open(path, framework="pt") as f:
             for key in f.keys():
                 if not key.endswith(".weight"):
                     continue
-                slice_ = f.get_slice(key)
-                if slice_.get_dtype() != "F8_E4M3":
-                    bare.add(key[: -len(".weight")])
+                dt = f.get_slice(key).get_dtype()
+                dtype_counts[dt] = dtype_counts.get(dt, 0) + 1
+                if dt != "F8_E4M3":
+                    normalized = _strip_comfy_prefix(key[: -len(".weight")])
+                    bare.add(normalized)
+                    file_bare_adds += 1
+                    if len(bf16_samples) < 3:
+                        bf16_samples.append(f"{key} [{dt}]")
+        logger.info(
+            "FP8 probe: %s — dtype histogram=%s, non-FP8 weights=%d",
+            os.path.basename(path),
+            sorted(dtype_counts.items()),
+            file_bare_adds,
+        )
+        if bf16_samples:
+            logger.info("FP8 probe: %s — raw BF16 samples: %s",
+                        os.path.basename(path), bf16_samples)
 
-    expanded: set[str] = set(bare)
-    for name in bare:
-        match = _TRANSFORMER_BLOCK_RE.match(name)
-        if match:
-            expanded.add(f"{match.group(1)}._orig_mod{match.group(2)}")
-    return tuple(sorted(expanded))
+    block_entries = sorted(n for n in bare if n.startswith("transformer_blocks."))
+    if not block_entries:
+        logger.warning(
+            "FP8 probe: NO transformer_blocks.* BF16 weights found across %d "
+            "checkpoint(s). Either the Lightricks FP8 format changed or the "
+            "prefix/dtype probe logic is stale. Block-1 load is expected to "
+            "fail with size mismatches.",
+            len(paths),
+        )
+    else:
+        logger.info(
+            "FP8 probe: %d transformer_blocks.* BF16 entries (first 10): %s",
+            len(block_entries),
+            block_entries[:10],
+        )
+
+    return tuple(sorted(bare))
 
 
 def _build_scaled_mm_policy(extras: tuple[str, ...]):
-    """Wrapper-only equivalent of ``QuantizationPolicy.fp8_scaled_mm()``
-    that accepts a per-call exclusion list.
+    """Wrapper-only equivalent of `QuantizationPolicy.fp8_scaled_mm()`
+    that accepts a per-call exclusion list AND normalizes names before
+    substring matching.
 
-    We can't extend the upstream factory because the Dockerfile clones
-    ``Lightricks/LTX-2`` fresh at build time (see Dockerfile line 73) —
-    any edit to the vendored ``LTX-2-ref/`` tree is git-ignored and
-    never reaches the pod. So we rebuild the policy here using the
-    same upstream primitives the baseline factory uses; the only
-    difference is that ``EXCLUDED_LAYER_SUBSTRINGS`` is augmented with
-    ``extras`` so modules the Lightricks FP8 checkpoint left in BF16
-    aren't swapped to ``FP8Linear``.
+    The upstream factory has two problems for the Lightricks
+    `*-fp8.safetensors` format:
 
-    When ``extras`` is empty we return a policy byte-equivalent to the
-    upstream factory output (same ``sd_ops`` + ``module_ops`` objects),
-    so this helper is a drop-in replacement.
+    1. Its `EXCLUDED_LAYER_SUBSTRINGS` doesn't cover the BF16 modules
+       Lightricks left in transformer block 1. So we append `extras`
+       produced by `_probe_fp8_exclusions`.
+
+    2. `_should_skip_layer` in upstream is a raw substring check. With
+       regional `torch.compile` active, module names pick up a
+       `._orig_mod.` segment that breaks substring matching against
+       bare exclusions. We replace `_apply_fp8_prepare_to_model` and
+       `_create_transpose_kv_operation` with local versions that
+       normalize `_orig_mod` out before the check.
+
+    We also can't edit upstream directly: the Dockerfile (line 73)
+    clones `Lightricks/LTX-2` fresh at build, so any change in
+    `LTX-2-ref/` is local-only and never reaches the pod.
     """
     from ltx_core.loader.module_ops import ModuleOps
-    from ltx_core.loader.sd_ops import SDOps
+    from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
     from ltx_core.model.transformer import LTXModel
     from ltx_core.quantization import QuantizationPolicy
     from ltx_core.quantization.fp8_scaled_mm import (
         EXCLUDED_LAYER_SUBSTRINGS,
         FP8_PREPARE_MODULE_OPS,
+        FP8Linear,
         FP8_TRANSPOSE_SD_OPS,
-        _apply_fp8_prepare_to_model,
-        _create_transpose_kv_operation,
+        _linear_to_fp8linear,
     )
 
     try:
@@ -180,21 +239,92 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
         ) from e
 
     if not extras:
+        # No checkpoint-driven extras — but we still want `_orig_mod`
+        # normalization, because upstream's baseline exclusions like
+        # `"transformer_blocks.0."` happen to tolerate compile (they
+        # stop at the dot, so substring matches regardless). Keeping
+        # the upstream primitives here is safe; no crash has been
+        # observed without extras.
         return QuantizationPolicy(
             sd_ops=FP8_TRANSPOSE_SD_OPS,
             module_ops=(FP8_PREPARE_MODULE_OPS,),
         )
 
     merged = EXCLUDED_LAYER_SUBSTRINGS + tuple(extras)
-    sd_ops = SDOps("fp8_transpose_weights").with_kv_operation(
-        _create_transpose_kv_operation(merged),
+
+    def _should_skip(name: str) -> bool:
+        canon = _normalize_for_match(name)
+        return any(sub in canon for sub in merged)
+
+    import torch
+    from torch import nn
+
+    def _prepare(model):
+        """Drop-in replacement for `_apply_fp8_prepare_to_model`.
+
+        Walks named_modules; for each nn.Linear (not already FP8Linear)
+        whose canonicalized name does NOT match an exclusion, swaps it
+        to FP8Linear. Logs the first swap/skip decisions under block 1
+        so we can verify the matcher at boot.
+        """
+        replacements: list[tuple[nn.Module, str, nn.Linear]] = []
+        swap_samples: list[str] = []
+        skip_samples: list[str] = []
+        block1_linear_total = 0
+
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear) or isinstance(module, FP8Linear):
+                continue
+            if name.startswith("transformer_blocks.1."):
+                block1_linear_total += 1
+            if _should_skip(name):
+                if len(skip_samples) < 5 and name.startswith("transformer_blocks.1."):
+                    skip_samples.append(name)
+                continue
+            if len(swap_samples) < 5 and name.startswith("transformer_blocks.1."):
+                swap_samples.append(name)
+            if "." in name:
+                parent_name, attr_name = name.rsplit(".", 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                attr_name = name
+            replacements.append((parent, attr_name, module))
+
+        for parent, attr_name, linear in replacements:
+            setattr(parent, attr_name, _linear_to_fp8linear(linear))
+
+        logger.info(
+            "FP8 prepare: block-1 nn.Linear count=%d, swapped=%d, skipped=%d",
+            block1_linear_total,
+            len(swap_samples),
+            len(skip_samples),
+        )
+        if swap_samples:
+            logger.info("FP8 prepare: block-1 swap samples: %s", swap_samples)
+        if skip_samples:
+            logger.info("FP8 prepare: block-1 skip samples: %s", skip_samples)
+        return model
+
+    def _transpose_op(key: str, value: torch.Tensor):
+        if not key.endswith(".weight"):
+            return [KeyValueOperationResult(key, value)]
+        if value.dim() != 2 or value.dtype != torch.float8_e4m3fn:
+            return [KeyValueOperationResult(key, value)]
+        layer_name = key.rsplit(".weight", 1)[0]
+        if _should_skip(layer_name):
+            return [KeyValueOperationResult(key, value)]
+        return [KeyValueOperationResult(key, value.t())]
+
+    sd_ops = SDOps("fp8_transpose_weights_normalized").with_kv_operation(
+        _transpose_op,
         key_prefix="transformer_blocks.",
         key_suffix=".weight",
     )
     module_ops = ModuleOps(
-        name="fp8_prepare_for_loading",
+        name="fp8_prepare_for_loading_normalized",
         matcher=lambda m: isinstance(m, LTXModel),
-        mutator=lambda m: _apply_fp8_prepare_to_model(m, merged),
+        mutator=_prepare,
     )
     return QuantizationPolicy(sd_ops=sd_ops, module_ops=(module_ops,))
 
