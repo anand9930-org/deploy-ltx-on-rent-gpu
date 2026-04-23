@@ -28,6 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- NGC pip-constraint hygiene --------------------------------------------
+# NGC ships /etc/pip/constraint.txt pinning every pre-installed Python
+# package to the versions NVIDIA tested. The documented way to override a
+# pin (NGC PyTorch 25.06 release notes) is to strip the package's line
+# from this file before installing your own version. We strip `anyio`
+# because NGC pins it below 4.9 and httpx_ws (pulled by bentoml) needs
+# anyio.AsyncContextManagerMixin, added in 4.9.0.
+#
+# Note: `uv pip install` does NOT read this file — uv only honors
+# UV_CONSTRAINT / --constraint. We still strip the line as hygiene for
+# any downstream pip invocation (e.g. `pip install` inside a subprocess
+# or future migration to `uv --constraint /etc/pip/constraint.txt`).
+# The actual uv-side upgrade is performed explicitly further below.
+RUN sed -i '/^anyio/d' /etc/pip/constraint.txt
+
 # ---- Clone LTX-2 and install its packages ----------------------------------
 # The `[fp8-trtllm]` extra pulls tensorrt-llm==1.0.0 + onnx + openmpi from
 # pypi.nvidia.com and registers the `torch.ops.tensorrt_llm.*` +
