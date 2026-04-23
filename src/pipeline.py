@@ -7,6 +7,7 @@ import functools
 import gc
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -97,27 +98,34 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     stage._stage2_cleanup_hooked = True
 
 
+_TRANSFORMER_BLOCK_RE = re.compile(r"^(transformer_blocks\.\d+)(\..+)$")
+
+
 def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
     """Return the set of module names that must stay BF16.
 
-    Reads the safetensors headers of each ``paths`` entry (no tensor data
-    loaded) and collects every ``.weight`` key whose dtype is not
-    ``float8_e4m3fn``. Returns the module path with ``.weight`` stripped
-    (e.g. ``transformer_blocks.1.audio_attn1.to_q``) so it flows straight
-    into ``_should_skip_layer``'s substring check — which compares
-    against module names from ``named_modules()`` that also have no
-    ``.weight`` suffix.
+    Reads the safetensors headers of each ``paths`` entry (no tensor
+    data loaded) and collects every ``.weight`` key whose dtype is not
+    ``float8_e4m3fn``. For each transformer-block entry we emit BOTH
+    the plain path (``transformer_blocks.1.audio_attn1.to_q``) AND the
+    torch.compile variant (``transformer_blocks.1._orig_mod.audio_attn1.to_q``).
 
-    Motivation: the Lightricks FP8 DiT keeps some modules in block 1 as
-    BF16 (audio-video cross modules and a few MLPs) that upstream's
-    ``EXCLUDED_LAYER_SUBSTRINGS`` does not cover. Without this probe
-    ``_apply_fp8_prepare_to_model`` swaps those to ``FP8Linear`` and
-    ``load_state_dict`` fails with size/dtype mismatches at first
-    inference.
+    Why both forms: LTX wraps each block with ``torch.compile`` when
+    ``ENABLE_TORCH_COMPILE=1``, which inserts ``_orig_mod`` between the
+    block index and its submodule chain. ``_should_skip_layer`` does a
+    plain substring check, and the bare path isn't a substring of the
+    ``_orig_mod``-injected module name (the dot boundary lands in the
+    wrong place). Emitting both variants is safe — only one ever
+    matches at swap time, depending on whether compile ran.
+
+    Upstream's baseline ``EXCLUDED_LAYER_SUBSTRINGS`` entries like
+    ``"transformer_blocks.0."`` don't need this because they stop at
+    the block boundary and still match regardless of what's injected
+    after the dot.
     """
     from safetensors import safe_open  # lazy — downloads pull safetensors
 
-    names: set[str] = set()
+    bare: set[str] = set()
     for path in paths:
         with safe_open(path, framework="pt") as f:
             for key in f.keys():
@@ -125,8 +133,14 @@ def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
                     continue
                 slice_ = f.get_slice(key)
                 if slice_.get_dtype() != "F8_E4M3":
-                    names.add(key[: -len(".weight")])
-    return tuple(sorted(names))
+                    bare.add(key[: -len(".weight")])
+
+    expanded: set[str] = set(bare)
+    for name in bare:
+        match = _TRANSFORMER_BLOCK_RE.match(name)
+        if match:
+            expanded.add(f"{match.group(1)}._orig_mod{match.group(2)}")
+    return tuple(sorted(expanded))
 
 
 def _build_scaled_mm_policy(extras: tuple[str, ...]):
