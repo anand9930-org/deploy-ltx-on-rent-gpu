@@ -10,16 +10,29 @@ FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    HF_HOME=/models/huggingface
+    HF_HOME=/models/huggingface \
+    LTX_FP8_MODE=scaled_mm
 
 # ---- System dependencies + uv ----------------------------------------------
+# libopenmpi-dev provides the MPI headers/libraries that tensorrt-llm's
+# openmpi wheel dlopens at import time. Without them the
+# `import tensorrt_llm` probe inside QuantizationPolicy.fp8_scaled_mm()
+# fails with a bare `ImportError` and we silently fall back to BF16.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg git-lfs gcc \
+        ffmpeg git-lfs gcc libopenmpi-dev \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Clone LTX-2 and install its packages ----------------------------------
+# The `[fp8-trtllm]` extra pulls tensorrt-llm==1.0.0 + onnx + openmpi from
+# pypi.nvidia.com and registers the `torch.ops.tensorrt_llm.*` +
+# `torch.ops.trtllm.*` ops used by FP8Linear.forward on the scaled_mm
+# (H100 W8A8) path. This extra is mutex with `[xformers]` in upstream
+# pyproject.toml — that's fine here because LTX-2-ref's attention
+# dispatcher falls back to torch SDPA and FA3 is installed separately
+# below.
+#
 # In-place patch: force use_fast=True on the Gemma image processor so the
 # Rust-backed tokenizer runs instead of the slow Python fallback. Default
 # in transformers >=4.52 anyway; forcing it here eliminates the
@@ -31,7 +44,8 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
         /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
     && grep -q "use_fast=True" /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
     && uv pip install --system --no-cache \
-        -e /app/LTX-2/packages/ltx-core \
+        --extra-index-url https://pypi.nvidia.com \
+        -e "/app/LTX-2/packages/ltx-core[fp8-trtllm]" \
         -e /app/LTX-2/packages/ltx-pipelines
 
 # ---- Install project dependencies ------------------------------------------

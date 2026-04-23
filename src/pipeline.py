@@ -97,16 +97,48 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     stage._stage2_cleanup_hooked = True
 
 
+def _select_fp8_mode() -> str:
+    """Pick the FP8 compute path.
+
+    ``scaled_mm`` is the H100-optimised W8A8 path (real FP8 GEMM via
+    TRT-LLM ``cublas_scaled_mm``), ``cast`` is the Ada/Blackwell W8A16
+    path (weights FP8, activations upcast to BF16 per forward).
+
+    Order of precedence:
+      1. ``LTX_FP8_MODE=scaled_mm|cast`` env override (matches
+         download_models.py so downloads and runtime agree).
+      2. GPU capability auto-detect: H100/H200 (SM 9.0) → ``scaled_mm``,
+         otherwise → ``cast``.
+      3. ``cast`` fallback when CUDA is unavailable.
+    """
+    override = os.getenv("LTX_FP8_MODE", "").strip().lower()
+    if override in ("scaled_mm", "cast"):
+        return override
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability(0)
+        if cap == (9, 0):
+            return "scaled_mm"
+    return "cast"
+
+
 class LTXVideoGenerator:
     """Initialises the LTX-2.3 two-stage pipeline and runs inference."""
 
     def __init__(self, model_dir: str = "/models") -> None:
+        # BF16 DiT checkpoint. Also holds VAE / audio decoder / vocoder /
+        # image encoder / embeddings processor weights — loaded by the
+        # non-DiT blocks through *_COMFY_KEYS_FILTER, so this file is
+        # required on every path (including scaled_mm).
         checkpoint_path = os.path.join(model_dir, "ltx-2.3-22b-dev.safetensors")
         spatial_upsampler_path = os.path.join(
             model_dir, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
         )
         distilled_lora_path = os.path.join(
             model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+        )
+        dev_fp8_path = os.path.join(model_dir, "ltx-2.3-22b-dev-fp8.safetensors")
+        distilled_fp8_path = os.path.join(
+            model_dir, "ltx-2.3-22b-distilled-fp8.safetensors"
         )
         gemma_root = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
 
@@ -118,15 +150,26 @@ class LTXVideoGenerator:
 
         self._encode_video = encode_video
 
-        # FP8 quantization — downcasts BF16 weights to FP8 on the fly,
-        # upcasts back to BF16 during forward. ~40% VRAM reduction.
-        try:
-            from ltx_core.quantization import QuantizationPolicy
+        # Pick FP8 path. scaled_mm = H100 W8A8 through TRT-LLM
+        # cublas_scaled_mm; cast = W8A16 runtime downcast/upcast.
+        fp8_mode = _select_fp8_mode()
+        self._fp8_mode = fp8_mode
+
+        from ltx_core.quantization import QuantizationPolicy
+        if fp8_mode == "scaled_mm":
+            if not (os.path.exists(dev_fp8_path) and os.path.exists(distilled_fp8_path)):
+                raise RuntimeError(
+                    f"LTX_FP8_MODE=scaled_mm requires pre-quantized FP8 checkpoints at "
+                    f"{dev_fp8_path} and {distilled_fp8_path}. Run download_models.py "
+                    f"with LTX_FP8_MODE=scaled_mm."
+                )
+            quantization = QuantizationPolicy.fp8_scaled_mm()
+            logger.info(
+                "FP8 mode: scaled_mm (W8A8, TRT-LLM cublas_scaled_mm, H100-optimised)"
+            )
+        else:
             quantization = QuantizationPolicy.fp8_cast()
-            logger.info("Using FP8 quantization (fp8_cast)")
-        except ImportError:
-            quantization = None
-            logger.warning("QuantizationPolicy not available")
+            logger.info("FP8 mode: cast (W8A16, weights FP8 / activations BF16)")
 
         # CPU weight caching — only one model on GPU at a time
         registry = None
@@ -137,21 +180,29 @@ class LTXVideoGenerator:
         except ImportError:
             logger.warning("StateDictRegistry not available")
 
-        # Distilled LoRA
+        # Distilled LoRA — only meaningful on the cast path. scaled_mm
+        # cannot fuse a BF16 LoRA into pre-quantized FP8 weights at load
+        # time; we instead swap Stage 2 to the pre-fused distilled-fp8
+        # checkpoint further down.
         from ltx_core.loader import (
             LTXV_LORA_COMFY_RENAMING_MAP,
             LoraPathStrengthAndSDOps,
         )
-        distilled_lora = [
-            LoraPathStrengthAndSDOps(
-                path=distilled_lora_path,
-                strength=0.8,
-                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
-            )
-        ]
+        if fp8_mode == "cast":
+            distilled_lora = [
+                LoraPathStrengthAndSDOps(
+                    path=distilled_lora_path,
+                    strength=0.8,
+                    sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+                )
+            ]
+        else:
+            distilled_lora = []
 
-        # Build pipeline — pass registry and quantization at construction time
-        # so VRAM is managed correctly from the start
+        # Build pipeline. On scaled_mm we pass the BF16 checkpoint so
+        # PromptEncoder / ImageConditioner / VideoDecoder / AudioDecoder /
+        # VideoUpsampler see their VAE + encoder keys; Stage 1 and Stage 2
+        # DiffusionStages are rebuilt below to point at the FP8 DiT files.
         pipeline_kwargs = dict(
             checkpoint_path=checkpoint_path,
             distilled_lora=distilled_lora,
@@ -192,6 +243,41 @@ class LTXVideoGenerator:
 
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
         self._log_vram("after pipeline init")
+
+        # scaled_mm: swap Stage 1 and Stage 2 DiffusionStages to point at
+        # the pre-quantized FP8 DiT checkpoints. The upstream
+        # TI2VidTwoStagesPipeline exposes a single checkpoint_path that it
+        # feeds to every block, which is fine for the cast path but wrong
+        # here — we need BF16 for the VAE/encoder blocks and FP8 for the
+        # two DiT stages. Rebuilding after construction is safe because
+        # DiffusionStage defers weight load to its first __call__.
+        if fp8_mode == "scaled_mm":
+            from ltx_pipelines.utils.blocks import DiffusionStage
+            self._pipeline.stage_1 = DiffusionStage(
+                checkpoint_path=dev_fp8_path,
+                dtype=self._pipeline.dtype,
+                device=self._pipeline.device,
+                loras=(),
+                quantization=quantization,
+                registry=registry,
+                torch_compile=pipeline_kwargs.get("torch_compile", False),
+            )
+            # Stage 2 uses the distilled-fp8 checkpoint (distilled weights
+            # already fused in) instead of base + distilled LoRA.
+            self._pipeline.stage_2 = DiffusionStage(
+                checkpoint_path=distilled_fp8_path,
+                dtype=self._pipeline.dtype,
+                device=self._pipeline.device,
+                loras=(),
+                quantization=quantization,
+                registry=registry,
+                torch_compile=pipeline_kwargs.get("torch_compile", False),
+            )
+            logger.info(
+                "scaled_mm: rebuilt stage_1 → %s, stage_2 → %s (distilled pre-fused)",
+                os.path.basename(dev_fp8_path),
+                os.path.basename(distilled_fp8_path),
+            )
 
         # Always-on: aggressive allocator flush at the Stage 1 → Stage 2
         # boundary. Fixes intermittent
