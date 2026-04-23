@@ -9,6 +9,11 @@ dependencies = [
     "huggingface-hub>=0.27.0",
     "hf-xet>=0.1.0",
     "transformers>=4.52,<5.0",
+    # NGC pytorch:25.06-py3 pre-installs anyio 4.8.x as a transitive dep.
+    # bentoml pulls httpx_ws, which at its current PyPI version subclasses
+    # anyio.AsyncContextManagerMixin (added in anyio 4.9.0). Without this
+    # floor uv keeps NGC's pre-install and the mixin is missing at import.
+    "anyio>=4.9",
     # FlashAttention 3 is installed separately in the Dockerfile from the
     # windreamer community wheel index — cu128 + torch 2.8 + cp39-abi3. Kept
     # out of pyproject because no PyPI wheel exists.
