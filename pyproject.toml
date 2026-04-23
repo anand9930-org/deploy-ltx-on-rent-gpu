@@ -9,18 +9,20 @@ dependencies = [
     "huggingface-hub>=0.27.0",
     "hf-xet>=0.1.0",
     "transformers>=4.52,<5.0",
-    # NGC pytorch:25.06-py3 pre-installs anyio 4.8.x as a transitive dep.
-    # bentoml pulls httpx_ws, which at its current PyPI version subclasses
-    # anyio.AsyncContextManagerMixin (added in anyio 4.9.0). Without this
-    # floor uv keeps NGC's pre-install and the mixin is missing at import.
+    # NGC pytorch:25.06-py3 pre-installs anyio 4.8.x. Load-bearing enforcement
+    # lives in the Dockerfile as an explicit `uv pip install --upgrade` step
+    # with a build-time assertion; this floor is kept as documentation so the
+    # requirement survives a resolver replay (e.g. regenerating uv.lock).
     "anyio>=4.9",
-    # NGC 25.06 ships torch 2.8.0a0 / CUDA 12.9.1 (libcudart.so.12) but does
-    # NOT pre-install torchaudio. uv resolves ltx-core's transitive
-    # torchaudio to the latest PyPI release (2.11.0), whose native _torchaudio
-    # extension is linked against libcudart.so.13 (CUDA 13) and crashes at
-    # `import torchaudio` inside ltx_core.model.audio_vae.ops. Pin to the
-    # 2.8.x line so uv picks a CUDA-12 wheel that matches NGC's torch.
-    "torchaudio>=2.8,<2.9",
+    # torchaudio is intentionally NOT listed here. ltx-core declares it as a
+    # transitive dep, but: (1) every PyPI torchaudio release declares a
+    # strict companion `torch==<exact>` pin which would force uv to replace
+    # NGC's NVIDIA-patched torch 2.8.0a0+...nv25.6 with stock PyPI torch,
+    # breaking NGC torchvision's ABI (`torchvision::nms` op fails to
+    # register); (2) our service is video-only — `audio_guider_params` is
+    # None on every request — so the audio_vae code path that touches
+    # torchaudio APIs is unreachable. The Dockerfile strips torchaudio from
+    # upstream ltx-core's pyproject and installs a pure-Python stub.
     # FlashAttention 3 is installed separately in the Dockerfile from the
     # windreamer community wheel index — cu128 + torch 2.8 + cp39-abi3. Kept
     # out of pyproject because no PyPI wheel exists.
