@@ -379,8 +379,25 @@ class LTXVideoGenerator:
 
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
         from ltx_pipelines.utils.media_io import encode_video
+        from ltx_pipelines.utils.types import OffloadMode
 
         self._encode_video = encode_video
+
+        # Weight placement. Upstream PR #201 (2026-04-23) replaced the
+        # per-call `streaming_prefetch_count` kwarg with a constructor
+        # `offload_mode` enum on `TI2VidTwoStagesPipeline` and
+        # `DiffusionStage`. OffloadMode.NONE keeps all weights on GPU
+        # (fastest); CPU streams layers from pinned host RAM for <40 GB
+        # pods; DISK re-reads from disk each pass for tiny cards.
+        gpu_vram_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1e9
+            if torch.cuda.is_available() else 0
+        )
+        offload_mode = OffloadMode.NONE if gpu_vram_gb >= 40 else OffloadMode.CPU
+        self._offload_mode = offload_mode
+        logger.info(
+            "Offload mode: %s (GPU=%.0f GB)", offload_mode.value, gpu_vram_gb,
+        )
 
         # Pick FP8 path. scaled_mm = H100 W8A8 through TRT-LLM
         # cublas_scaled_mm; cast = W8A16 runtime downcast/upcast.
@@ -458,6 +475,7 @@ class LTXVideoGenerator:
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_root,
             loras=[],
+            offload_mode=offload_mode,
         )
         if quantization is not None:
             pipeline_kwargs["quantization"] = quantization
@@ -510,6 +528,7 @@ class LTXVideoGenerator:
                 quantization=quantization,
                 registry=registry,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
+                offload_mode=offload_mode,
             )
             # Stage 2 uses the distilled-fp8 checkpoint (distilled weights
             # already fused in) instead of base + distilled LoRA.
@@ -521,6 +540,7 @@ class LTXVideoGenerator:
                 quantization=quantization,
                 registry=registry,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
+                offload_mode=offload_mode,
             )
             logger.info(
                 "scaled_mm: rebuilt stage_1 → %s, stage_2 → %s (distilled pre-fused)",
@@ -646,19 +666,15 @@ class LTXVideoGenerator:
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(0)
 
-            # Streaming: builds models on CPU, streams layers to GPU on demand.
-            # Required for <48GB GPUs — without it, LoRA fusion OOMs because
-            # the 22B transformer + LoRA deltas exceed GPU memory.
-            # With streaming, build+fuse happens on CPU (plenty of RAM),
-            # then only 2-3 layers live on GPU at any time during inference.
-            # max_batch_size=4 batches guidance passes to reduce PCIe round-trips.
-            gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-            streaming = 2 if gpu_vram_gb < 40 else None
-            max_batch_size = 4 if streaming else 1
-
+            # Weight placement was decided at __init__ time via
+            # `offload_mode` (PR #201 upstream refactor — `streaming_prefetch_count`
+            # no longer exists on `__call__`). `max_batch_size=1` is the
+            # upstream default and is correct on big GPUs; raising it
+            # above 1 has previously caused issues on ≥40 GB pods.
+            max_batch_size = 1
             logger.info(
-                "Job %s: GPU=%.0fGB, streaming=%s, max_batch_size=%d, teacache=%s",
-                job_id, gpu_vram_gb, streaming, max_batch_size,
+                "Job %s: offload_mode=%s, max_batch_size=%d, teacache=%s",
+                job_id, self._offload_mode.value, max_batch_size,
                 getattr(self, "_teacache_enabled", False),
             )
 
@@ -667,7 +683,6 @@ class LTXVideoGenerator:
                 height=height, width=width, num_frames=num_frames,
                 frame_rate=frame_rate, num_inference_steps=num_inference_steps,
                 images=[],
-                streaming_prefetch_count=streaming,
                 max_batch_size=max_batch_size,
             )
             if video_guider_params is not None:
