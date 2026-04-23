@@ -56,6 +56,16 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --break-system-packages --no-cache /app
 
+# ---- Force anyio floor (NGC 25.06 ships < 4.9) -----------------------------
+# The anyio>=4.9 floor in pyproject.toml is not load-bearing on its own: uv
+# accepts NGC's pre-installed anyio as "already satisfied" and skips the
+# upgrade (no mention in the build log). httpx_ws (pulled by bentoml) then
+# crashes at import with `anyio has no attribute 'AsyncContextManagerMixin'`.
+# Explicit --upgrade forces re-resolution. The inline python -c asserts the
+# mixin is present so the build fails loudly instead of the pod crashlooping.
+RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' \
+    && python -c "import anyio; assert hasattr(anyio, 'AsyncContextManagerMixin'), anyio.__version__; print('anyio', anyio.__version__, 'ok')"
+
 # ---- FlashAttention 3 — DEFERRED on this base ------------------------------
 # NGC 25.06 ships CUDA 12.9.1 + NVIDIA-patched torch 2.8.0a0. The only
 # prebuilt FA3 wheel index we trust (windreamer) publishes
