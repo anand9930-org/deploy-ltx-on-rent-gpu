@@ -50,19 +50,24 @@ def _round_user_inputs(width: int, height: int, num_frames: int) -> tuple[int, i
 def _install_stage2_cleanup_hook(pipeline) -> None:
     """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
 
-    LTX-2's layer-streaming path pins the full transformer's weights to
-    host memory at each stage entry. Between Stage 1 teardown and
-    Stage 2 setup LTX calls ``torch._C._host_emptyCache()`` best-effort,
-    but on 24 GB GPUs that call intermittently fails to release enough
-    pinned pages and the first ``tensor.data.pin_memory()`` call inside
-    Stage 2's ``_LayerStore.__init__`` raises
+    LTX-2's weight-offloading path (``OffloadMode.CPU`` / ``DISK`` via
+    ``block_streaming`` — formerly ``layer_streaming``; renamed in PR
+    #201, 2026-04-23) pins transformer blocks in host memory during
+    inference. PR #201 also *removed* the best-effort
+    ``torch._C._host_emptyCache()`` that used to run in the streaming
+    teardown, so pinned pages are no longer returned to the OS between
+    stages. On <40 GB pods that intermittently exhausts the pinned arena
+    and the next ``tensor.data.pin_memory()`` call (inside the Stage 2
+    pool builder) raises
 
         torch.AcceleratorError: CUDA error: invalid argument
 
     We force a synchronous cleanup cycle (Python GC → device
     empty_cache → CUDA sync → host empty_cache) right before Stage 2's
     transformer context manager enters, so the pinned arena is in a
-    known-drained state. Idempotent; safe to call multiple times.
+    known-drained state. On H100 (``OffloadMode.NONE``) the streaming
+    path is inactive and the hook is a cheap no-op-ish sync; harmless.
+    Idempotent; safe to call multiple times.
     """
     stage = getattr(pipeline, "stage_2", None)
     if stage is None:
