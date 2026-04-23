@@ -437,6 +437,23 @@ class LTXVideoGenerator:
             quantization = QuantizationPolicy.fp8_cast()
             logger.info("FP8 mode: cast (W8A16, weights FP8 / activations BF16)")
 
+        # Upstream PR #201 constraint: DiffusionStage rejects
+        # `offload_mode != NONE` combined with either `quantization` or
+        # `torch_compile`. On H100 (our primary target) offload_mode is
+        # NONE so this is a no-op. On a <40 GB pod we'd otherwise hit
+        # a ValueError at pipeline init; drop quantization + compile so
+        # the pipeline still boots in streaming BF16 mode.
+        if offload_mode != OffloadMode.NONE and quantization is not None:
+            logger.warning(
+                "Offload mode %s requires non-quantized BF16 weights — "
+                "dropping FP8 quantization and torch.compile for this run. "
+                "This branch is tuned for ≥40 GB GPUs; consider a larger pod.",
+                offload_mode.value,
+            )
+            quantization = None
+            fp8_mode = "bf16"
+            self._fp8_mode = fp8_mode
+
         # CPU weight caching — only one model on GPU at a time
         registry = None
         try:
@@ -492,9 +509,15 @@ class LTXVideoGenerator:
         torch_compile_enabled = os.getenv("ENABLE_TORCH_COMPILE", "1").strip().lower() not in (
             "0", "false", "no", "off", "",
         )
-        if torch_compile_enabled:
+        if torch_compile_enabled and offload_mode == OffloadMode.NONE:
             pipeline_kwargs["torch_compile"] = True
             logger.info("torch.compile ENABLED (regional per transformer block)")
+        elif torch_compile_enabled:
+            logger.warning(
+                "torch.compile requested but offload_mode=%s disallows it "
+                "(upstream DiffusionStage guard); running uncompiled.",
+                offload_mode.value,
+            )
         else:
             logger.info("torch.compile disabled via ENABLE_TORCH_COMPILE=%s", os.getenv("ENABLE_TORCH_COMPILE"))
 
