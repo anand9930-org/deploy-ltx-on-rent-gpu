@@ -79,7 +79,7 @@ RUN uv pip install --system --break-system-packages --no-cache /app
 # Explicit --upgrade forces re-resolution. The inline python -c asserts the
 # mixin is present so the build fails loudly instead of the pod crashlooping.
 RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' \
-    && python -c "import anyio; assert hasattr(anyio, 'AsyncContextManagerMixin'), anyio.__version__; print('anyio', anyio.__version__, 'ok')"
+    && python -c "import anyio, importlib.metadata as m; assert hasattr(anyio, 'AsyncContextManagerMixin'); print('anyio', m.version('anyio'), 'ok')"
 
 # ---- FlashAttention 3 — DEFERRED on this base ------------------------------
 # NGC 25.06 ships CUDA 12.9.1 + NVIDIA-patched torch 2.8.0a0. The only
