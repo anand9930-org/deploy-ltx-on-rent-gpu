@@ -5,7 +5,11 @@
 # as a volume.  Downloaded on first boot if not already present (~64 GB).
 # ============================================================================
 
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+# Base image matches the one TensorRT-LLM v1.0.0 itself is built against
+# (nvidia/TensorRT-LLM@v1.0.0 docker/Dockerfile.multi). Ships Python 3.12,
+# torch 2.8.0a0, CUDA 12.9.1 on Ubuntu 24.04 — cp312 is required because
+# `tensorrt-llm==1.0.0` only publishes cp310/cp312 wheels (no cp311).
+FROM nvcr.io/nvidia/pytorch:25.06-py3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -52,17 +56,14 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --no-cache /app
 
-# ---- Install FlashAttention 3 (Hopper-only, community wheel index) ---------
-# FA3 has no PyPI wheel. Building from source needs ~80-150 GB RAM and does
-# not fit on GH-hosted runners (issue Dao-AILab/flash-attention#1043), so we
-# install a prebuilt wheel from the windreamer community index — cp39-abi3
-# stable-ABI wheels (usable from 3.11) built against torch 2.8.0 + cu128,
-# rebuilt bi-weekly from Dao-AILab/flash-attention main. Apache-2.0,
-# unsigned; acceptable for research validation, swap for a SHA-pinned
-# self-hosted build before shipping to customer traffic.
-RUN pip install --no-cache-dir flash_attn_3 \
-        --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch280/ \
-    && python3 -c "import flash_attn_interface; print('flash_attn_interface loaded OK')"
+# ---- FlashAttention 3 — DEFERRED on this base ------------------------------
+# NGC 25.06 ships CUDA 12.9.1 + NVIDIA-patched torch 2.8.0a0. The only
+# prebuilt FA3 wheel index we trust (windreamer) publishes
+# cu128_torch280 wheels, so the CUDA minor mismatches the container.
+# Rather than risk a silent ABI break at runtime, skip FA3 for now and
+# let LTX-2-ref's attention dispatcher fall back to torch SDPA (BF16).
+# TODO: re-enable FA3 once a cu129_torch280 wheel exists (either from
+# windreamer or a self-hosted build) so we recover the Hopper FA3 perf.
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
