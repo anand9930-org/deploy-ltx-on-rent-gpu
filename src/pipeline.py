@@ -97,6 +97,94 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     stage._stage2_cleanup_hooked = True
 
 
+def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
+    """Return the set of module names that must stay BF16.
+
+    Reads the safetensors headers of each ``paths`` entry (no tensor data
+    loaded) and collects every ``.weight`` key whose dtype is not
+    ``float8_e4m3fn``. Returns the module path with ``.weight`` stripped
+    (e.g. ``transformer_blocks.1.audio_attn1.to_q``) so it flows straight
+    into ``_should_skip_layer``'s substring check — which compares
+    against module names from ``named_modules()`` that also have no
+    ``.weight`` suffix.
+
+    Motivation: the Lightricks FP8 DiT keeps some modules in block 1 as
+    BF16 (audio-video cross modules and a few MLPs) that upstream's
+    ``EXCLUDED_LAYER_SUBSTRINGS`` does not cover. Without this probe
+    ``_apply_fp8_prepare_to_model`` swaps those to ``FP8Linear`` and
+    ``load_state_dict`` fails with size/dtype mismatches at first
+    inference.
+    """
+    from safetensors import safe_open  # lazy — downloads pull safetensors
+
+    names: set[str] = set()
+    for path in paths:
+        with safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                if not key.endswith(".weight"):
+                    continue
+                slice_ = f.get_slice(key)
+                if slice_.get_dtype() != "F8_E4M3":
+                    names.add(key[: -len(".weight")])
+    return tuple(sorted(names))
+
+
+def _build_scaled_mm_policy(extras: tuple[str, ...]):
+    """Wrapper-only equivalent of ``QuantizationPolicy.fp8_scaled_mm()``
+    that accepts a per-call exclusion list.
+
+    We can't extend the upstream factory because the Dockerfile clones
+    ``Lightricks/LTX-2`` fresh at build time (see Dockerfile line 73) —
+    any edit to the vendored ``LTX-2-ref/`` tree is git-ignored and
+    never reaches the pod. So we rebuild the policy here using the
+    same upstream primitives the baseline factory uses; the only
+    difference is that ``EXCLUDED_LAYER_SUBSTRINGS`` is augmented with
+    ``extras`` so modules the Lightricks FP8 checkpoint left in BF16
+    aren't swapped to ``FP8Linear``.
+
+    When ``extras`` is empty we return a policy byte-equivalent to the
+    upstream factory output (same ``sd_ops`` + ``module_ops`` objects),
+    so this helper is a drop-in replacement.
+    """
+    from ltx_core.loader.module_ops import ModuleOps
+    from ltx_core.loader.sd_ops import SDOps
+    from ltx_core.model.transformer import LTXModel
+    from ltx_core.quantization import QuantizationPolicy
+    from ltx_core.quantization.fp8_scaled_mm import (
+        EXCLUDED_LAYER_SUBSTRINGS,
+        FP8_PREPARE_MODULE_OPS,
+        FP8_TRANSPOSE_SD_OPS,
+        _apply_fp8_prepare_to_model,
+        _create_transpose_kv_operation,
+    )
+
+    try:
+        import tensorrt_llm  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "tensorrt_llm not installed — fp8-trtllm extra missing"
+        ) from e
+
+    if not extras:
+        return QuantizationPolicy(
+            sd_ops=FP8_TRANSPOSE_SD_OPS,
+            module_ops=(FP8_PREPARE_MODULE_OPS,),
+        )
+
+    merged = EXCLUDED_LAYER_SUBSTRINGS + tuple(extras)
+    sd_ops = SDOps("fp8_transpose_weights").with_kv_operation(
+        _create_transpose_kv_operation(merged),
+        key_prefix="transformer_blocks.",
+        key_suffix=".weight",
+    )
+    module_ops = ModuleOps(
+        name="fp8_prepare_for_loading",
+        matcher=lambda m: isinstance(m, LTXModel),
+        mutator=lambda m: _apply_fp8_prepare_to_model(m, merged),
+    )
+    return QuantizationPolicy(sd_ops=sd_ops, module_ops=(module_ops,))
+
+
 def _select_fp8_mode() -> str:
     """Pick the FP8 compute path.
 
@@ -163,7 +251,24 @@ class LTXVideoGenerator:
                     f"{dev_fp8_path} and {distilled_fp8_path}. Run download_models.py "
                     f"with LTX_FP8_MODE=scaled_mm."
                 )
-            quantization = QuantizationPolicy.fp8_scaled_mm()
+            # Checkpoint-driven exclusion list. The Lightricks FP8 DiT
+            # keeps a subset of block-1's modules (audio-video cross
+            # modules, some MLPs) in BF16 that upstream's
+            # EXCLUDED_LAYER_SUBSTRINGS does not cover. Without this
+            # probe, _apply_fp8_prepare_to_model swaps those to
+            # FP8Linear and load_state_dict fails with size/dtype
+            # mismatches at first inference. See docs/FP8_H100_Spec.md
+            # Verification #7.
+            extras = _probe_fp8_exclusions([dev_fp8_path, distilled_fp8_path])
+            logger.info(
+                "FP8 checkpoint probe: %d non-FP8 weight modules added to exclusion list",
+                len(extras),
+            )
+            if extras:
+                preview = ", ".join(extras[:5])
+                more = f" (+{len(extras) - 5} more)" if len(extras) > 5 else ""
+                logger.info("FP8 probe extras (first 5): %s%s", preview, more)
+            quantization = _build_scaled_mm_policy(extras)
             logger.info(
                 "FP8 mode: scaled_mm (W8A8, TRT-LLM cublas_scaled_mm, H100-optimised)"
             )

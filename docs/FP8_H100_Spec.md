@@ -27,8 +27,8 @@ Source: `Lightricks/LTX-2.3-fp8` — **weights-only** repo (no `config.json`, no
 | File | Size | Role |
 |------|------|------|
 | `Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors` | 46 GB | **Still required on every path.** Sole source of VAE / audio / image-encoder / embeddings-processor weights consumed by `ImageConditioner`, `VideoDecoder`, `AudioDecoder`, `PromptEncoder`, `VideoUpsampler`. On the `cast` path this also backs the two DiffusionStages. |
-| `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors` | 29.1 GB | Stage 1 DiT on `scaled_mm`. |
-| `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-distilled-fp8.safetensors` | 29.5 GB | Stage 2 DiT on `scaled_mm` (distilled weights pre-fused). |
+| `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors` | 29.1 GB | Stage 1 DiT on `scaled_mm`. Per-tensor amax scales embedded. A subset of `transformer_blocks.1.*` (audio-video cross modules, some MLPs) is kept in BF16 alongside block 0 and blocks 43-47 — see §Checkpoint-exclusion probe. |
+| `Lightricks/LTX-2.3-fp8/ltx-2.3-22b-distilled-fp8.safetensors` | 29.5 GB | Stage 2 DiT on `scaled_mm` (distilled weights pre-fused). Same BF16/FP8 split as the dev file. |
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | ~1 GB | Unchanged. |
 | Gemma 3 12B text encoder | ~26 GB | Unchanged. |
 
@@ -102,6 +102,7 @@ Note: `ltx-core[xformers]` and `ltx-core[fp8-trtllm]` are declared as **conflict
 4. **Perf** — measure step time on H100 for a 10 s generation; target ≥ 1.3× speedup vs. the `fp8_cast` baseline (torchao float8 reports 1.27–1.54× on comparable DiTs).
 5. **FA3 confirmation** — log which attention backend resolved in Stage 1 and Stage 2; both must be `FLASH_ATTENTION_3`.
 6. **VRAM** — expect ~30 GB weight footprint plus activations; fits H100 80 GB comfortably with TeaCache enabled and layer-streaming disabled.
+7. **Checkpoint-exclusion probe** — at boot, `src/pipeline.py:_probe_fp8_exclusions` reads the safetensors headers of `ltx-2.3-22b-dev-fp8.safetensors` and `ltx-2.3-22b-distilled-fp8.safetensors` and collects every `.weight` key whose dtype is *not* `float8_e4m3fn`. The resulting module-name set is passed into `src/pipeline.py:_build_scaled_mm_policy(extras)`, a wrapper-only helper that rebuilds a `QuantizationPolicy` using upstream primitives (`EXCLUDED_LAYER_SUBSTRINGS`, `_apply_fp8_prepare_to_model`, `_create_transpose_kv_operation`) with the baseline exclusion list augmented by the probe results. We do **not** patch the upstream `QuantizationPolicy.fp8_scaled_mm()` factory — the Dockerfile clones `Lightricks/LTX-2` fresh at build time, so edits to the vendored `LTX-2-ref/` tree never reach the pod. This probe is mandatory: the Lightricks FP8 DiT keeps a subset of block 1 (audio-video cross modules: `audio_attn1/2`, `audio_ff`, `audio_to_video_attn`, `video_to_audio_attn`, `to_gate_logits`, and `ff.net.*`) in BF16 that the upstream exclusion list does not cover. Without the probe, `_apply_fp8_prepare_to_model` swaps those to `FP8Linear` and `load_state_dict` fails with size/dtype mismatches on the first inference. The two checkpoints may have slightly different exclusion sets; we take the union. Boot log reports the count and first five entries; expected count is O(10s) and all entries should live under `transformer_blocks.1.`.
 
 ## Open questions
 
