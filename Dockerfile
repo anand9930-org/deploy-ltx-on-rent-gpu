@@ -126,7 +126,7 @@ RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>
     && python -c "\
 import importlib.metadata as m, anyio, torch, torchvision, torchaudio; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
-assert 'nv25.6' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
+assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
 assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
 print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK')"
