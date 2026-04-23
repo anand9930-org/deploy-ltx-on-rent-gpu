@@ -47,14 +47,14 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
     && sed -i 's|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=True)|' \
         /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
     && grep -q "use_fast=True" /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
-    && uv pip install --system --no-cache \
+    && uv pip install --system --break-system-packages --no-cache \
         --extra-index-url https://pypi.nvidia.com \
         -e "/app/LTX-2/packages/ltx-core[fp8-trtllm]" \
         -e /app/LTX-2/packages/ltx-pipelines
 
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
-RUN uv pip install --system --no-cache /app
+RUN uv pip install --system --break-system-packages --no-cache /app
 
 # ---- FlashAttention 3 — DEFERRED on this base ------------------------------
 # NGC 25.06 ships CUDA 12.9.1 + NVIDIA-patched torch 2.8.0a0. The only
