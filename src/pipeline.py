@@ -229,7 +229,6 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
     from ltx_core.model.transformer import LTXModel
     from ltx_core.quantization import QuantizationPolicy
     from ltx_core.quantization.fp8_scaled_mm import (
-        EXCLUDED_LAYER_SUBSTRINGS,
         FP8_PREPARE_MODULE_OPS,
         FP8Linear,
         FP8_TRANSPOSE_SD_OPS,
@@ -255,11 +254,18 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
             module_ops=(FP8_PREPARE_MODULE_OPS,),
         )
 
-    merged = EXCLUDED_LAYER_SUBSTRINGS + tuple(extras)
+    # Exact match against the probe result, NOT substring match against
+    # upstream's baseline. Baseline includes block-level catch-alls like
+    # `"transformer_blocks.0."` and `"transformer_blocks.43..47."` that
+    # substring-match *every* module in those blocks. Lightricks' FP8
+    # checkpoint keeps some modules in those blocks as FP8 — the
+    # substring rule over-excluded them, leaving FP8 weights loaded into
+    # plain nn.Linear modules and crashing F.linear on first forward.
+    # `extras` is the ground truth: the safetensors header's BF16 keys.
+    exclusions = frozenset(extras)
 
     def _should_skip(name: str) -> bool:
-        canon = _normalize_for_match(name)
-        return any(sub in canon for sub in merged)
+        return _normalize_for_match(name) in exclusions
 
     import torch
     from torch import nn
@@ -269,25 +275,40 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
 
         Walks named_modules; for each nn.Linear (not already FP8Linear)
         whose canonicalized name does NOT match an exclusion, swaps it
-        to FP8Linear. Logs the first swap/skip decisions under block 1
-        so we can verify the matcher at boot.
+        to FP8Linear. Logs per-block swap/skip totals for blocks 0 and 1
+        so we can verify the matcher at boot (block 0 is the first one
+        processed during inference; if a block-0 FP8 module is missed
+        here the first forward crashes with a BF16×FP8 dtype error).
         """
         replacements: list[tuple[nn.Module, str, nn.Linear]] = []
-        swap_samples: list[str] = []
-        skip_samples: list[str] = []
-        block1_linear_total = 0
+        block_totals = {0: 0, 1: 0}
+        block_swapped = {0: 0, 1: 0}
+        block_skipped = {0: 0, 1: 0}
+        block_swap_samples: dict[int, list[str]] = {0: [], 1: []}
+        block_skip_samples: dict[int, list[str]] = {0: [], 1: []}
+
+        def _block_idx(n: str) -> int | None:
+            for i in (0, 1):
+                if n.startswith(f"transformer_blocks.{i}."):
+                    return i
+            return None
 
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear) or isinstance(module, FP8Linear):
                 continue
-            if name.startswith("transformer_blocks.1."):
-                block1_linear_total += 1
+            bi = _block_idx(name)
+            if bi is not None:
+                block_totals[bi] += 1
             if _should_skip(name):
-                if len(skip_samples) < 5 and name.startswith("transformer_blocks.1."):
-                    skip_samples.append(name)
+                if bi is not None:
+                    block_skipped[bi] += 1
+                    if len(block_skip_samples[bi]) < 5:
+                        block_skip_samples[bi].append(name)
                 continue
-            if len(swap_samples) < 5 and name.startswith("transformer_blocks.1."):
-                swap_samples.append(name)
+            if bi is not None:
+                block_swapped[bi] += 1
+                if len(block_swap_samples[bi]) < 5:
+                    block_swap_samples[bi].append(name)
             if "." in name:
                 parent_name, attr_name = name.rsplit(".", 1)
                 parent = model.get_submodule(parent_name)
@@ -299,16 +320,24 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
         for parent, attr_name, linear in replacements:
             setattr(parent, attr_name, _linear_to_fp8linear(linear))
 
-        logger.info(
-            "FP8 prepare: block-1 nn.Linear count=%d, swapped=%d, skipped=%d",
-            block1_linear_total,
-            len(swap_samples),
-            len(skip_samples),
-        )
-        if swap_samples:
-            logger.info("FP8 prepare: block-1 swap samples: %s", swap_samples)
-        if skip_samples:
-            logger.info("FP8 prepare: block-1 skip samples: %s", skip_samples)
+        for bi in (0, 1):
+            logger.info(
+                "FP8 prepare: block-%d nn.Linear count=%d, swapped=%d, skipped=%d",
+                bi,
+                block_totals[bi],
+                block_swapped[bi],
+                block_skipped[bi],
+            )
+            if block_swap_samples[bi]:
+                logger.info(
+                    "FP8 prepare: block-%d swap samples: %s",
+                    bi, block_swap_samples[bi],
+                )
+            if block_skip_samples[bi]:
+                logger.info(
+                    "FP8 prepare: block-%d skip samples: %s",
+                    bi, block_skip_samples[bi],
+                )
         return model
 
     def _transpose_op(key: str, value: torch.Tensor):
