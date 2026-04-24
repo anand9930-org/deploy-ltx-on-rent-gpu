@@ -417,29 +417,39 @@ class LTXVideoGenerator:
                     f"{dev_fp8_path} and {distilled_fp8_path}. Run download_models.py "
                     f"with LTX_FP8_MODE=scaled_mm."
                 )
-            # Checkpoint-driven exclusion list. The Lightricks FP8 DiT
-            # keeps a subset of block-1's modules (audio-video cross
-            # modules, some MLPs) in BF16 that upstream's
-            # EXCLUDED_LAYER_SUBSTRINGS does not cover. Without this
-            # probe, _apply_fp8_prepare_to_model swaps those to
-            # FP8Linear and load_state_dict fails with size/dtype
-            # mismatches at first inference. See docs/FP8_H100_Spec.md
-            # Verification #7.
-            extras = _probe_fp8_exclusions([dev_fp8_path, distilled_fp8_path])
+            # Checkpoint-driven exclusion list — PER STAGE. The dev and
+            # distilled FP8 checkpoints do NOT keep the same modules in
+            # BF16 (distilled has ~34 extra BF16 entries that are FP8 in
+            # dev). Merging their exclusions and reusing one policy for
+            # both stages leaves dev-stage modules as nn.Linear while
+            # loading FP8 weights into them → BF16×FP8 dtype error on
+            # the first forward. Probe each file on its own.
+            extras_dev = _probe_fp8_exclusions([dev_fp8_path])
+            extras_distilled = _probe_fp8_exclusions([distilled_fp8_path])
             logger.info(
-                "FP8 checkpoint probe: %d non-FP8 weight modules added to exclusion list",
-                len(extras),
+                "FP8 checkpoint probe: dev=%d, distilled=%d non-FP8 weight modules",
+                len(extras_dev),
+                len(extras_distilled),
             )
-            if extras:
-                preview = ", ".join(extras[:5])
-                more = f" (+{len(extras) - 5} more)" if len(extras) > 5 else ""
-                logger.info("FP8 probe extras (first 5): %s%s", preview, more)
-            quantization = _build_scaled_mm_policy(extras)
+            for label, extras in (("dev", extras_dev), ("distilled", extras_distilled)):
+                if extras:
+                    preview = ", ".join(extras[:5])
+                    more = f" (+{len(extras) - 5} more)" if len(extras) > 5 else ""
+                    logger.info("FP8 probe extras (%s, first 5): %s%s", label, preview, more)
+            quantization_dev = _build_scaled_mm_policy(extras_dev)
+            quantization_distilled = _build_scaled_mm_policy(extras_distilled)
+            # Placeholder fed to the pipeline constructor; the stage
+            # rebuild below overwrites both stages with per-checkpoint
+            # policies. DiffusionStage defers weight load so this
+            # placeholder never actually touches a DiT checkpoint.
+            quantization = quantization_dev
             logger.info(
                 "FP8 mode: scaled_mm (W8A8, TRT-LLM cublas_scaled_mm, H100-optimised)"
             )
         else:
             quantization = QuantizationPolicy.fp8_cast()
+            quantization_dev = None
+            quantization_distilled = None
             logger.info("FP8 mode: cast (W8A16, weights FP8 / activations BF16)")
 
         # Upstream PR #201 constraint: DiffusionStage rejects
@@ -456,6 +466,8 @@ class LTXVideoGenerator:
                 offload_mode.value,
             )
             quantization = None
+            quantization_dev = None
+            quantization_distilled = None
             fp8_mode = "bf16"
             self._fp8_mode = fp8_mode
 
@@ -553,7 +565,7 @@ class LTXVideoGenerator:
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
                 loras=(),
-                quantization=quantization,
+                quantization=quantization_dev,
                 registry=registry,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
                 offload_mode=offload_mode,
@@ -565,7 +577,7 @@ class LTXVideoGenerator:
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
                 loras=(),
-                quantization=quantization,
+                quantization=quantization_distilled,
                 registry=registry,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
                 offload_mode=offload_mode,
