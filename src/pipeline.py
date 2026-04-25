@@ -270,6 +270,27 @@ class LTXVideoGenerator:
         except ImportError:
             pass
 
+        # Token-count-aware Stage-1 sigma schedule. The standard
+        # TI2VidTwoStagesPipeline (ti2vid_two_stages.py:155-157) calls
+        # self._scheduler.execute(steps=N) without a `latent=` arg, so
+        # the scheduler falls back to MAX_SHIFT_ANCHOR=4096 tokens for
+        # its sigma-shift formula (schedulers.py:32). The HQ variant
+        # (ti2vid_two_stages_hq.py:168-170) passes the actual latent
+        # shape to get token-count-dependent shift. We mirror HQ here:
+        # for our 1920x1088 renders, real Stage-1 token counts are 8K
+        # (5s) or 16K (10s) — the 4096-anchor under-shifts by 1.7x and
+        # 3.0x respectively, which biases the schedule toward fine-detail
+        # denoising and starves the high-noise structure-forming regime
+        # most acutely on long clips. Result: late-frame drift on 10s.
+        self._VideoPixelShape = None
+        self._VideoLatentShape = None
+        try:
+            from ltx_core.types import VideoPixelShape, VideoLatentShape
+            self._VideoPixelShape = VideoPixelShape
+            self._VideoLatentShape = VideoLatentShape
+        except ImportError:
+            pass
+
         logger.info("Pipeline ready.")
 
     def _log_vram(self, label: str) -> None:
@@ -323,6 +344,46 @@ class LTXVideoGenerator:
                 tiling_config = self._TilingConfig.default()
                 video_chunks_number = self._get_video_chunks_number(num_frames, tiling_config)
 
+            # Token-count-aware Stage-1 sigma schedule (mirrors
+            # ti2vid_two_stages_hq.py:168-170). Without this, the
+            # standard pipeline anchors to 4096 tokens regardless of
+            # actual latent size, under-shifting the schedule on long
+            # clips. Stage 1 runs at half-res, so the latent we hand
+            # to the scheduler must reflect that.
+            stage_1_sigmas = None
+            scheduler = getattr(self._pipeline, "_scheduler", None)
+            if (
+                self._VideoPixelShape is not None
+                and self._VideoLatentShape is not None
+                and scheduler is not None
+            ):
+                stage_1_pixel_shape = self._VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
+                    width=width // 2,
+                    height=height // 2,
+                    fps=frame_rate,
+                )
+                stage_1_latent_shape = self._VideoLatentShape.from_pixel_shape(
+                    stage_1_pixel_shape
+                )
+                empty_stage_1_latent = torch.empty(stage_1_latent_shape.to_torch_shape())
+                stage_1_sigmas = scheduler.execute(
+                    latent=empty_stage_1_latent,
+                    steps=num_inference_steps,
+                )
+                logger.info(
+                    "Job %s: stage_1 sigma schedule — tokens=%d (lat %dx%dx%d), "
+                    "first=%.4f last=%.4f",
+                    job_id,
+                    stage_1_latent_shape.token_count(),
+                    stage_1_latent_shape.frames,
+                    stage_1_latent_shape.height,
+                    stage_1_latent_shape.width,
+                    float(stage_1_sigmas[0]),
+                    float(stage_1_sigmas[-2]) if stage_1_sigmas.numel() >= 2 else float("nan"),
+                )
+
             # Run pipeline
             start_time = time.time()
             if torch.cuda.is_available():
@@ -353,6 +414,8 @@ class LTXVideoGenerator:
                 call_kwargs["audio_guider_params"] = audio_guider_params
             if tiling_config is not None:
                 call_kwargs["tiling_config"] = tiling_config
+            if stage_1_sigmas is not None:
+                call_kwargs["stage_1_sigmas"] = stage_1_sigmas
 
             result = self._pipeline(**call_kwargs)
             video, audio = result if isinstance(result, tuple) else (result, None)
