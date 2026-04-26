@@ -72,7 +72,14 @@ def _bmgjet_stage_2_sigmas(num_frames: int, prompt: str) -> torch.Tensor:
 
     word_count = max(1, len(prompt.split()))
     offset = min(0.0075, max(0.0, (num_frames / word_count) - 10) * 0.0002)
-    regime = (num_frames <= 241) * 1 + (num_frames >= 601) * 2
+    # Threshold deviates from upstream bmgjet (`<= 241`). Empirical
+    # test on 241f / 1920x1088 (pod or0nihrlpzu1nn, branch
+    # feat/bmgjet-stage2-sigmas commit 683beb8) showed the 3-step
+    # short regime made tail SAT *worse* (29.81 vs 27.70 baseline).
+    # Pushing 241 into the 4-step medium regime gives Stage 2 one
+    # extra denoising pass at sigma 0.78, which is the direction the
+    # data points to.
+    regime = (num_frames < 241) * 1 + (num_frames >= 601) * 2
     schedules = [
         [max(s1, min(1.0, s1 + offset)), max(s2, min(1.0, s2 + offset * 0.5)), s3, 0.445, 0.0],
         [0.85, 0.725, 0.4219, 0.0],
