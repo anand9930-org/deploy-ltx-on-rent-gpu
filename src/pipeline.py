@@ -181,23 +181,27 @@ def _install_build_transformer_audit(stage, label: str) -> None:
             dtype_counts: Counter = Counter()
             block_dtype_sets: dict[int, set[str]] = {}
             bf16_in_body: list[str] = []
-            block_re = re.compile(r"^transformer_blocks\.(\d+)\.")
+            # `_build_transformer` returns `X0Model(builder.build(...))`,
+            # which wraps the inner DiT under an attribute prefix. So
+            # `named_parameters()` yields names like
+            # `inner.transformer_blocks.<n>....` — search the regex
+            # anywhere in the name rather than anchoring at the start.
+            block_re = re.compile(r"transformer_blocks\.(\d+)\.")
             for pname, p in model.named_parameters():
-                if not pname.startswith("transformer_blocks."):
+                m = block_re.search(pname)
+                if m is None:
                     continue
                 dt_name = str(p.dtype).removeprefix("torch.")
                 dtype_counts[dt_name] += 1
-                m = block_re.match(pname)
-                if m:
-                    bi = int(m.group(1))
-                    block_dtype_sets.setdefault(bi, set()).add(dt_name)
-                    if (
-                        dt_name == "bfloat16"
-                        and bi >= 2
-                        and len(bf16_in_body) < 5
-                        and pname.endswith(".weight")
-                    ):
-                        bf16_in_body.append(pname)
+                bi = int(m.group(1))
+                block_dtype_sets.setdefault(bi, set()).add(dt_name)
+                if (
+                    dt_name == "bfloat16"
+                    and bi >= 2
+                    and len(bf16_in_body) < 5
+                    and pname.endswith(".weight")
+                ):
+                    bf16_in_body.append(pname)
 
             total = sum(dtype_counts.values())
             fp8_n = dtype_counts.get("float8_e4m3fn", 0)
@@ -824,17 +828,34 @@ class LTXVideoGenerator:
             _install_build_transformer_audit(self._pipeline.stage_1, "stage_1")
             _install_build_transformer_audit(self._pipeline.stage_2, "stage_2")
 
-        # Always-on: aggressive allocator flush at the Stage 1 → Stage 2
-        # boundary. Fixes intermittent
+        # Aggressive allocator flush at the Stage 1 → Stage 2 boundary.
+        # Fixes intermittent
         #   torch.AcceleratorError: CUDA error: invalid argument
-        # coming out of layer_streaming.py:63 on 24 GB cards. See
-        # _install_stage2_cleanup_hook above.
-        _t3 = time.perf_counter()
-        _install_stage2_cleanup_hook(self._pipeline)
-        logger.info(
-            "Init timing: _install_stage2_cleanup_hook took %.3fs",
-            time.perf_counter() - _t3,
-        )
+        # out of block_streaming.py on small (<40 GB) cards: the streaming
+        # path pins transformer blocks in host memory and PR #201 removed
+        # the host-side empty_cache that used to drain that arena. This
+        # hook restores that drain.
+        #
+        # Skip on OffloadMode.NONE (H100): the streaming path is inactive,
+        # Stage 1 is already released by gpu_model.__exit__ before the
+        # hook runs, and the allocator has already returned reserved
+        # bytes. Empirically (cold + warm runs on H100 80 GB):
+        #   alloc 32.42 → 32.42 GB (unchanged), reserved 32.92 → 32.92 GB
+        # — i.e. exactly zero work for the hook to do, and a misleading
+        # log line. Drop it on the NONE path.
+        if offload_mode != OffloadMode.NONE:
+            _t3 = time.perf_counter()
+            _install_stage2_cleanup_hook(self._pipeline)
+            logger.info(
+                "Init timing: _install_stage2_cleanup_hook took %.3fs",
+                time.perf_counter() - _t3,
+            )
+        else:
+            logger.info(
+                "Stage 2 cleanup hook skipped: offload_mode=NONE "
+                "(streaming path inactive; gpu_model.__exit__ already "
+                "drains stage 1 before stage 2 builds)"
+            )
 
         # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the transformer
         # forward on diffusion steps where the input hasn't changed
