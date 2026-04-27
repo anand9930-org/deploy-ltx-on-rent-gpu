@@ -89,6 +89,7 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
         gc.collect()
         if torch.cuda.is_available():
             alloc_before = torch.cuda.memory_allocated(0) / 1e9
+            res_before = torch.cuda.memory_reserved(0) / 1e9
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
@@ -97,9 +98,18 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
                 except Exception:  # pragma: no cover — best effort
                     logger.debug("Stage 2 cleanup: _host_emptyCache raised", exc_info=True)
             alloc_after = torch.cuda.memory_allocated(0) / 1e9
+            res_after = torch.cuda.memory_reserved(0) / 1e9
+            alloc_delta = alloc_before - alloc_after
+            res_delta = res_before - res_after
+            alloc_note = (
+                "" if alloc_delta > 0.01
+                else " (unchanged; stage 1 already released via gpu_model.__exit__)"
+            )
             logger.info(
-                "Stage 2 boundary cleanup done: VRAM %.2f → %.2f GB allocated",
-                alloc_before, alloc_after,
+                "Stage 2 boundary cleanup: alloc %.2f → %.2f GB%s, "
+                "reserved %.2f → %.2f GB (%.2f GB returned to pool)",
+                alloc_before, alloc_after, alloc_note,
+                res_before, res_after, res_delta,
             )
         else:
             logger.info("Stage 2 boundary cleanup done (no CUDA)")
@@ -107,6 +117,126 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
 
     stage._transformer_ctx = hooked_ctx
     stage._stage2_cleanup_hooked = True
+
+
+def _install_build_transformer_audit(stage, label: str) -> None:
+    """Wrap ``DiffusionStage._build_transformer`` with timing + dtype audit.
+
+    The transformer build is what dominates cold-start: disk read of the
+    FP8 safetensors → SDOps transpose → ``load_state_dict(..., assign=True)``
+    → the FP8 ``_prepare`` swap. We have no instrumentation for that
+    wall time today; the cold-start gap (job submit → first sampler step)
+    is a 7-min black box. This wrapper logs:
+
+    1. Wall time for the whole build (single number — easy to compare
+       cold vs warm).
+    2. Post-load dtype histogram over `transformer_blocks.*` parameters.
+       This is the GROUND TRUTH for "did the FP8 swap actually take?".
+       The per-block log inside `_prepare` only reflects what the
+       matcher decided to swap; if the matcher picked the wrong module
+       names, the actual weight buffers stay BF16 — and only this
+       post-load histogram surfaces the discrepancy.
+    3. First few BF16 names in blocks ≥ 2 — sanity check that BF16
+       isn't bleeding into the body of the network.
+    4. Blocks fully BF16 (every weight in the block is BF16) — should
+       be {0, 1, 46, 47} or similar per upstream's published design.
+
+    Idempotent; safe to call once per stage.
+    """
+    if getattr(stage, "_build_transformer_audited", False):
+        return
+    if not hasattr(stage, "_build_transformer"):
+        logger.warning(
+            "Audit hook [%s]: stage has no _build_transformer; skipping",
+            label,
+        )
+        return
+
+    original_build = stage._build_transformer
+
+    @functools.wraps(original_build)
+    def audited_build(*args, **kwargs):
+        logger.info("[%s] _build_transformer start", label)
+        peak_before = (
+            torch.cuda.max_memory_allocated(0) / 1e9
+            if torch.cuda.is_available() else 0.0
+        )
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(0)
+        t_start = time.perf_counter()
+        model = original_build(*args, **kwargs)
+        elapsed = time.perf_counter() - t_start
+        peak = (
+            torch.cuda.max_memory_allocated(0) / 1e9
+            if torch.cuda.is_available() else 0.0
+        )
+        logger.info(
+            "[%s] _build_transformer done in %.1fs "
+            "(load+swap+assign), peak VRAM %.2f GB (was %.2f GB before)",
+            label, elapsed, peak, peak_before,
+        )
+
+        try:
+            from collections import Counter
+            dtype_counts: Counter = Counter()
+            block_dtype_sets: dict[int, set[str]] = {}
+            bf16_in_body: list[str] = []
+            block_re = re.compile(r"^transformer_blocks\.(\d+)\.")
+            for pname, p in model.named_parameters():
+                if not pname.startswith("transformer_blocks."):
+                    continue
+                dt_name = str(p.dtype).removeprefix("torch.")
+                dtype_counts[dt_name] += 1
+                m = block_re.match(pname)
+                if m:
+                    bi = int(m.group(1))
+                    block_dtype_sets.setdefault(bi, set()).add(dt_name)
+                    if (
+                        dt_name == "bfloat16"
+                        and bi >= 2
+                        and len(bf16_in_body) < 5
+                        and pname.endswith(".weight")
+                    ):
+                        bf16_in_body.append(pname)
+
+            total = sum(dtype_counts.values())
+            fp8_n = dtype_counts.get("float8_e4m3fn", 0)
+            pct = (100.0 * fp8_n / total) if total else 0.0
+            logger.info(
+                "FP8 audit [%s]: %d transformer params total — "
+                "FP8 %d (%.1f%%), other %d",
+                label, total, fp8_n, pct, total - fp8_n,
+            )
+            logger.info(
+                "FP8 audit [%s]: dtype histogram (transformer_blocks.*): %s",
+                label, dict(dtype_counts),
+            )
+            if bf16_in_body:
+                logger.info(
+                    "FP8 audit [%s]: first %d BF16 weight names in blocks ≥ 2: %s",
+                    label, len(bf16_in_body), bf16_in_body,
+                )
+            fully_bf16_blocks = sorted(
+                bi for bi, ds in block_dtype_sets.items()
+                if "float8_e4m3fn" not in ds
+            )
+            if fully_bf16_blocks:
+                logger.info(
+                    "FP8 audit [%s]: blocks with NO FP8 params: %s",
+                    label, fully_bf16_blocks,
+                )
+            else:
+                logger.info(
+                    "FP8 audit [%s]: every block has at least one FP8 param",
+                    label,
+                )
+        except Exception:
+            logger.exception("FP8 audit [%s]: dtype histogram failed", label)
+
+        return model
+
+    stage._build_transformer = audited_build
+    stage._build_transformer_audited = True
 
 
 # The Lightricks FP8 safetensors store DiT weights with this prefix on
@@ -281,40 +411,43 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
 
         Walks named_modules; for each nn.Linear (not already FP8Linear)
         whose canonicalized name does NOT match an exclusion, swaps it
-        to FP8Linear. Logs per-block swap/skip totals for blocks 0 and 1
-        so we can verify the matcher at boot (block 0 is the first one
-        processed during inference; if a block-0 FP8 module is missed
-        here the first forward crashes with a BF16×FP8 dtype error).
+        to FP8Linear. Logs per-block swap/skip totals for ALL blocks
+        encountered so we can verify swap coverage end-to-end (the
+        upstream design keeps block 0 and the late blocks in BF16; we
+        need visibility into blocks 2..N to confirm they are FP8).
         """
+        from collections import defaultdict
+
         replacements: list[tuple[nn.Module, str, nn.Linear]] = []
-        block_totals = {0: 0, 1: 0}
-        block_swapped = {0: 0, 1: 0}
-        block_skipped = {0: 0, 1: 0}
-        block_swap_samples: dict[int, list[str]] = {0: [], 1: []}
-        block_skip_samples: dict[int, list[str]] = {0: [], 1: []}
+        block_totals: dict[int, int] = defaultdict(int)
+        block_swapped: dict[int, int] = defaultdict(int)
+        block_skipped: dict[int, int] = defaultdict(int)
+        block_swap_samples: dict[int, list[str]] = defaultdict(list)
+        block_skip_samples: dict[int, list[str]] = defaultdict(list)
+
+        _BLOCK_RE = re.compile(r"^transformer_blocks\.(\d+)\.")
 
         def _block_idx(n: str) -> int | None:
-            for i in (0, 1):
-                if n.startswith(f"transformer_blocks.{i}."):
-                    return i
-            return None
+            m = _BLOCK_RE.match(n)
+            return int(m.group(1)) if m else None
 
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear) or isinstance(module, FP8Linear):
                 continue
-            bi = _block_idx(name)
+            normalized = _normalize_for_match(name)
+            bi = _block_idx(normalized)
             if bi is not None:
                 block_totals[bi] += 1
             if _should_skip(name):
                 if bi is not None:
                     block_skipped[bi] += 1
-                    if len(block_skip_samples[bi]) < 5:
-                        block_skip_samples[bi].append(name)
+                    if len(block_skip_samples[bi]) < 3:
+                        block_skip_samples[bi].append(normalized)
                 continue
             if bi is not None:
                 block_swapped[bi] += 1
-                if len(block_swap_samples[bi]) < 5:
-                    block_swap_samples[bi].append(name)
+                if len(block_swap_samples[bi]) < 3:
+                    block_swap_samples[bi].append(normalized)
             if "." in name:
                 parent_name, attr_name = name.rsplit(".", 1)
                 parent = model.get_submodule(parent_name)
@@ -326,22 +459,54 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
         for parent, attr_name, linear in replacements:
             setattr(parent, attr_name, _linear_to_fp8linear(linear))
 
-        for bi in (0, 1):
+        # Aggregate roll-up
+        total_in_blocks = sum(block_totals.values())
+        total_swapped = sum(block_swapped.values())
+        total_skipped = sum(block_skipped.values())
+        pct_swapped = (100.0 * total_swapped / total_in_blocks) if total_in_blocks else 0.0
+        logger.info(
+            "FP8 prepare: aggregate over %d transformer blocks — "
+            "linears=%d, swapped=%d (%.1f%%), skipped=%d",
+            len(block_totals), total_in_blocks, total_swapped, pct_swapped, total_skipped,
+        )
+
+        # Per-block summary, sorted; flag fully-BF16 blocks for fast scan.
+        all_bf16_blocks = []
+        for bi in sorted(block_totals.keys()):
+            tag = ""
+            if block_totals[bi] > 0 and block_swapped[bi] == 0:
+                tag = " [ALL-BF16]"
+                all_bf16_blocks.append(bi)
             logger.info(
-                "FP8 prepare: block-%d nn.Linear count=%d, swapped=%d, skipped=%d",
-                bi,
-                block_totals[bi],
-                block_swapped[bi],
-                block_skipped[bi],
+                "FP8 prepare: block-%02d count=%d, swapped=%d, skipped=%d%s",
+                bi, block_totals[bi], block_swapped[bi], block_skipped[bi], tag,
             )
+        if all_bf16_blocks:
+            logger.info(
+                "FP8 prepare: blocks fully BF16 (swapped=0): %s",
+                all_bf16_blocks,
+            )
+
+        # Spot-check samples from a few representative blocks (first,
+        # mid, last) to confirm the matcher is producing sensible names.
+        seen = sorted(block_totals.keys())
+        spot_blocks = []
+        if seen:
+            spot_blocks = [seen[0]]
+            mid = seen[len(seen) // 2]
+            if mid not in spot_blocks:
+                spot_blocks.append(mid)
+            if seen[-1] not in spot_blocks:
+                spot_blocks.append(seen[-1])
+        for bi in spot_blocks:
             if block_swap_samples[bi]:
                 logger.info(
-                    "FP8 prepare: block-%d swap samples: %s",
+                    "FP8 prepare: block-%02d swap samples: %s",
                     bi, block_swap_samples[bi],
                 )
             if block_skip_samples[bi]:
                 logger.info(
-                    "FP8 prepare: block-%d skip samples: %s",
+                    "FP8 prepare: block-%02d skip samples: %s",
                     bi, block_skip_samples[bi],
                 )
         return model
@@ -583,7 +748,12 @@ class LTXVideoGenerator:
             from src.attention_override import enable_flash_attention_3
             enable_flash_attention_3()
 
+        _t0 = time.perf_counter()
         self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
+        logger.info(
+            "Init timing: TI2VidTwoStagesPipeline construction took %.2fs",
+            time.perf_counter() - _t0,
+        )
         self._log_vram("after pipeline init")
 
         # scaled_mm: swap Stage 1 and Stage 2 DiffusionStages to point at
@@ -600,6 +770,7 @@ class LTXVideoGenerator:
             # `gpu_model.__exit__` runs `model.to("meta")`. With both
             # ~40 GB FP8 stages pinned, the Stage 2 build OOMs on H100
             # 80 GB. Builder defaults to DummyRegistry → no caching.
+            _t1 = time.perf_counter()
             self._pipeline.stage_1 = DiffusionStage(
                 checkpoint_path=dev_fp8_path,
                 dtype=self._pipeline.dtype,
@@ -610,8 +781,14 @@ class LTXVideoGenerator:
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
                 offload_mode=offload_mode,
             )
+            logger.info(
+                "Init timing: DiffusionStage(stage_1) constructor took %.3fs "
+                "(weight load deferred to first __call__)",
+                time.perf_counter() - _t1,
+            )
             # Stage 2 uses the distilled-fp8 checkpoint (distilled weights
             # already fused in) instead of base + distilled LoRA.
+            _t2 = time.perf_counter()
             self._pipeline.stage_2 = DiffusionStage(
                 checkpoint_path=distilled_fp8_path,
                 dtype=self._pipeline.dtype,
@@ -623,17 +800,41 @@ class LTXVideoGenerator:
                 offload_mode=offload_mode,
             )
             logger.info(
+                "Init timing: DiffusionStage(stage_2) constructor took %.3fs "
+                "(weight load deferred to first __call__)",
+                time.perf_counter() - _t2,
+            )
+            logger.info(
                 "scaled_mm: rebuilt stage_1 → %s, stage_2 → %s (distilled pre-fused)",
                 os.path.basename(dev_fp8_path),
                 os.path.basename(distilled_fp8_path),
             )
+
+            # Wrap each stage's _build_transformer to log wall time +
+            # post-load dtype histogram. This is the only place we can
+            # observe the actual swapped-vs-skipped result, because the
+            # swap happens inside Builder.build(...) at the END of the
+            # weight load — well after _prepare(model) returns, when
+            # the safetensors values get assigned via load_state_dict
+            # (assign=True). A meta module renamed wrong by _prepare
+            # would still log "swapped" there but the actual weight
+            # buffer would land on a stale nn.Linear. The histogram
+            # below reads `module.weight.dtype` after the load → ground
+            # truth.
+            _install_build_transformer_audit(self._pipeline.stage_1, "stage_1")
+            _install_build_transformer_audit(self._pipeline.stage_2, "stage_2")
 
         # Always-on: aggressive allocator flush at the Stage 1 → Stage 2
         # boundary. Fixes intermittent
         #   torch.AcceleratorError: CUDA error: invalid argument
         # coming out of layer_streaming.py:63 on 24 GB cards. See
         # _install_stage2_cleanup_hook above.
+        _t3 = time.perf_counter()
         _install_stage2_cleanup_hook(self._pipeline)
+        logger.info(
+            "Init timing: _install_stage2_cleanup_hook took %.3fs",
+            time.perf_counter() - _t3,
+        )
 
         # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the transformer
         # forward on diffusion steps where the input hasn't changed
@@ -645,7 +846,12 @@ class LTXVideoGenerator:
         teacache_cfg = teacache_config_from_env()
         self._teacache_enabled = teacache_cfg is not None
         if self._teacache_enabled:
+            _t4 = time.perf_counter()
             enable_teacache(self._pipeline, **teacache_cfg)
+            logger.info(
+                "Init timing: enable_teacache took %.3fs",
+                time.perf_counter() - _t4,
+            )
 
         # Boot-time attention-backend fingerprint. LTX-2's
         # `AttentionFunction.DEFAULT` resolves to `PytorchAttention` (torch
