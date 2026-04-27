@@ -66,7 +66,13 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     empty_cache → CUDA sync → host empty_cache) right before Stage 2's
     transformer context manager enters, so the pinned arena is in a
     known-drained state. On H100 (``OffloadMode.NONE``) the streaming
-    path is inactive and the hook is a cheap no-op-ish sync; harmless.
+    path is inactive and the hook is a cheap sync; the actual Stage 1
+    GPU weight release happens inside upstream ``gpu_model.__exit__``
+    (which calls ``model.to("meta")``), and only takes effect because
+    the DiT stages are built without a ``StateDictRegistry`` — see the
+    ``registry=None`` rebuilds in ``LTXVideoGenerator.__init__``. The
+    hook's ``empty_cache`` returns the freed CUDA blocks to the OS so
+    Stage 2's build sees a near-empty pool.
     Idempotent; safe to call multiple times.
     """
     stage = getattr(pipeline, "stage_2", None)
@@ -589,13 +595,18 @@ class LTXVideoGenerator:
         # DiffusionStage defers weight load to its first __call__.
         if fp8_mode == "scaled_mm":
             from ltx_pipelines.utils.blocks import DiffusionStage
+            # No registry on the DiT stages: state dicts load straight to
+            # GPU and are kept alive by registry refs even after
+            # `gpu_model.__exit__` runs `model.to("meta")`. With both
+            # ~40 GB FP8 stages pinned, the Stage 2 build OOMs on H100
+            # 80 GB. Builder defaults to DummyRegistry → no caching.
             self._pipeline.stage_1 = DiffusionStage(
                 checkpoint_path=dev_fp8_path,
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
                 loras=(),
                 quantization=quantization_dev,
-                registry=registry,
+                registry=None,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
                 offload_mode=offload_mode,
             )
@@ -607,7 +618,7 @@ class LTXVideoGenerator:
                 device=self._pipeline.device,
                 loras=(),
                 quantization=quantization_distilled,
-                registry=registry,
+                registry=None,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
                 offload_mode=offload_mode,
             )
