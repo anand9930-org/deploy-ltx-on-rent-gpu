@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Temporal Segmentation — Visual Explainer</title>
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --ink: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-2: #7ee787;
+    --warn: #f0883e;
+    --bad: #f85149;
+    --ok: #2ea043;
+    --grid: #30363d;
+    --seg1: #3b82f6;
+    --seg2: #a855f7;
+    --overlap: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.55 -apple-system, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 96px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 20px; margin: 36px 0 12px; color: var(--accent); border-bottom: 1px solid var(--grid); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin: 20px 0 8px; color: var(--accent-2); }
+  p { color: var(--ink); }
+  .lede { color: var(--muted); font-size: 15px; max-width: 70ch; margin: 0 0 24px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--grid);
+    border-radius: 10px;
+    padding: 20px;
+    margin: 16px 0;
+  }
+  .panel-2 { background: var(--panel-2); }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 13px; }
+  .kbd { background: #2d333b; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--grid); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .col { flex: 1 1 300px; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0 16px; font-size: 13px; color: var(--muted); }
+  .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #2d333b; font-size: 12px; color: var(--muted); }
+  .pill.ok  { background: #0d3018; color: #56d364; }
+  .pill.bad { background: #3a0e0e; color: #ff7b72; }
+  .pill.warn { background: #3a280e; color: #f0c674; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .quote {
+    border-left: 3px solid var(--accent);
+    padding: 4px 14px;
+    color: var(--muted);
+    margin: 8px 0;
+    font-size: 13px;
+  }
+
+  /* SVG containers */
+  .svgbox {
+    width: 100%;
+    background: #0a0d11;
+    border: 1px solid var(--grid);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+  }
+  svg { display: block; max-width: 100%; height: auto; }
+  .label { fill: var(--muted); font-family: "SF Mono", Menlo, monospace; font-size: 11px; }
+  .label-title { fill: var(--ink); font-family: -apple-system, system-ui, sans-serif; font-size: 13px; font-weight: 600; }
+  .label-big { fill: var(--ink); font-family: -apple-system, system-ui, sans-serif; font-size: 14px; }
+
+  details {
+    background: var(--panel-2);
+    border: 1px solid var(--grid);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 8px 0;
+  }
+  summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+
+  pre {
+    background: #0a0d11;
+    border: 1px solid var(--grid);
+    border-radius: 6px;
+    padding: 12px 14px;
+    overflow-x: auto;
+    color: #d2a8ff;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 36px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Temporal Segmentation, visually explained</h1>
+<p class="lede">
+The name sounds technical but the idea is simple: <b>don't ask the GPU to render all 10 seconds at once.
+Render it in two 5-second chunks, then stitch the chunks so the seam is invisible.</b>
+This page walks through what that means visually, why it works, and how the two chunks stay coherent.
+</p>
+
+<!-- ============================================================ -->
+<h2>1. The problem in one picture</h2>
+
+<div class="panel">
+<p>Your H100 has 85 GB. A 5 s render peaks at <b>80.7 GB</b> — fits, with 4 GB to spare.
+A 10 s render projects to <b>~104 GB</b> — overflows by 19 GB. That's the OOM.</p>
+
+<div class="svgbox">
+<svg viewBox="0 0 900 280" role="img" aria-label="Bar chart comparing 5s and 10s VRAM peaks against the 85GB ceiling.">
+  <!-- Ceiling line -->
+  <line x1="60" y1="40" x2="860" y2="40" stroke="#f85149" stroke-dasharray="6 4" stroke-width="2"/>
+  <text x="864" y="44" class="label" fill="#f85149">85 GB ceiling</text>
+
+  <!-- Y axis -->
+  <line x1="60" y1="40" x2="60" y2="240" stroke="#30363d"/>
+  <text x="48" y="44" class="label" text-anchor="end">120</text>
+  <text x="48" y="100" class="label" text-anchor="end">85</text>
+  <text x="48" y="160" class="label" text-anchor="end">50</text>
+  <text x="48" y="240" class="label" text-anchor="end">0</text>
+
+  <!-- 5s bar -->
+  <rect x="160" y="58" width="120" height="182" fill="#3b82f6" opacity="0.85"/>
+  <text x="220" y="56" class="label-big" text-anchor="middle">80.7 GB</text>
+  <text x="220" y="262" class="label-title" text-anchor="middle">5 s render</text>
+  <text x="220" y="278" class="label" text-anchor="middle">fits ✓</text>
+
+  <!-- 10s bar -->
+  <rect x="380" y="20" width="120" height="220" fill="#f85149" opacity="0.85"/>
+  <text x="440" y="14" class="label-big" text-anchor="middle">~104 GB</text>
+  <text x="440" y="262" class="label-title" text-anchor="middle">10 s render (single shot)</text>
+  <text x="440" y="278" class="label" text-anchor="middle">OOM ✗</text>
+
+  <!-- 2x5s -->
+  <rect x="600" y="58" width="55" height="182" fill="#3b82f6" opacity="0.85"/>
+  <rect x="665" y="58" width="55" height="182" fill="#a855f7" opacity="0.85"/>
+  <text x="660" y="56" class="label-big" text-anchor="middle">80.7 GB peak (each)</text>
+  <text x="660" y="262" class="label-title" text-anchor="middle">2 × 5 s segmented</text>
+  <text x="660" y="278" class="label" text-anchor="middle">fits ✓ — same headroom, twice</text>
+</svg>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The core idea: split the timeline</h2>
+
+<div class="panel">
+<p>Instead of one big tensor that holds 240 frames in GPU memory simultaneously,
+we make two render calls. Each call only ever holds 120 frames.
+The peak memory is the same as today's working 5 s — we just pay it twice.</p>
+
+<div class="svgbox">
+<svg viewBox="0 0 900 240" role="img" aria-label="Timeline showing 240 frames split into two segments of 120 frames each.">
+  <!-- Single timeline -->
+  <text x="20" y="36" class="label-title">Single shot (broken):</text>
+  <rect x="20" y="50" width="860" height="40" fill="#f85149" opacity="0.6" rx="4"/>
+  <text x="450" y="76" class="label-big" text-anchor="middle" fill="#fff">240 frames in one forward pass — needs ~104 GB</text>
+  <text x="20" y="108" class="label">frame 0</text>
+  <text x="876" y="108" class="label" text-anchor="end">frame 240</text>
+
+  <!-- Segmented timeline -->
+  <text x="20" y="156" class="label-title">Temporal segmentation:</text>
+  <rect x="20" y="170" width="430" height="40" fill="#3b82f6" opacity="0.85" rx="4"/>
+  <text x="235" y="196" class="label-big" text-anchor="middle" fill="#fff">Segment 1 — frames 0..120</text>
+  <rect x="450" y="170" width="430" height="40" fill="#a855f7" opacity="0.85" rx="4"/>
+  <text x="665" y="196" class="label-big" text-anchor="middle" fill="#fff">Segment 2 — frames 120..240</text>
+  <text x="20" y="226" class="label">frame 0</text>
+  <text x="445" y="226" class="label" text-anchor="middle">frame 120 (boundary)</text>
+  <text x="876" y="226" class="label" text-anchor="end">frame 240</text>
+</svg>
+</div>
+
+<p class="quote">Each segment is just a normal 5 s render that you already know works on your hardware.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. The hard part: making the seam invisible</h2>
+
+<div class="panel">
+<p>If you naively render two segments and concatenate them, the boundary will look like a hard cut —
+because segment 2's diffusion process started from random noise and has no idea what segment 1 looked like.
+The character could swap clothes. The background could shift. The motion direction could flip.</p>
+
+<p>The fix is <b>autoregressive conditioning with overlap</b>:</p>
+
+<div class="legend">
+  <span><span class="swatch" style="background:var(--seg1)"></span>Segment 1 frames</span>
+  <span><span class="swatch" style="background:var(--seg2)"></span>Segment 2 frames</span>
+  <span><span class="swatch" style="background:var(--overlap)"></span>Overlap (blended)</span>
+  <span><span class="swatch" style="background:#444c56"></span>Conditioning frames (frozen)</span>
+</div>
+
+<div class="svgbox">
+<svg viewBox="0 0 900 360" role="img" aria-label="Autoregressive overlap diagram. Segment 2 is conditioned on the tail of segment 1.">
+  <!-- Frame ruler -->
+  <line x1="20" y1="40" x2="880" y2="40" stroke="#30363d"/>
+  <g class="label">
+    <text x="20" y="32">0</text>
+    <text x="237" y="32">60</text>
+    <text x="453" y="32">120</text>
+    <text x="670" y="32">180</text>
+    <text x="876" y="32" text-anchor="end">240</text>
+  </g>
+
+  <!-- Step 1: render segment 1 -->
+  <text x="20" y="76" class="label-title">Step 1 — render segment 1 (normal 5 s call)</text>
+  <rect x="20" y="86" width="430" height="36" fill="var(--seg1)" opacity="0.85" rx="4"/>
+  <text x="235" y="110" class="label-big" text-anchor="middle" fill="#fff">120 frames generated from prompt + noise</text>
+
+  <!-- Step 2: extract tail -->
+  <text x="20" y="160" class="label-title">Step 2 — keep the last ~24 latent frames as a "tail"</text>
+  <rect x="20" y="170" width="350" height="30" fill="var(--seg1)" opacity="0.25" rx="4"/>
+  <rect x="370" y="170" width="80" height="30" fill="var(--overlap)" opacity="0.95" rx="4"/>
+  <text x="410" y="190" class="label" text-anchor="middle" fill="#000" font-weight="600">tail (96..120)</text>
+
+  <!-- Step 3: condition segment 2 on the tail -->
+  <text x="20" y="234" class="label-title">Step 3 — render segment 2, but freeze its first 24 frames = segment 1's tail</text>
+  <rect x="370" y="244" width="80" height="36" fill="#444c56" rx="4"/>
+  <text x="410" y="266" class="label" text-anchor="middle" fill="#fff" font-weight="600">conditioning</text>
+  <rect x="450" y="244" width="430" height="36" fill="var(--seg2)" opacity="0.85" rx="4"/>
+  <text x="665" y="268" class="label-big" text-anchor="middle" fill="#fff">120 new frames diffused from this anchor</text>
+
+  <!-- Step 4: blend & stitch -->
+  <text x="20" y="318" class="label-title">Step 4 — blend the overlap region (AdaIN) and concat</text>
+  <rect x="20" y="328" width="350" height="22" fill="var(--seg1)" opacity="0.85" rx="3"/>
+  <rect x="370" y="328" width="80" height="22" fill="var(--overlap)" opacity="0.95" rx="3"/>
+  <rect x="450" y="328" width="430" height="22" fill="var(--seg2)" opacity="0.85" rx="3"/>
+  <text x="450" y="346" class="label" text-anchor="middle">final 240-frame video — no visible cut</text>
+</svg>
+</div>
+
+<p>Why this works: by making segment 2's first 24 frames be <i>literally the same latents</i> as segment 1's
+last 24 frames, the diffusion model picks up the motion mid-stride. The character keeps walking, the camera
+keeps panning, the lighting stays consistent. The overlap region is rendered twice and blended — that's where
+any tiny mismatch dissolves.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. What the GPU sees over time</h2>
+
+<div class="panel">
+<p>Memory profile across the wall clock — note how the peak never exceeds today's working 5 s peak.</p>
+
+<div class="svgbox">
+<svg viewBox="0 0 900 280" role="img" aria-label="Memory-vs-time graph for segmented rendering.">
+  <!-- Axes -->
+  <line x1="60" y1="40" x2="60" y2="240" stroke="#30363d"/>
+  <line x1="60" y1="240" x2="880" y2="240" stroke="#30363d"/>
+  <text x="48" y="44" class="label" text-anchor="end">120</text>
+  <text x="48" y="100" class="label" text-anchor="end">85</text>
+  <text x="48" y="160" class="label" text-anchor="end">50</text>
+  <text x="48" y="244" class="label" text-anchor="end">0</text>
+  <text x="40" y="140" class="label" text-anchor="middle" transform="rotate(-90 40 140)">VRAM (GB)</text>
+
+  <!-- Ceiling -->
+  <line x1="60" y1="100" x2="880" y2="100" stroke="#f85149" stroke-dasharray="6 4"/>
+  <text x="876" y="96" class="label" fill="#f85149" text-anchor="end">85 GB ceiling</text>
+
+  <!-- Single-shot (red, exceeds ceiling) -->
+  <path d="M 60 200 L 200 200 L 350 60 L 600 60 L 750 200 L 880 200"
+        stroke="#f85149" stroke-width="2.5" fill="#f85149" fill-opacity="0.12"/>
+  <text x="475" y="50" class="label-big" text-anchor="middle" fill="#f85149">10 s single shot — peaks at ~104 GB ✗</text>
+
+  <!-- Segmented (blue+purple, two peaks under ceiling) -->
+  <path d="M 60 200 L 150 200 L 250 110 L 380 110 L 470 200 L 510 200 L 590 110 L 720 110 L 800 200 L 880 200"
+        stroke="#7ee787" stroke-width="2.5" fill="#7ee787" fill-opacity="0.15"/>
+  <text x="320" y="146" class="label" fill="#7ee787" text-anchor="middle">seg 1 peak</text>
+  <text x="660" y="146" class="label" fill="#7ee787" text-anchor="middle">seg 2 peak</text>
+  <text x="490" y="220" class="label" fill="#7ee787" text-anchor="middle">cleanup boundary</text>
+
+  <!-- X axis labels -->
+  <text x="60" y="262" class="label">t = 0</text>
+  <text x="490" y="262" class="label" text-anchor="middle">~mid render</text>
+  <text x="876" y="262" class="label" text-anchor="end">done</text>
+</svg>
+</div>
+
+<p>The green curve is what your H100 will actually do. Two safe peaks, separated by a cleanup
+(<code>gc.collect() + torch.cuda.empty_cache()</code>) that already exists in
+<code>src/pipeline.py:49-98</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Where the conditioning math comes from</h2>
+
+<div class="panel">
+<p>Inside the diffusion loop, "conditioning" means: at every denoising step, we overwrite the first 24
+positions of segment 2's latent with segment 1's tail latent (with appropriate noise added at the right
+sigma level). The model can't drift because those positions are pinned.</p>
+
+<pre>
+# pseudocode (matches diffusers LTXI2VLongMultiPromptPipeline)
+seg1_video, seg1_tail_latents = pipeline.generate(
+    prompt=prompt,
+    num_frames=121,
+    return_tail_latents=24,
+)
+
+# Stage 2's noise gets the tail "stamped" onto the first 24 frames at every step
+seg2_video = pipeline.generate(
+    prompt=prompt,                    # same prompt, or a continuation prompt
+    num_frames=121,
+    conditioning_latents=seg1_tail_latents,   # the anchor
+    conditioning_position="head",
+    overlap=24,                       # how many frames are shared
+)
+
+final = stitch(seg1_video, seg2_video, overlap=24, blend="adain")
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Practical knobs</h2>
+
+<div class="panel">
+<table>
+  <tr><th>Knob</th><th>Typical value</th><th>What it controls</th></tr>
+  <tr>
+    <td><code>temporal_tile_size</code></td>
+    <td>120 latent frames (~5 s)</td>
+    <td>How many frames per segment. Cap to whatever your VRAM safely fits.</td>
+  </tr>
+  <tr>
+    <td><code>temporal_overlap</code></td>
+    <td>24 frames (~1 s)</td>
+    <td>How many frames are shared at the boundary. Bigger = smoother seam, more recompute.</td>
+  </tr>
+  <tr>
+    <td><code>adain_factor</code></td>
+    <td>0.25</td>
+    <td>How aggressively to color/contrast-match segment 2 to segment 1. Hides small drift.</td>
+  </tr>
+  <tr>
+    <td><code>conditioning_position</code></td>
+    <td><span class="mono">"head"</span></td>
+    <td>Where the anchor frames go in segment 2 (always at the head, since they precede the new content).</td>
+  </tr>
+</table>
+
+<div class="row">
+  <div class="col panel panel-2">
+    <h3>What stays lossless</h3>
+    <ul>
+      <li>Frames <b>inside</b> each segment — bit-identical to a single render of those frames.</li>
+      <li>The pinned conditioning frames — they ARE segment 1's tail by construction.</li>
+    </ul>
+  </div>
+  <div class="col panel panel-2">
+    <h3>What gets blended (not bit-identical)</h3>
+    <ul>
+      <li>The 24-frame overlap region — linear-feathered between seg1 and seg2.</li>
+      <li>Optional global tone match via AdaIN over the whole segment 2.</li>
+    </ul>
+    <p style="font-size:12px;color:var(--muted)">In practice this is below the visual threshold; it's the
+    same trick used in the official LTX-2.3 long-video pipeline and ComfyUI workflows.</p>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Why this is the right choice for your setup</h2>
+
+<div class="panel">
+<table>
+  <tr><th>Approach</th><th>Closes 19 GB gap?</th><th>Lossless?</th><th>Effort</th><th>Status</th></tr>
+  <tr>
+    <td>Temporal segmentation</td>
+    <td><span class="pill ok">yes (~24 GB)</span></td>
+    <td><span class="pill ok">inside segments</span></td>
+    <td>Medium</td>
+    <td>Proven in 3+ public workflows</td>
+  </tr>
+  <tr>
+    <td>FFN forward chunking</td>
+    <td><span class="pill warn">partial (2–4 GB)</span></td>
+    <td><span class="pill ok">bit-identical</span></td>
+    <td>Medium</td>
+    <td>Useful complement, not enough alone</td>
+  </tr>
+  <tr>
+    <td>FP8 native matmul</td>
+    <td><span class="pill warn">~25 GB resident</span></td>
+    <td><span class="pill warn">numerical</span></td>
+    <td>High (base image swap)</td>
+    <td>Upstream issue still open</td>
+  </tr>
+  <tr>
+    <td>Reduce resolution</td>
+    <td><span class="pill ok">yes</span></td>
+    <td><span class="pill bad">no — quality drop</span></td>
+    <td>Low</td>
+    <td>Not what you want</td>
+  </tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. The one-line summary</h2>
+
+<div class="panel">
+<p style="font-size:16px;">
+<b>Temporal segmentation = render two 5-second clips back-to-back, where the second one starts from
+the last second of the first one. Stitch with a short overlap. The GPU never has to hold all 10 seconds in memory
+at the same time.</b>
+</p>
+</div>
+
+<details>
+<summary>Sources used in this explainer</summary>
+<ul>
+  <li><a href="https://github.com/huggingface/diffusers/pull/12614" style="color:var(--accent)">diffusers PR #12614 — LTXI2VLongMultiPromptPipeline</a> (canonical reference implementation)</li>
+  <li><a href="https://aurelm.com/2026/03/09/ltx-2-3-long-video-for-low-vram-ram-workflow/" style="color:var(--accent)">Aurel Manea — LTX-2.3 long video workflow (40 s proof of concept)</a></li>
+  <li><a href="https://crepal.ai/blog/aivideo/ltx-2-3-multi-stage-latent-upscaling-comfyui/" style="color:var(--accent)">CrePal — LTX-2.3 multi-stage workflow with stage-2 short refine</a></li>
+  <li><a href="https://github.com/Comfy-Org/ComfyUI/issues/11726" style="color:var(--accent)">Comfy Issue #11726 — VRAM handling between samplers</a></li>
+  <li>Local file <code>docs/VRAM_MAP.md</code> — measured baseline (80.7 GB peak at 5 s)</li>
+  <li>Local file <code>docs/STAGE2_VRAM_MITIGATION_RESEARCH.md</code> — full lever catalogue</li>
+</ul>
+</details>
+
+<p class="footer">Open this file directly in your browser: <code>file:///Users/anand/Documents/my-projects/another-deploy-ltx-on-rent-gpu-fa3-teacache/docs/temporal_segmentation_explained.html</code></p>
+
+</div>
+</body>
+</html>
