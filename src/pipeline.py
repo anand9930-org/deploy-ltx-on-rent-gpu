@@ -157,23 +157,29 @@ def _install_build_transformer_audit(stage, label: str) -> None:
     @functools.wraps(original_build)
     def audited_build(*args, **kwargs):
         logger.info("[%s] _build_transformer start", label)
-        peak_before = (
-            torch.cuda.max_memory_allocated(0) / 1e9
-            if torch.cuda.is_available() else 0.0
-        )
         if torch.cuda.is_available():
+            alloc_before = torch.cuda.memory_allocated(0) / 1e9
+            res_before = torch.cuda.memory_reserved(0) / 1e9
+            prior_process_peak = torch.cuda.max_memory_allocated(0) / 1e9
             torch.cuda.reset_peak_memory_stats(0)
+        else:
+            alloc_before = res_before = prior_process_peak = 0.0
         t_start = time.perf_counter()
         model = original_build(*args, **kwargs)
         elapsed = time.perf_counter() - t_start
-        peak = (
-            torch.cuda.max_memory_allocated(0) / 1e9
-            if torch.cuda.is_available() else 0.0
-        )
+        if torch.cuda.is_available():
+            alloc_after = torch.cuda.memory_allocated(0) / 1e9
+            res_after = torch.cuda.memory_reserved(0) / 1e9
+            this_stage_peak = torch.cuda.max_memory_allocated(0) / 1e9
+        else:
+            alloc_after = res_after = this_stage_peak = 0.0
         logger.info(
-            "[%s] _build_transformer done in %.1fs "
-            "(load+swap+assign), peak VRAM %.2f GB (was %.2f GB before)",
-            label, elapsed, peak, peak_before,
+            "[%s] _build_transformer done in %.1fs (load+swap+assign). "
+            "Live alloc %.2f → %.2f GB, reserved %.2f → %.2f GB, "
+            "this-stage peak %.2f GB (prior process peak %.2f GB).",
+            label, elapsed,
+            alloc_before, alloc_after, res_before, res_after,
+            this_stage_peak, prior_process_peak,
         )
 
         try:
@@ -205,15 +211,18 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 
             total = sum(dtype_counts.values())
             fp8_n = dtype_counts.get("float8_e4m3fn", 0)
-            pct = (100.0 * fp8_n / total) if total else 0.0
             logger.info(
-                "FP8 audit [%s]: %d transformer params total — "
-                "FP8 %d (%.1f%%), other %d",
-                label, total, fp8_n, pct, total - fp8_n,
+                "FP8 audit [%s]: %d FP8 weight tensors loaded "
+                "(should match the prepare-step swapped count above). "
+                "Param-level dtype mix follows; denominator includes "
+                "non-Linear params (norms, biases, FP8 scales) so any "
+                "percentage from it is NOT the module-level swap rate.",
+                label, fp8_n,
             )
             logger.info(
-                "FP8 audit [%s]: dtype histogram (transformer_blocks.*): %s",
-                label, dict(dtype_counts),
+                "FP8 audit [%s]: param-level dtype histogram "
+                "(transformer_blocks.*, total=%d): %s",
+                label, total, dict(dtype_counts),
             )
             if bf16_in_body:
                 logger.info(
