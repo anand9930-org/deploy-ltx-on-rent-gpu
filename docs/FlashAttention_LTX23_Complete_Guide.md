@@ -1,5 +1,7 @@
 # FlashAttention × LTX-2.3 — Complete Deployment Guide
 
+> **Status.** Research history. Implementation superseded by `docs/fa3-wheel-process.md` (the runbook for the build/cache pipeline that actually shipped). Preserved here for the rationale, hardware matrix, and expected speedups.
+>
 > **Purpose.** This is the *how*. It operationalises the compatibility analysis in `FlashAttention_Compatibility_Analysis.md` into a concrete, step-by-step implementation plan for enabling FlashAttention 2 on Ada (RTX 4090, RTX 6000 Ada, L40S) and FlashAttention 3 on Hopper (H100, H200). No code is written by this document — it is a pre-flight plan that the implementation PR will follow.
 >
 > **Companion documents.**

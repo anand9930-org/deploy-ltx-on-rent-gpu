@@ -47,48 +47,6 @@ def _round_user_inputs(width: int, height: int, num_frames: int) -> tuple[int, i
     return w, h, f
 
 
-def _bmgjet_stage_2_sigmas(num_frames: int, prompt: str) -> torch.Tensor:
-    """Frame-count-aware Stage-2 sigma schedule.
-
-    Ported from bmgjet/ComfyUi-LTX23Sigmas. Mitigates late-frame chroma
-    drift on long clips that the upstream STAGE_2_DISTILLED_SIGMAS
-    constant (3-step schedule, tuned for 121f/5s) does not handle.
-    See HF Lightricks/LTX-2.3 discussion #13.
-    """
-    def _interp(v: int, points: list[tuple[int, float]]) -> float:
-        prev = points[0]
-        if v <= prev[0]:
-            return prev[1]
-        for p in points[1:]:
-            if v <= p[0]:
-                t = (v - prev[0]) / (p[0] - prev[0])
-                return prev[1] + (p[1] - prev[1]) * t
-            prev = p
-        return points[-1][1]
-
-    s1 = _interp(num_frames, [(121, 0.84), (241, 0.85), (361, 0.90), (481, 0.95), (601, 0.98)])
-    s2 = _interp(num_frames, [(121, 0.78), (241, 0.78), (361, 0.85), (481, 0.89), (601, 0.91), (841, 0.92)])
-    s3 = _interp(num_frames, [(121, 0.735), (961, 0.735), (1081, 0.740)])
-    s4 = _interp(num_frames, [(601, 0.96), (841, 0.97), (961, 0.98), (10000, 0.98)])
-
-    word_count = max(1, len(prompt.split()))
-    offset = min(0.0075, max(0.0, (num_frames / word_count) - 10) * 0.0002)
-    # Threshold deviates from upstream bmgjet (`<= 241`). Empirical
-    # test on 241f / 1920x1088 (pod or0nihrlpzu1nn, branch
-    # feat/bmgjet-stage2-sigmas commit 683beb8) showed the 3-step
-    # short regime made tail SAT *worse* (29.81 vs 27.70 baseline).
-    # Pushing 241 into the 4-step medium regime gives Stage 2 one
-    # extra denoising pass at sigma 0.78, which is the direction the
-    # data points to.
-    regime = (num_frames < 241) * 1 + (num_frames >= 601) * 2
-    schedules = [
-        [max(s1, min(1.0, s1 + offset)), max(s2, min(1.0, s2 + offset * 0.5)), s3, 0.445, 0.0],
-        [0.85, 0.725, 0.4219, 0.0],
-        [s4, 0.935, 0.9, 0.725, 0.445, 0.0],
-    ]
-    return torch.tensor(schedules[regime], dtype=torch.float32)
-
-
 def _install_stage2_cleanup_hook(pipeline) -> None:
     """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
 
@@ -966,27 +924,6 @@ class LTXVideoGenerator:
         except ImportError:
             pass
 
-        # Token-count-aware Stage-1 sigma schedule. The standard
-        # TI2VidTwoStagesPipeline (ti2vid_two_stages.py:155-157) calls
-        # self._scheduler.execute(steps=N) without a `latent=` arg, so
-        # the scheduler falls back to MAX_SHIFT_ANCHOR=4096 tokens for
-        # its sigma-shift formula (schedulers.py:32). The HQ variant
-        # (ti2vid_two_stages_hq.py:168-170) passes the actual latent
-        # shape to get token-count-dependent shift. We mirror HQ here:
-        # for our 1920x1088 renders, real Stage-1 token counts are 8K
-        # (5s) or 16K (10s) — the 4096-anchor under-shifts by 1.7x and
-        # 3.0x respectively, which biases the schedule toward fine-detail
-        # denoising and starves the high-noise structure-forming regime
-        # most acutely on long clips. Result: late-frame drift on 10s.
-        self._VideoPixelShape = None
-        self._VideoLatentShape = None
-        try:
-            from ltx_core.types import VideoPixelShape, VideoLatentShape
-            self._VideoPixelShape = VideoPixelShape
-            self._VideoLatentShape = VideoLatentShape
-        except ImportError:
-            pass
-
         logger.info("Pipeline ready.")
 
     def _log_vram(self, label: str) -> None:
@@ -1040,60 +977,6 @@ class LTXVideoGenerator:
                 tiling_config = self._TilingConfig.default()
                 video_chunks_number = self._get_video_chunks_number(num_frames, tiling_config)
 
-            # Token-count-aware Stage-1 sigma schedule (mirrors
-            # ti2vid_two_stages_hq.py:168-170). Without this, the
-            # standard pipeline anchors to 4096 tokens regardless of
-            # actual latent size, under-shifting the schedule on long
-            # clips. Stage 1 runs at half-res, so the latent we hand
-            # to the scheduler must reflect that.
-            stage_1_sigmas = None
-            scheduler = getattr(self._pipeline, "_scheduler", None)
-            if (
-                self._VideoPixelShape is not None
-                and self._VideoLatentShape is not None
-                and scheduler is not None
-            ):
-                stage_1_pixel_shape = self._VideoPixelShape(
-                    batch=1,
-                    frames=num_frames,
-                    width=width // 2,
-                    height=height // 2,
-                    fps=frame_rate,
-                )
-                stage_1_latent_shape = self._VideoLatentShape.from_pixel_shape(
-                    stage_1_pixel_shape
-                )
-                empty_stage_1_latent = torch.empty(stage_1_latent_shape.to_torch_shape())
-                stage_1_sigmas = scheduler.execute(
-                    latent=empty_stage_1_latent,
-                    steps=num_inference_steps,
-                )
-                logger.info(
-                    "Job %s: stage_1 sigma schedule — tokens=%d (lat %dx%dx%d), "
-                    "first=%.4f last=%.4f",
-                    job_id,
-                    stage_1_latent_shape.token_count(),
-                    stage_1_latent_shape.frames,
-                    stage_1_latent_shape.height,
-                    stage_1_latent_shape.width,
-                    float(stage_1_sigmas[0]),
-                    float(stage_1_sigmas[-2]) if stage_1_sigmas.numel() >= 2 else float("nan"),
-                )
-
-            # Frame-count-aware Stage-2 sigma schedule. Upstream
-            # STAGE_2_DISTILLED_SIGMAS is a fixed 3-step schedule tuned
-            # for 121f / 5s clips; long clips drift at the tail without
-            # this override. Disable via DISABLE_BMGJET_STAGE2_SIGMAS=1.
-            stage_2_sigmas = None
-            if os.getenv("DISABLE_BMGJET_STAGE2_SIGMAS", "0").strip().lower() in ("0", "false", "no", "off", ""):
-                stage_2_sigmas = _bmgjet_stage_2_sigmas(num_frames, prompt)
-                regime_name = "short" if num_frames < 241 else ("medium" if num_frames < 601 else "long")
-                logger.info(
-                    "Job %s: stage_2 sigma schedule (bmgjet) — frames=%d, regime=%s, sigmas=[%s]",
-                    job_id, num_frames, regime_name,
-                    ", ".join(f"{x:.4f}" for x in stage_2_sigmas.tolist()),
-                )
-
             # Run pipeline
             start_time = time.time()
             if torch.cuda.is_available():
@@ -1124,10 +1007,6 @@ class LTXVideoGenerator:
                 call_kwargs["audio_guider_params"] = audio_guider_params
             if tiling_config is not None:
                 call_kwargs["tiling_config"] = tiling_config
-            if stage_1_sigmas is not None:
-                call_kwargs["stage_1_sigmas"] = stage_1_sigmas
-            if stage_2_sigmas is not None:
-                call_kwargs["stage_2_sigmas"] = stage_2_sigmas
 
             result = self._pipeline(**call_kwargs)
             video, audio = result if isinstance(result, tuple) else (result, None)

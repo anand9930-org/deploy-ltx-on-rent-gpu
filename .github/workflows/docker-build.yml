@@ -3,7 +3,17 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.gitignore'
   workflow_dispatch:
+
+# Cancel an in-flight build for the same ref when a new commit lands.
+# Per-ref grouping means main and feature branches don't starve each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

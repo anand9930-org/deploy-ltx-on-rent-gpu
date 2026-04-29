@@ -85,6 +85,32 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --break-system-packages --no-cache /app
 
+# ---- FlashAttention 3 (sm_90 only) -----------------------------------------
+# Self-built wheel cached as a GitHub Release asset, keyed by
+# (FA3 commit SHA, NGC base tag). See docs/fa3-wheel-process.md for the
+# ABI rationale and the build/bump runbook. sm_90 only — non-Hopper pods
+# must launch with `LTX_ATTENTION_TYPE=` (see start.sh) for SDPA fallback.
+ARG FA3_WHEEL_URL=https://github.com/anand9930-org/deploy-ltx-on-rent-gpu/releases/download/fa3-ngc25.06-6c73fb50/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl
+ARG FA3_WHEEL_SHA256=1f1598465ea9ea3ba51084050358f90b08d2d5b5435ef205b8265fd3d59aff9c
+# Decode `%2B` → `+` so uv reads the on-disk filename per PEP 427.
+RUN if [ "${FA3_WHEEL_URL}" = "__SET_BY_BUILD_FA3_WHEEL_SH__" ] \
+        || [ "${FA3_WHEEL_SHA256}" = "__SET_BY_BUILD_FA3_WHEEL_SH__" ]; then \
+        echo "ERROR: FA3_WHEEL_URL/SHA256 are unset placeholders." >&2; \
+        echo "       Run scripts/runpod_build_fa3_wheel.sh, then paste the" >&2; \
+        echo "       printed values into the ARG defaults above." >&2; \
+        echo "       See docs/fa3-wheel-process.md for the full runbook." >&2; \
+        exit 1; \
+    fi \
+    && FA3_WHEEL_FILE="/tmp/$(basename "${FA3_WHEEL_URL}" | sed 's/%2B/+/g')" \
+    && curl -fsSL --retry 3 -o "${FA3_WHEEL_FILE}" "${FA3_WHEEL_URL}" \
+    && echo "${FA3_WHEEL_SHA256}  ${FA3_WHEEL_FILE}" | sha256sum -c - \
+    && uv pip install --system --break-system-packages --no-cache --no-deps "${FA3_WHEEL_FILE}" \
+    && python -c "import flash_attn_interface; \
+        v = getattr(flash_attn_interface, '__version__', 'unknown'); \
+        assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func API'; \
+        print('FA3 wheel installed OK:', v)" \
+    && rm -f "${FA3_WHEEL_FILE}"
+
 # ---- Pure-Python torchaudio stub -------------------------------------------
 # ltx-core's audio_vae module does `import torchaudio` at module load time
 # (ops.py:2) even though the class instantiation (`MelSpectrogram(...)`) and
@@ -124,21 +150,13 @@ RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
 # torchaudio import resolves to our stub. Any failure aborts the build.
 RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' \
     && python -c "\
-import importlib.metadata as m, anyio, torch, torchvision, torchaudio; \
+import importlib.metadata as m, anyio, torch, torchvision, torchaudio, flash_attn_interface; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
 assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
 assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
-print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK')"
-
-# ---- FlashAttention 3 — DEFERRED on this base ------------------------------
-# NGC 25.06 ships CUDA 12.9.1 + NVIDIA-patched torch 2.8.0a0. The only
-# prebuilt FA3 wheel index we trust (windreamer) publishes
-# cu128_torch280 wheels, so the CUDA minor mismatches the container.
-# Rather than risk a silent ABI break at runtime, skip FA3 for now and
-# let LTX-2-ref's attention dispatcher fall back to torch SDPA (BF16).
-# TODO: re-enable FA3 once a cu129_torch280 wheel exists (either from
-# windreamer or a self-hosted build) so we recover the Hopper FA3 perf.
+assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func'; \
+print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
