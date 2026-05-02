@@ -15,7 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HF_HOME=/models/huggingface \
-    LTX_FP8_MODE=scaled_mm
+    LTX_FP8_MODE=scaled_mm \
+    TORCH_LOGS=recompiles_verbose
 
 # ---- System dependencies + uv ----------------------------------------------
 # libopenmpi-dev provides the MPI headers/libraries that tensorrt-llm's
