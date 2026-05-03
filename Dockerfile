@@ -145,18 +145,35 @@ RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
 
 # ---- Consolidated boot-blocker assertions ----------------------------------
 # Upgrade anyio past NGC's pre-installed 4.8.x (httpx_ws needs
-# AsyncContextManagerMixin from 4.9.0) AND verify the full stack in one
-# shot: NGC torch still in place, torchvision's native ops load, and the
-# torchaudio import resolves to our stub. Any failure aborts the build.
-RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' \
+# AsyncContextManagerMixin from 4.9.0) AND pin numpy<2: NGC 25.06's torch
+# was compiled against NumPy 1.x, so any dep that pulls NumPy 2.x in
+# (transitive resolutions of LTX-2 / huggingface deps) silently disables
+# torch's tensor.numpy() bridge — `torch.Tensor.numpy()` then raises
+# `RuntimeError: Numpy is not available` at every encode_video call,
+# which is fatal because upstream `encode_video` materialises CPU frames
+# via `.numpy()` (LTX-2/packages/ltx-pipelines/.../utils/media_io.py:352).
+# Generation completes silently, then the final mp4 write blows up.
+# Verify the full stack in one shot: NGC torch still in place, NumPy 1.x,
+# torchvision native ops load, torchaudio resolves to our stub, FA3 wheel
+# present, and torch.Tensor.numpy() actually works. Any failure aborts the build.
+#
+# We intentionally do NOT `import tensorrt_llm` here — its `bindings`
+# submodule dlopens `libcuda.so.1` at import time, which isn't present on
+# the GitHub Actions builder (no NVIDIA driver). That probe has to happen
+# at pod boot inside QuantizationPolicy.fp8_scaled_mm() where libcuda is
+# available; we just verify the package is installed via metadata.
+RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' 'numpy<2' \
     && python -c "\
-import importlib.metadata as m, anyio, torch, torchvision, torchaudio, flash_attn_interface; \
+import importlib.metadata as m, anyio, numpy, torch, torchvision, torchaudio, flash_attn_interface; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
+assert numpy.__version__.split('.')[0] == '1', f'numpy must be 1.x for NGC torch ABI; got {numpy.__version__}'; \
 assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
 assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
 assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func'; \
-print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
+trtllm_ver = m.version('tensorrt-llm'); \
+torch.zeros(2).numpy(); \
+print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'), '/ tensorrt_llm', trtllm_ver, '(installed; import deferred to pod boot)')"
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
