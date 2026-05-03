@@ -21,9 +21,12 @@ def _run_generate(mock_gen, **kwargs):
         prompt="test prompt",
         negative_prompt="worst quality",
         width=512, height=768, num_frames=25,
-        num_inference_steps=8, seed=42,
-        frame_rate=24.0, cfg_scale=3.0,
-        stg_scale=1.0, rescale_scale=0.7,
+        seed=42, frame_rate=24.0,
+        image_url=None, image_b64=None,
+        reference_video_url=None, reference_video_b64=None,
+        reference_video_strength=1.0,
+        conditioning_attention_strength=1.0,
+        enhance_prompt=False,
     )
     defaults.update(kwargs)
     upload_to_supabase = defaults.pop("upload_to_supabase", False)
@@ -55,9 +58,12 @@ def _run_generate_sync(mock_gen, **kwargs):
         prompt="test prompt",
         negative_prompt="worst quality",
         width=512, height=768, num_frames=25,
-        num_inference_steps=8, seed=42,
-        frame_rate=24.0, cfg_scale=3.0,
-        stg_scale=1.0, rescale_scale=0.7,
+        seed=42, frame_rate=24.0,
+        image_url=None, image_b64=None,
+        reference_video_url=None, reference_video_b64=None,
+        reference_video_strength=1.0,
+        conditioning_attention_strength=1.0,
+        enhance_prompt=False,
     )
     defaults.update(kwargs)
     result = mock_gen.generate(**defaults)
@@ -99,7 +105,6 @@ class TestGenerate:
         with patch("src.storage.is_configured", return_value=True), \
              patch("src.storage.upload_video", return_value="https://example.com/v.mp4"):
             result = _run_generate(mock_generator, upload_to_supabase=True)
-        # Temp file should be deleted after upload
         assert "video_url" in result
 
 
@@ -120,6 +125,88 @@ class TestDefaults:
         params = result["parameters"]
         assert params["seed"] == 42
         assert params["frame_rate"] == 24.0
-        assert params["cfg_scale"] == 3.0
-        assert params["stg_scale"] == 1.0
-        assert params["rescale_scale"] == 0.7
+        assert params["mode"] == "t2v"
+        assert params["enhance_prompt"] is False
+
+
+class TestModeRouting:
+    """Veo-style mode discrimination: input presence picks the path."""
+
+    def test_t2v_when_no_image_no_ref_video(self, mock_generator):
+        result = _run_generate(mock_generator)
+        assert result["parameters"]["mode"] == "t2v"
+
+    def test_i2v_when_image_url_set(self, mock_generator):
+        result = _run_generate(
+            mock_generator, image_url="https://example.com/cat.png"
+        )
+        assert result["parameters"]["mode"] == "i2v"
+
+    def test_i2v_when_image_b64_set(self, mock_generator):
+        result = _run_generate(mock_generator, image_b64="aGVsbG8=")
+        assert result["parameters"]["mode"] == "i2v"
+
+    def test_v2v_when_reference_video_url_set(self, mock_generator):
+        result = _run_generate(
+            mock_generator,
+            reference_video_url="https://example.com/ref.mp4",
+        )
+        assert result["parameters"]["mode"] == "v2v"
+
+    def test_v2v_when_reference_video_b64_set(self, mock_generator):
+        result = _run_generate(mock_generator, reference_video_b64="dmlkZW8=")
+        assert result["parameters"]["mode"] == "v2v"
+
+    def test_v2v_takes_precedence_over_image(self, mock_generator):
+        result = _run_generate(
+            mock_generator,
+            image_url="https://example.com/cat.png",
+            reference_video_url="https://example.com/ref.mp4",
+        )
+        assert result["parameters"]["mode"] == "v2v"
+
+
+class TestImageInputForwarding:
+    """The service layer just forwards image_url / image_b64 to the generator
+    — no transformation. These tests pin that contract so a future refactor
+    that drops the params from the forward chain fails fast."""
+
+    def test_image_url_reaches_generator(self, mock_generator):
+        _run_generate(mock_generator, image_url="https://example.com/cat.png")
+        assert mock_generator.last_call["image_url"] == "https://example.com/cat.png"
+        assert mock_generator.last_call["image_b64"] is None
+
+    def test_image_b64_reaches_generator(self, mock_generator):
+        _run_generate(mock_generator, image_b64="aGVsbG8=")
+        assert mock_generator.last_call["image_b64"] == "aGVsbG8="
+        assert mock_generator.last_call["image_url"] is None
+
+    def test_t2v_passes_none_for_both(self, mock_generator):
+        _run_generate(mock_generator)
+        assert mock_generator.last_call["image_url"] is None
+        assert mock_generator.last_call["image_b64"] is None
+
+
+class TestReferenceVideoForwarding:
+    """Same contract for V2V wire fields — service forwards verbatim."""
+
+    def test_reference_video_url_reaches_generator(self, mock_generator):
+        _run_generate(
+            mock_generator,
+            reference_video_url="https://example.com/ref.mp4",
+        )
+        assert (
+            mock_generator.last_call["reference_video_url"]
+            == "https://example.com/ref.mp4"
+        )
+        assert mock_generator.last_call["reference_video_b64"] is None
+
+    def test_reference_video_b64_reaches_generator(self, mock_generator):
+        _run_generate(mock_generator, reference_video_b64="dmlkZW8=")
+        assert mock_generator.last_call["reference_video_b64"] == "dmlkZW8="
+        assert mock_generator.last_call["reference_video_url"] is None
+
+    def test_strength_and_attn_strength_default_one(self, mock_generator):
+        _run_generate(mock_generator, image_url="https://example.com/cat.png")
+        assert mock_generator.last_call["reference_video_strength"] == 1.0
+        assert mock_generator.last_call["conditioning_attention_strength"] == 1.0

@@ -1,4 +1,10 @@
-"""BentoML service for LTX-2.3 text-to-video generation.
+"""BentoML service for LTX-2.3 unified video generation (T2V / I2V / V2V).
+
+Mode is selected by which inputs the caller supplies (Veo-style):
+    prompt only                                    → T2V
+    prompt + image_url|image_b64                   → I2V (identity-strict via IC-LoRA)
+    prompt + reference_video_url|reference_video_b64 (± image)
+                                                   → V2V (style transfer / edit)
 
 Endpoints:
     generate      — async task (POST /generate/submit, GET /status, /get)
@@ -27,7 +33,6 @@ logging.basicConfig(
     level=_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-# BentoML sets its own handlers; just make sure our loggers propagate.
 logging.getLogger("src").setLevel(_level)
 
 logger = logging.getLogger(__name__)
@@ -50,23 +55,30 @@ class LTXVideoService:
         self,
         prompt: Annotated[str, Field(max_length=2000)],
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: Annotated[int, Field(ge=256, le=1920)] = 1024,
-        height: Annotated[int, Field(ge=256, le=1920)] = 1536,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
         num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
-        num_inference_steps: Annotated[int, Field(ge=1, le=100)] = 30,
         seed: int = 42,
         frame_rate: float = 24.0,
-        cfg_scale: float = 3.0,
-        stg_scale: float = 1.0,
-        rescale_scale: float = 0.7,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        reference_video_url: Annotated[str | None, Field(max_length=2048)] = None,
+        reference_video_b64: Annotated[str | None, Field(max_length=300_000_000)] = None,
+        reference_video_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        conditioning_attention_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        enhance_prompt: bool = False,
         upload_to_supabase: bool = True,
     ) -> dict:
         result = self.generator.generate(
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, num_frames=num_frames,
-            num_inference_steps=num_inference_steps, seed=seed,
-            frame_rate=frame_rate, cfg_scale=cfg_scale,
-            stg_scale=stg_scale, rescale_scale=rescale_scale,
+            seed=seed, frame_rate=frame_rate,
+            image_url=image_url, image_b64=image_b64,
+            reference_video_url=reference_video_url,
+            reference_video_b64=reference_video_b64,
+            reference_video_strength=reference_video_strength,
+            conditioning_attention_strength=conditioning_attention_strength,
+            enhance_prompt=enhance_prompt,
         )
 
         response = {
@@ -92,21 +104,28 @@ class LTXVideoService:
         self,
         prompt: Annotated[str, Field(max_length=2000)],
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: Annotated[int, Field(ge=256, le=1920)] = 1024,
-        height: Annotated[int, Field(ge=256, le=1920)] = 1536,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
         num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
-        num_inference_steps: Annotated[int, Field(ge=1, le=100)] = 30,
         seed: int = 42,
         frame_rate: float = 24.0,
-        cfg_scale: float = 3.0,
-        stg_scale: float = 1.0,
-        rescale_scale: float = 0.7,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        reference_video_url: Annotated[str | None, Field(max_length=2048)] = None,
+        reference_video_b64: Annotated[str | None, Field(max_length=300_000_000)] = None,
+        reference_video_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        conditioning_attention_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        enhance_prompt: bool = False,
     ) -> Annotated[Path, bentoml.validators.ContentType("video/*")]:
         result = self.generator.generate(
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, num_frames=num_frames,
-            num_inference_steps=num_inference_steps, seed=seed,
-            frame_rate=frame_rate, cfg_scale=cfg_scale,
-            stg_scale=stg_scale, rescale_scale=rescale_scale,
+            seed=seed, frame_rate=frame_rate,
+            image_url=image_url, image_b64=image_b64,
+            reference_video_url=reference_video_url,
+            reference_video_b64=reference_video_b64,
+            reference_video_strength=reference_video_strength,
+            conditioning_attention_strength=conditioning_attention_strength,
+            enhance_prompt=enhance_prompt,
         )
         return Path(result["output_path"])
