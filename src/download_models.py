@@ -6,28 +6,38 @@ from huggingface_hub import hf_hub_download, snapshot_download
 logger = logging.getLogger(__name__)
 
 
-def _fp8_mode() -> str:
-    """Return the active FP8 mode. ``scaled_mm`` is the H100-optimised W8A8
-    path; ``cast`` is the default W8A16 path used on Ada/Blackwell.
+# Lightricks-official distilled-1.1 BF16 baseline. IC-LoRA Union-Control was
+# trained against this exact distilled checkpoint, so applying the IC-LoRA at
+# runtime on top of distilled-1.1 reproduces the trained configuration. This
+# replaces the prior `dev BF16 + distilled-LoRA` two-LoRA stack and the
+# third-party pre-fused checkpoint variant.
+DISTILLED_CHECKPOINT_FILENAME = "ltx-2.3-22b-distilled-1.1.safetensors"
+DISTILLED_CHECKPOINT_REPO = "Lightricks/LTX-2.3"
 
-    The pipeline auto-detects H100 at runtime, but downloads happen at pod
-    boot before the GPU is queried, so we key off ``LTX_FP8_MODE`` instead.
-    """
-    return os.getenv("LTX_FP8_MODE", "cast").strip().lower()
+IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+IC_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
+
+# Pre-quantized distilled FP8 DiT (~30 GB). DiT-only — VAE / Gemma /
+# image encoder / decoder / upsampler still come from the BF16 file via
+# *_COMFY_KEYS_FILTER, so distilled-1.1 stays mandatory regardless.
+DISTILLED_FP8_FILENAME = "ltx-2.3-22b-distilled-fp8.safetensors"
+DISTILLED_FP8_REPO = "Lightricks/LTX-2.3-fp8"
 
 
 def ensure_models_downloaded(model_dir: str) -> None:
     """Download all required LTX-2.3 models to *model_dir* if not already present.
 
-    On the default ``cast`` path we download the BF16 DiT checkpoint (~46 GB)
-    and the distilled LoRA (~7.6 GB); runtime ``fp8_cast`` downcasts weights
-    to FP8 at load time.
-
-    On the ``scaled_mm`` path (H100) we additionally pull the pre-quantized
-    FP8 DiT checkpoints (~58 GB) from ``Lightricks/LTX-2.3-fp8``. The BF16
-    file is still required because VAE, audio decoder, image encoder and
-    embeddings-processor weights live inside it and are loaded by other
-    pipeline blocks via key filters.
+    The pipeline is BF16-only on this branch:
+      - Distilled-1.1 BF16 checkpoint (~46 GB): officially-released distilled
+        baseline. Packs DiT + VAE encoder/decoder, audio decoder, vocoder,
+        image encoder, and the embeddings processor; every non-DiT block reads
+        its slice via *_COMFY_KEYS_FILTER.
+      - Spatial upsampler (~1 GB): used by VideoUpsampler between stages.
+      - IC-LoRA Union-Control (~few GB): provides the
+        ``VideoConditionByReferenceLatent`` cross-attention deltas that keep
+        I2V identity / V2V structure aligned to the reference. Applied at
+        runtime as the single LoRA fusion on stage 1.
+      - Gemma 3 12B text encoder (~26 GB).
     """
     os.makedirs(model_dir, exist_ok=True)
     hf_token = os.getenv("HF_TOKEN")
@@ -37,27 +47,21 @@ def ensure_models_downloaded(model_dir: str) -> None:
             "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
         )
 
-    fp8_mode = _fp8_mode()
-    logger.info("LTX_FP8_MODE=%s", fp8_mode)
-
-    # 1. LTX-2.3 BF16 checkpoint (~46 GB). Always downloaded: non-DiT
-    # subcomponents (VAE encoder/decoder, audio decoder, vocoder, image
-    # encoder, embeddings processor) are packaged inside this file and
-    # loaded by PromptEncoder / ImageConditioner / VideoDecoder /
-    # AudioDecoder / VideoUpsampler via *_COMFY_KEYS_FILTER state-dict ops.
-    checkpoint_path = os.path.join(model_dir, "ltx-2.3-22b-dev.safetensors")
+    # 1. LTX-2.3 distilled-1.1 BF16 checkpoint (~46 GB). Holds DiT + every
+    # non-DiT block (VAE, audio decoder, vocoder, image encoder, embeddings).
+    checkpoint_path = os.path.join(model_dir, DISTILLED_CHECKPOINT_FILENAME)
     if not os.path.exists(checkpoint_path):
-        logger.info("Downloading LTX-2.3 BF16 checkpoint (~46 GB) ...")
+        logger.info("Downloading LTX-2.3 distilled-1.1 BF16 checkpoint (~46 GB) ...")
         hf_hub_download(
-            repo_id="Lightricks/LTX-2.3",
-            filename="ltx-2.3-22b-dev.safetensors",
+            repo_id=DISTILLED_CHECKPOINT_REPO,
+            filename=DISTILLED_CHECKPOINT_FILENAME,
             local_dir=model_dir,
             token=hf_token,
         )
     else:
-        logger.info("LTX-2.3 BF16 checkpoint already cached.")
+        logger.info("LTX-2.3 distilled-1.1 BF16 checkpoint already cached.")
 
-    # 2. Spatial upscaler 2x (~1 GB)
+    # 2. Spatial upscaler 2x (~1 GB).
     upscaler_path = os.path.join(
         model_dir, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
     )
@@ -72,58 +76,46 @@ def ensure_models_downloaded(model_dir: str) -> None:
     else:
         logger.info("Spatial upscaler already cached.")
 
-    # 3. Distilled LoRA (~7.6 GB). Required on the cast path (Stage 2
-    # applies the LoRA on top of the BF16 DiT). On the scaled_mm path the
-    # distilled weights ship pre-fused inside ltx-2.3-22b-distilled-fp8,
-    # so we skip this download unless the user explicitly keeps it.
-    lora_path = os.path.join(
-        model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-    )
-    if fp8_mode != "scaled_mm":
-        if not os.path.exists(lora_path):
-            logger.info("Downloading distilled LoRA (~7.6 GB) ...")
-            hf_hub_download(
-                repo_id="Lightricks/LTX-2.3",
-                filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-                local_dir=model_dir,
-                token=hf_token,
-            )
-        else:
-            logger.info("Distilled LoRA already cached.")
-    else:
-        logger.info("Skipping distilled LoRA (pre-fused inside distilled-fp8 checkpoint).")
-
-    # 3b. Pre-quantized FP8 DiT checkpoints for the H100 scaled_mm path.
-    # Weights-only repo (no config/tokenizer); per-tensor amax scales are
-    # embedded as *_scale parameters inside each safetensors file.
-    if fp8_mode == "scaled_mm":
-        dev_fp8_path = os.path.join(model_dir, "ltx-2.3-22b-dev-fp8.safetensors")
-        if not os.path.exists(dev_fp8_path):
-            logger.info("Downloading LTX-2.3 dev FP8 DiT (~29 GB) ...")
-            hf_hub_download(
-                repo_id="Lightricks/LTX-2.3-fp8",
-                filename="ltx-2.3-22b-dev-fp8.safetensors",
-                local_dir=model_dir,
-                token=hf_token,
-            )
-        else:
-            logger.info("LTX-2.3 dev FP8 DiT already cached.")
-
-        distilled_fp8_path = os.path.join(
-            model_dir, "ltx-2.3-22b-distilled-fp8.safetensors"
+    # 3. IC-LoRA Union-Control. Provides positionally-aligned reference-token
+    # cross-attention; consumed by ICLoraPipeline stage 1 to keep identity /
+    # structure aligned to the supplied image (I2V) or reference video (V2V).
+    # Applied at runtime as the single LoRA on top of the distilled-1.1 base.
+    ic_lora_path = os.path.join(model_dir, IC_LORA_FILENAME)
+    if not os.path.exists(ic_lora_path):
+        logger.info("Downloading IC-LoRA Union-Control ...")
+        hf_hub_download(
+            repo_id=IC_LORA_REPO,
+            filename=IC_LORA_FILENAME,
+            local_dir=model_dir,
+            token=hf_token,
         )
-        if not os.path.exists(distilled_fp8_path):
-            logger.info("Downloading LTX-2.3 distilled FP8 DiT (~29 GB) ...")
+    else:
+        logger.info("IC-LoRA Union-Control already cached.")
+
+    # 4. Pre-quantized distilled FP8 DiT (~30 GB) — only when the runtime is
+    # configured to load it. LTX_FP8_MODE=scaled_mm|cast at boot enables the
+    # FP8 path in pipeline.py; downloading is gated on the same flag so BF16
+    # pods don't pay the bandwidth/disk cost. The FP8 file is DiT-only — every
+    # non-DiT block still reads its slice from the BF16 distilled-1.1 file
+    # above via *_COMFY_KEYS_FILTER, so this download is purely additive.
+    fp8_mode = os.environ.get("LTX_FP8_MODE", "").strip().lower()
+    if fp8_mode in ("scaled_mm", "cast"):
+        fp8_path = os.path.join(model_dir, DISTILLED_FP8_FILENAME)
+        if not os.path.exists(fp8_path):
+            logger.info(
+                "Downloading LTX-2.3 distilled FP8 DiT (~30 GB) for LTX_FP8_MODE=%s ...",
+                fp8_mode,
+            )
             hf_hub_download(
-                repo_id="Lightricks/LTX-2.3-fp8",
-                filename="ltx-2.3-22b-distilled-fp8.safetensors",
+                repo_id=DISTILLED_FP8_REPO,
+                filename=DISTILLED_FP8_FILENAME,
                 local_dir=model_dir,
                 token=hf_token,
             )
         else:
             logger.info("LTX-2.3 distilled FP8 DiT already cached.")
 
-    # 4. Gemma 3 12B text encoder (~26 GB, full snapshot)
+    # 5. Gemma 3 12B text encoder (~26 GB, full snapshot)
     gemma_dir = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
     gemma_has_weights = os.path.isdir(gemma_dir) and any(
         f.endswith(".safetensors")

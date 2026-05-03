@@ -1,6 +1,9 @@
 """Shared LTX-2.3 pipeline wrapper.
 
-All VRAM optimisation techniques live here.
+Single ICLoraPipeline serves all three modes (T2V, I2V, V2V); the active
+mode is determined by which inputs the caller supplies. IC-LoRA is loaded
+unconditionally so I2V identity preservation works the moment an image is
+attached, with no per-request reload cost.
 """
 
 import functools
@@ -15,6 +18,14 @@ import uuid
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+# FP8 + expandable_segments — required by the upstream LTX FP8 README:
+# the scaled_mm path's CUDA graph capture is incompatible with the default
+# allocator's segment splitting. Set before any tensor is allocated, but
+# only when the FP8 path is requested so BF16 deployments stay unchanged.
+if os.environ.get("LTX_FP8_MODE", "").strip().lower() in ("scaled_mm", "cast"):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 DEFAULT_NEGATIVE_PROMPT = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
@@ -51,29 +62,18 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     """Flush device + host allocators at the Stage 1 → Stage 2 boundary.
 
     LTX-2's weight-offloading path (``OffloadMode.CPU`` / ``DISK`` via
-    ``block_streaming`` — formerly ``layer_streaming``; renamed in PR
-    #201, 2026-04-23) pins transformer blocks in host memory during
-    inference. PR #201 also *removed* the best-effort
-    ``torch._C._host_emptyCache()`` that used to run in the streaming
-    teardown, so pinned pages are no longer returned to the OS between
-    stages. On <40 GB pods that intermittently exhausts the pinned arena
-    and the next ``tensor.data.pin_memory()`` call (inside the Stage 2
-    pool builder) raises
+    ``block_streaming``) pins transformer blocks in host memory during
+    inference. Upstream removed the best-effort host-side empty_cache
+    that used to run in the streaming teardown, so pinned pages are no
+    longer returned to the OS between stages. On VRAM-constrained pods
+    that intermittently exhausts the pinned arena and the next
+    ``tensor.data.pin_memory()`` call (inside the Stage 2 pool builder)
+    raises ``torch.AcceleratorError: CUDA error: invalid argument``.
 
-        torch.AcceleratorError: CUDA error: invalid argument
-
-    We force a synchronous cleanup cycle (Python GC → device
-    empty_cache → CUDA sync → host empty_cache) right before Stage 2's
-    transformer context manager enters, so the pinned arena is in a
-    known-drained state. On H100 (``OffloadMode.NONE``) the streaming
-    path is inactive and the hook is a cheap sync; the actual Stage 1
-    GPU weight release happens inside upstream ``gpu_model.__exit__``
-    (which calls ``model.to("meta")``), and only takes effect because
-    the DiT stages are built without a ``StateDictRegistry`` — see the
-    ``registry=None`` rebuilds in ``LTXVideoGenerator.__init__``. The
-    hook's ``empty_cache`` returns the freed CUDA blocks to the OS so
-    Stage 2's build sees a near-empty pool.
-    Idempotent; safe to call multiple times.
+    We force a synchronous cleanup cycle (Python GC → device empty_cache
+    → CUDA sync → host empty_cache) right before Stage 2's transformer
+    context manager enters, so the pinned arena is in a known-drained
+    state. Idempotent; safe to call multiple times.
     """
     stage = getattr(pipeline, "stage_2", None)
     if stage is None:
@@ -119,151 +119,26 @@ def _install_stage2_cleanup_hook(pipeline) -> None:
     stage._stage2_cleanup_hooked = True
 
 
-def _install_build_transformer_audit(stage, label: str) -> None:
-    """Wrap ``DiffusionStage._build_transformer`` with timing + dtype audit.
+# ---- FP8 helpers (ported from feature/fp8-h100 reference branch) -----------
+# These adapt to Lightricks' specific FP8 packaging: a `model.diffusion_model.`
+# comfy prefix on disk, BF16 leftovers in transformer block 1 that upstream's
+# baseline `EXCLUDED_LAYER_SUBSTRINGS` doesn't cover, and `_orig_mod.` segments
+# injected by `torch.compile` that break upstream's substring matcher. Without
+# them the FP8 load fails at first inference with FP8Linear/Linear shape
+# mismatches. Source: /tmp/fp8ref/src_pipeline.py.
 
-    The transformer build is what dominates cold-start: disk read of the
-    FP8 safetensors → SDOps transpose → ``load_state_dict(..., assign=True)``
-    → the FP8 ``_prepare`` swap. We have no instrumentation for that
-    wall time today; the cold-start gap (job submit → first sampler step)
-    is a 7-min black box. This wrapper logs:
-
-    1. Wall time for the whole build (single number — easy to compare
-       cold vs warm).
-    2. Post-load dtype histogram over `transformer_blocks.*` parameters.
-       This is the GROUND TRUTH for "did the FP8 swap actually take?".
-       The per-block log inside `_prepare` only reflects what the
-       matcher decided to swap; if the matcher picked the wrong module
-       names, the actual weight buffers stay BF16 — and only this
-       post-load histogram surfaces the discrepancy.
-    3. First few BF16 names in blocks ≥ 2 — sanity check that BF16
-       isn't bleeding into the body of the network.
-    4. Blocks fully BF16 (every weight in the block is BF16) — should
-       be {0, 1, 46, 47} or similar per upstream's published design.
-
-    Idempotent; safe to call once per stage.
-    """
-    if getattr(stage, "_build_transformer_audited", False):
-        return
-    if not hasattr(stage, "_build_transformer"):
-        logger.warning(
-            "Audit hook [%s]: stage has no _build_transformer; skipping",
-            label,
-        )
-        return
-
-    original_build = stage._build_transformer
-
-    @functools.wraps(original_build)
-    def audited_build(*args, **kwargs):
-        logger.info("[%s] _build_transformer start", label)
-        if torch.cuda.is_available():
-            alloc_before = torch.cuda.memory_allocated(0) / 1e9
-            res_before = torch.cuda.memory_reserved(0) / 1e9
-            prior_process_peak = torch.cuda.max_memory_allocated(0) / 1e9
-            torch.cuda.reset_peak_memory_stats(0)
-        else:
-            alloc_before = res_before = prior_process_peak = 0.0
-        t_start = time.perf_counter()
-        model = original_build(*args, **kwargs)
-        elapsed = time.perf_counter() - t_start
-        if torch.cuda.is_available():
-            alloc_after = torch.cuda.memory_allocated(0) / 1e9
-            res_after = torch.cuda.memory_reserved(0) / 1e9
-            this_stage_peak = torch.cuda.max_memory_allocated(0) / 1e9
-        else:
-            alloc_after = res_after = this_stage_peak = 0.0
-        logger.info(
-            "[%s] _build_transformer done in %.1fs (load+swap+assign). "
-            "Live alloc %.2f → %.2f GB, reserved %.2f → %.2f GB, "
-            "this-stage peak %.2f GB (prior process peak %.2f GB).",
-            label, elapsed,
-            alloc_before, alloc_after, res_before, res_after,
-            this_stage_peak, prior_process_peak,
-        )
-
-        try:
-            from collections import Counter
-            dtype_counts: Counter = Counter()
-            block_dtype_sets: dict[int, set[str]] = {}
-            bf16_in_body: list[str] = []
-            # `_build_transformer` returns `X0Model(builder.build(...))`,
-            # which wraps the inner DiT under an attribute prefix. So
-            # `named_parameters()` yields names like
-            # `inner.transformer_blocks.<n>....` — search the regex
-            # anywhere in the name rather than anchoring at the start.
-            block_re = re.compile(r"transformer_blocks\.(\d+)\.")
-            for pname, p in model.named_parameters():
-                m = block_re.search(pname)
-                if m is None:
-                    continue
-                dt_name = str(p.dtype).removeprefix("torch.")
-                dtype_counts[dt_name] += 1
-                bi = int(m.group(1))
-                block_dtype_sets.setdefault(bi, set()).add(dt_name)
-                if (
-                    dt_name == "bfloat16"
-                    and bi >= 2
-                    and len(bf16_in_body) < 5
-                    and pname.endswith(".weight")
-                ):
-                    bf16_in_body.append(pname)
-
-            total = sum(dtype_counts.values())
-            fp8_n = dtype_counts.get("float8_e4m3fn", 0)
-            logger.info(
-                "FP8 audit [%s]: %d FP8 weight tensors loaded "
-                "(should match the prepare-step swapped count above). "
-                "Param-level dtype mix follows; denominator includes "
-                "non-Linear params (norms, biases, FP8 scales) so any "
-                "percentage from it is NOT the module-level swap rate.",
-                label, fp8_n,
-            )
-            logger.info(
-                "FP8 audit [%s]: param-level dtype histogram "
-                "(transformer_blocks.*, total=%d): %s",
-                label, total, dict(dtype_counts),
-            )
-            if bf16_in_body:
-                logger.info(
-                    "FP8 audit [%s]: first %d BF16 weight names in blocks ≥ 2: %s",
-                    label, len(bf16_in_body), bf16_in_body,
-                )
-            fully_bf16_blocks = sorted(
-                bi for bi, ds in block_dtype_sets.items()
-                if "float8_e4m3fn" not in ds
-            )
-            if fully_bf16_blocks:
-                logger.info(
-                    "FP8 audit [%s]: blocks with NO FP8 params: %s",
-                    label, fully_bf16_blocks,
-                )
-            else:
-                logger.info(
-                    "FP8 audit [%s]: every block has at least one FP8 param",
-                    label,
-                )
-        except Exception:
-            logger.exception("FP8 audit [%s]: dtype histogram failed", label)
-
-        return model
-
-    stage._build_transformer = audited_build
-    stage._build_transformer_audited = True
-
-
-# The Lightricks FP8 safetensors store DiT weights with this prefix on
-# disk; `LTXV_MODEL_COMFY_RENAMING_MAP` strips it when the loader reads
-# them. Our probe reads RAW keys so we strip it too — otherwise the
-# exclusion names we emit won't match the in-memory module paths.
+# Lightricks FP8 safetensors store DiT weights with this prefix on disk;
+# `LTXV_MODEL_COMFY_RENAMING_MAP` strips it when the loader reads them. Our
+# probe reads RAW keys so we strip it too — otherwise the exclusion names we
+# emit won't match the in-memory module paths.
 _COMFY_PREFIX = "model.diffusion_model."
 
-# torch.compile wraps each transformer block in an OptimizedModule whose
-# inner attributes are reached through `_orig_mod`. After compile,
+# torch.compile wraps each transformer block in an OptimizedModule whose inner
+# attributes are reached through `_orig_mod`. After compile,
 # `model.named_modules()` yields paths like
-# `transformer_blocks.1._orig_mod.attn1.to_gate_logits`. We strip the
-# injected segment before the substring check so exclusions can use
-# the plain (pre-compile) form regardless of whether compile ran.
+# `transformer_blocks.1._orig_mod.attn1.to_gate_logits`. Strip the injected
+# segment before substring matching so exclusions can use the plain
+# (pre-compile) form regardless of whether compile ran.
 _ORIG_MOD_SEGMENT_RE = re.compile(r"\._orig_mod(?=\.|$)")
 
 
@@ -272,35 +147,23 @@ def _strip_comfy_prefix(name: str) -> str:
 
 
 def _normalize_for_match(name: str) -> str:
-    """Canonicalize a module/key path for exclusion matching.
-
-    Removes the `_orig_mod.` segment injected by torch.compile AND the
-    `model.diffusion_model.` prefix that may persist on raw safetensors
-    keys. The result is the canonical in-memory module path used by
-    `EXCLUDED_LAYER_SUBSTRINGS` and by our probe output.
-    """
     return _ORIG_MOD_SEGMENT_RE.sub("", _strip_comfy_prefix(name))
 
 
 def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
     """Return module paths that must stay as nn.Linear (BF16).
 
-    Opens each `.safetensors` header (no tensor data loaded) and
-    collects every `.weight` key whose dtype is not `float8_e4m3fn`.
-    Each name is canonicalized by stripping `model.diffusion_model.`
-    so it matches the post-rename module path the LTX loader produces.
+    Opens each safetensors header (no tensor data loaded) and collects every
+    `.weight` key whose dtype is not `float8_e4m3fn`. Each name is canonicalized
+    by stripping `model.diffusion_model.` so it matches the post-rename module
+    path the LTX loader produces.
 
-    Why we probe: the Lightricks `*-fp8.safetensors` checkpoints leave
-    a subset of transformer block 1 in BF16 (AV cross modules, a few
-    MLPs) that upstream's hard-coded `EXCLUDED_LAYER_SUBSTRINGS` does
-    not cover. Without these extras, `_apply_fp8_prepare_to_model`
-    swaps those modules to FP8Linear and `load_state_dict` fails with
-    size mismatches at first inference.
-
-    Logs a dtype histogram per file, a sample of transformer-block
-    extras, and a warning if zero transformer-block BF16 entries were
-    found (which would mean the crash that motivated this probe isn't
-    actually being prevented).
+    Why we probe: the Lightricks `*-fp8.safetensors` checkpoints leave a subset
+    of transformer block 1 in BF16 (AV cross modules, a few MLPs) that
+    upstream's hard-coded `EXCLUDED_LAYER_SUBSTRINGS` does not cover. Without
+    these extras, `_apply_fp8_prepare_to_model` swaps those modules to
+    FP8Linear and `load_state_dict` fails with size mismatches at first
+    inference.
     """
     from safetensors import safe_open  # lazy — downloads pull safetensors
 
@@ -328,8 +191,10 @@ def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
             file_bare_adds,
         )
         if bf16_samples:
-            logger.info("FP8 probe: %s — raw BF16 samples: %s",
-                        os.path.basename(path), bf16_samples)
+            logger.info(
+                "FP8 probe: %s — raw BF16 samples: %s",
+                os.path.basename(path), bf16_samples,
+            )
 
     block_entries = sorted(n for n in bare if n.startswith("transformer_blocks."))
     if not block_entries:
@@ -351,27 +216,21 @@ def _probe_fp8_exclusions(paths: list[str]) -> tuple[str, ...]:
 
 
 def _build_scaled_mm_policy(extras: tuple[str, ...]):
-    """Wrapper-only equivalent of `QuantizationPolicy.fp8_scaled_mm()`
-    that accepts a per-call exclusion list AND normalizes names before
-    substring matching.
+    """Wrapper-only equivalent of `QuantizationPolicy.fp8_scaled_mm()` that
+    accepts a per-checkpoint exclusion list AND normalizes names before
+    matching.
 
     The upstream factory has two problems for the Lightricks
     `*-fp8.safetensors` format:
 
     1. Its `EXCLUDED_LAYER_SUBSTRINGS` doesn't cover the BF16 modules
-       Lightricks left in transformer block 1. So we append `extras`
-       produced by `_probe_fp8_exclusions`.
-
-    2. `_should_skip_layer` in upstream is a raw substring check. With
-       regional `torch.compile` active, module names pick up a
-       `._orig_mod.` segment that breaks substring matching against
-       bare exclusions. We replace `_apply_fp8_prepare_to_model` and
-       `_create_transpose_kv_operation` with local versions that
-       normalize `_orig_mod` out before the check.
-
-    We also can't edit upstream directly: the Dockerfile (line 73)
-    clones `Lightricks/LTX-2` fresh at build, so any change in
-    `LTX-2-ref/` is local-only and never reaches the pod.
+       Lightricks left in transformer block 1 — append `extras` produced by
+       `_probe_fp8_exclusions`.
+    2. `_should_skip_layer` upstream is a raw substring check. With regional
+       `torch.compile` active, module names pick up an `._orig_mod.` segment
+       that breaks substring matching against bare exclusions. We replace
+       `_apply_fp8_prepare_to_model` and `_create_transpose_kv_operation`
+       with local versions that normalize `_orig_mod` out before the check.
     """
     from ltx_core.loader.module_ops import ModuleOps
     from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
@@ -379,8 +238,8 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
     from ltx_core.quantization import QuantizationPolicy
     from ltx_core.quantization.fp8_scaled_mm import (
         FP8_PREPARE_MODULE_OPS,
-        FP8Linear,
         FP8_TRANSPOSE_SD_OPS,
+        FP8Linear,
         _linear_to_fp8linear,
     )
 
@@ -393,11 +252,10 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
 
     if not extras:
         # No checkpoint-driven extras — but we still want `_orig_mod`
-        # normalization, because upstream's baseline exclusions like
-        # `"transformer_blocks.0."` happen to tolerate compile (they
-        # stop at the dot, so substring matches regardless). Keeping
-        # the upstream primitives here is safe; no crash has been
-        # observed without extras.
+        # normalization. Upstream's baseline exclusions like
+        # `"transformer_blocks.0."` happen to tolerate compile (they stop at
+        # the dot, so substring matches regardless), so the upstream
+        # primitives are safe here.
         return QuantizationPolicy(
             sd_ops=FP8_TRANSPOSE_SD_OPS,
             module_ops=(FP8_PREPARE_MODULE_OPS,),
@@ -405,30 +263,18 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
 
     # Exact match against the probe result, NOT substring match against
     # upstream's baseline. Baseline includes block-level catch-alls like
-    # `"transformer_blocks.0."` and `"transformer_blocks.43..47."` that
-    # substring-match *every* module in those blocks. Lightricks' FP8
-    # checkpoint keeps some modules in those blocks as FP8 — the
-    # substring rule over-excluded them, leaving FP8 weights loaded into
+    # `"transformer_blocks.0."` that substring-match every module in those
+    # blocks; Lightricks' FP8 checkpoint keeps some modules there as FP8 —
+    # the substring rule over-excluded them, leaving FP8 weights loaded into
     # plain nn.Linear modules and crashing F.linear on first forward.
-    # `extras` is the ground truth: the safetensors header's BF16 keys.
     exclusions = frozenset(extras)
 
     def _should_skip(name: str) -> bool:
         return _normalize_for_match(name) in exclusions
 
-    import torch
     from torch import nn
 
     def _prepare(model):
-        """Drop-in replacement for `_apply_fp8_prepare_to_model`.
-
-        Walks named_modules; for each nn.Linear (not already FP8Linear)
-        whose canonicalized name does NOT match an exclusion, swaps it
-        to FP8Linear. Logs per-block swap/skip totals for ALL blocks
-        encountered so we can verify swap coverage end-to-end (the
-        upstream design keeps block 0 and the late blocks in BF16; we
-        need visibility into blocks 2..N to confirm they are FP8).
-        """
         from collections import defaultdict
 
         replacements: list[tuple[nn.Module, str, nn.Linear]] = []
@@ -472,7 +318,6 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
         for parent, attr_name, linear in replacements:
             setattr(parent, attr_name, _linear_to_fp8linear(linear))
 
-        # Aggregate roll-up
         total_in_blocks = sum(block_totals.values())
         total_swapped = sum(block_swapped.values())
         total_skipped = sum(block_skipped.values())
@@ -483,7 +328,6 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
             len(block_totals), total_in_blocks, total_swapped, pct_swapped, total_skipped,
         )
 
-        # Per-block summary, sorted; flag fully-BF16 blocks for fast scan.
         all_bf16_blocks = []
         for bi in sorted(block_totals.keys()):
             tag = ""
@@ -500,8 +344,6 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
                 all_bf16_blocks,
             )
 
-        # Spot-check samples from a few representative blocks (first,
-        # mid, last) to confirm the matcher is producing sensible names.
         seen = sorted(block_totals.keys())
         spot_blocks = []
         if seen:
@@ -547,374 +389,401 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
     return QuantizationPolicy(sd_ops=sd_ops, module_ops=(module_ops,))
 
 
-def _select_fp8_mode() -> str:
-    """Pick the FP8 compute path.
-
-    ``scaled_mm`` is the H100-optimised W8A8 path (real FP8 GEMM via
-    TRT-LLM ``cublas_scaled_mm``), ``cast`` is the Ada/Blackwell W8A16
-    path (weights FP8, activations upcast to BF16 per forward).
+def _select_fp8_mode() -> str | None:
+    """Pick the FP8 compute path. Returns None when FP8 is not requested.
 
     Order of precedence:
-      1. ``LTX_FP8_MODE=scaled_mm|cast`` env override (matches
-         download_models.py so downloads and runtime agree).
-      2. GPU capability auto-detect: H100/H200 (SM 9.0) → ``scaled_mm``,
-         otherwise → ``cast``.
-      3. ``cast`` fallback when CUDA is unavailable.
+      1. ``LTX_FP8_MODE=scaled_mm|cast`` env override.
+      2. GPU capability auto-detect when LTX_FP8_MODE is empty: H100/H200
+         (SM 9.0) → ``scaled_mm``, otherwise ``cast``. (Requires the env to
+         be set to a recognized non-empty value, otherwise we return None
+         to keep BF16 default behaviour.)
+      3. None when LTX_FP8_MODE is unset/empty.
     """
     override = os.getenv("LTX_FP8_MODE", "").strip().lower()
     if override in ("scaled_mm", "cast"):
         return override
-    if torch.cuda.is_available():
-        cap = torch.cuda.get_device_capability(0)
-        if cap == (9, 0):
-            return "scaled_mm"
-    return "cast"
+    return None
+
+
+def _install_build_transformer_audit(stage, label: str) -> None:
+    """Wrap ``DiffusionStage._build_transformer`` with timing + dtype audit.
+
+    Logs wall time for the transformer build (load → SDOps transpose →
+    `_prepare` swap) and a post-load dtype histogram over
+    `transformer_blocks.*` parameters. The histogram is the GROUND TRUTH for
+    "did the FP8 swap actually take?"; the per-block prepare-step log only
+    reflects what the matcher decided to swap, which can diverge from the
+    actual loaded buffers if the matcher picked the wrong module names.
+
+    Idempotent; safe to call once per stage.
+    """
+    if getattr(stage, "_build_transformer_audited", False):
+        return
+    if not hasattr(stage, "_build_transformer"):
+        logger.warning(
+            "Audit hook [%s]: stage has no _build_transformer; skipping",
+            label,
+        )
+        return
+
+    original_build = stage._build_transformer
+
+    @functools.wraps(original_build)
+    def audited_build(*args, **kwargs):
+        logger.info("[%s] _build_transformer start", label)
+        if torch.cuda.is_available():
+            alloc_before = torch.cuda.memory_allocated(0) / 1e9
+            res_before = torch.cuda.memory_reserved(0) / 1e9
+            torch.cuda.reset_peak_memory_stats(0)
+        else:
+            alloc_before = res_before = 0.0
+        t_start = time.perf_counter()
+        model = original_build(*args, **kwargs)
+        elapsed = time.perf_counter() - t_start
+        if torch.cuda.is_available():
+            alloc_after = torch.cuda.memory_allocated(0) / 1e9
+            res_after = torch.cuda.memory_reserved(0) / 1e9
+            this_stage_peak = torch.cuda.max_memory_allocated(0) / 1e9
+        else:
+            alloc_after = res_after = this_stage_peak = 0.0
+        logger.info(
+            "[%s] _build_transformer done in %.1fs (load+swap+assign). "
+            "Live alloc %.2f → %.2f GB, reserved %.2f → %.2f GB, "
+            "this-stage peak %.2f GB.",
+            label, elapsed,
+            alloc_before, alloc_after, res_before, res_after, this_stage_peak,
+        )
+
+        try:
+            from collections import Counter
+            dtype_counts: Counter = Counter()
+            block_dtype_sets: dict[int, set[str]] = {}
+            bf16_in_body: list[str] = []
+            block_re = re.compile(r"transformer_blocks\.(\d+)\.")
+            for pname, p in model.named_parameters():
+                m = block_re.search(pname)
+                if m is None:
+                    continue
+                dt_name = str(p.dtype).removeprefix("torch.")
+                dtype_counts[dt_name] += 1
+                bi = int(m.group(1))
+                block_dtype_sets.setdefault(bi, set()).add(dt_name)
+                if (
+                    dt_name == "bfloat16"
+                    and bi >= 2
+                    and len(bf16_in_body) < 5
+                    and pname.endswith(".weight")
+                ):
+                    bf16_in_body.append(pname)
+
+            total = sum(dtype_counts.values())
+            fp8_n = dtype_counts.get("float8_e4m3fn", 0)
+            logger.info(
+                "FP8 audit [%s]: %d FP8 weight tensors loaded. "
+                "Param-level dtype histogram (transformer_blocks.*, total=%d): %s",
+                label, fp8_n, total, dict(dtype_counts),
+            )
+            if bf16_in_body:
+                logger.info(
+                    "FP8 audit [%s]: first %d BF16 weight names in blocks ≥ 2: %s",
+                    label, len(bf16_in_body), bf16_in_body,
+                )
+            fully_bf16_blocks = sorted(
+                bi for bi, ds in block_dtype_sets.items()
+                if "float8_e4m3fn" not in ds
+            )
+            if fully_bf16_blocks:
+                logger.info(
+                    "FP8 audit [%s]: blocks with NO FP8 params: %s",
+                    label, fully_bf16_blocks,
+                )
+        except Exception:
+            logger.exception("FP8 audit [%s]: dtype histogram failed", label)
+
+        return model
+
+    stage._build_transformer = audited_build
+    stage._build_transformer_audited = True
 
 
 class LTXVideoGenerator:
-    """Initialises the LTX-2.3 two-stage pipeline and runs inference."""
+    """Initialises a single ICLoraPipeline serving T2V / I2V / V2V."""
 
     def __init__(self, model_dir: str = "/models") -> None:
-        # BF16 DiT checkpoint. Also holds VAE / audio decoder / vocoder /
-        # image encoder / embeddings processor weights — loaded by the
-        # non-DiT blocks through *_COMFY_KEYS_FILTER, so this file is
-        # required on every path (including scaled_mm).
-        checkpoint_path = os.path.join(model_dir, "ltx-2.3-22b-dev.safetensors")
+        # Lightricks-official distilled-1.1 BF16 checkpoint. Holds DiT, VAE,
+        # audio decoder, vocoder, image encoder, and embeddings processor in
+        # one safetensors — required by every non-DiT block via
+        # *_COMFY_KEYS_FILTER. IC-LoRA Union-Control was trained against
+        # this exact distilled baseline, so applying it at runtime as the
+        # single LoRA reproduces the trained configuration.
+        from src.download_models import (
+            DISTILLED_CHECKPOINT_FILENAME,
+            DISTILLED_FP8_FILENAME,
+            IC_LORA_FILENAME,
+        )
+        checkpoint_path = os.path.join(model_dir, DISTILLED_CHECKPOINT_FILENAME)
+        distilled_fp8_path = os.path.join(model_dir, DISTILLED_FP8_FILENAME)
         spatial_upsampler_path = os.path.join(
             model_dir, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
         )
-        distilled_lora_path = os.path.join(
-            model_dir, "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-        )
-        dev_fp8_path = os.path.join(model_dir, "ltx-2.3-22b-dev-fp8.safetensors")
-        distilled_fp8_path = os.path.join(
-            model_dir, "ltx-2.3-22b-distilled-fp8.safetensors"
-        )
+        ic_lora_path = os.path.join(model_dir, IC_LORA_FILENAME)
         gemma_root = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
 
-        logger.info("Initializing LTX-2.3 pipeline ...")
+        # FP8 path is opt-in via LTX_FP8_MODE; default stays BF16 so production
+        # behaviour doesn't change silently. Decide here so the existence check
+        # below can demand the FP8 file too when requested.
+        fp8_mode = _select_fp8_mode()
+        fp8_enabled = fp8_mode is not None
+
+        required = [
+            ("distilled-1.1 BF16", checkpoint_path),
+            ("spatial upsampler", spatial_upsampler_path),
+            ("IC-LoRA Union-Control", ic_lora_path),
+        ]
+        if fp8_enabled:
+            required.append(("distilled FP8 DiT", distilled_fp8_path))
+        for label, path in required:
+            if not os.path.exists(path):
+                raise RuntimeError(
+                    f"Required {label} checkpoint missing at {path}. "
+                    "Run download_models.py before pipeline init."
+                )
+
+        logger.info("Initializing LTX-2.3 ICLoraPipeline ...")
         self._log_vram("before pipeline init")
 
-        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+        from ltx_core.loader import (
+            LTXV_LORA_COMFY_RENAMING_MAP,
+            LoraPathStrengthAndSDOps,
+            StateDictRegistry,
+        )
+        from ltx_pipelines.ic_lora import ICLoraPipeline
         from ltx_pipelines.utils.media_io import encode_video
         from ltx_pipelines.utils.types import OffloadMode
 
         self._encode_video = encode_video
+        self._OffloadMode = OffloadMode
 
-        # Weight placement. Upstream PR #201 (2026-04-23) replaced the
-        # per-call `streaming_prefetch_count` kwarg with a constructor
-        # `offload_mode` enum on `TI2VidTwoStagesPipeline` and
-        # `DiffusionStage`. OffloadMode.NONE keeps all weights on GPU
-        # (fastest); CPU streams layers from pinned host RAM for <40 GB
-        # pods; DISK re-reads from disk each pass for tiny cards.
+        # Offload mode follows precision: FP8 fits two ~30 GB DiTs on H100
+        # 80 GB without offload, BF16 doesn't (two ~44 GB DiTs overflow). The
+        # NONE setting also unlocks `torch.compile` (upstream's
+        # DiffusionStage rejects compile when offload_mode != NONE).
         gpu_vram_gb = (
             torch.cuda.get_device_properties(0).total_memory / 1e9
             if torch.cuda.is_available() else 0
         )
-        offload_mode = OffloadMode.NONE if gpu_vram_gb >= 40 else OffloadMode.CPU
+        offload_mode = OffloadMode.NONE if fp8_enabled else OffloadMode.CPU
         self._offload_mode = offload_mode
         logger.info(
-            "Offload mode: %s (GPU=%.0f GB)", offload_mode.value, gpu_vram_gb,
+            "Offload mode: %s (GPU=%.0f GB; precision=%s)",
+            offload_mode.value, gpu_vram_gb, "fp8" if fp8_enabled else "bf16",
         )
 
-        # Pick FP8 path. scaled_mm = H100 W8A8 through TRT-LLM
-        # cublas_scaled_mm; cast = W8A16 runtime downcast/upcast.
-        fp8_mode = _select_fp8_mode()
-        self._fp8_mode = fp8_mode
-
-        from ltx_core.quantization import QuantizationPolicy
-        if fp8_mode == "scaled_mm":
-            if not (os.path.exists(dev_fp8_path) and os.path.exists(distilled_fp8_path)):
-                raise RuntimeError(
-                    f"LTX_FP8_MODE=scaled_mm requires pre-quantized FP8 checkpoints at "
-                    f"{dev_fp8_path} and {distilled_fp8_path}. Run download_models.py "
-                    f"with LTX_FP8_MODE=scaled_mm."
+        # Quantization policy. scaled_mm = H100 W8A8 through TRT-LLM
+        # cublas_scaled_mm; cast = W8A16 runtime downcast/upcast (any FP8 GPU).
+        if fp8_enabled:
+            from ltx_core.quantization import QuantizationPolicy
+            if fp8_mode == "scaled_mm":
+                extras = _probe_fp8_exclusions([distilled_fp8_path])
+                logger.info(
+                    "FP8 checkpoint probe: %d non-FP8 weight modules", len(extras),
                 )
-            # Checkpoint-driven exclusion list — PER STAGE. The dev and
-            # distilled FP8 checkpoints do NOT keep the same modules in
-            # BF16 (distilled has ~34 extra BF16 entries that are FP8 in
-            # dev). Merging their exclusions and reusing one policy for
-            # both stages leaves dev-stage modules as nn.Linear while
-            # loading FP8 weights into them → BF16×FP8 dtype error on
-            # the first forward. Probe each file on its own.
-            extras_dev = _probe_fp8_exclusions([dev_fp8_path])
-            extras_distilled = _probe_fp8_exclusions([distilled_fp8_path])
-            logger.info(
-                "FP8 checkpoint probe: dev=%d, distilled=%d non-FP8 weight modules",
-                len(extras_dev),
-                len(extras_distilled),
-            )
-            for label, extras in (("dev", extras_dev), ("distilled", extras_distilled)):
                 if extras:
                     preview = ", ".join(extras[:5])
                     more = f" (+{len(extras) - 5} more)" if len(extras) > 5 else ""
-                    logger.info("FP8 probe extras (%s, first 5): %s%s", label, preview, more)
-            quantization_dev = _build_scaled_mm_policy(extras_dev)
-            quantization_distilled = _build_scaled_mm_policy(extras_distilled)
-            # Placeholder fed to the pipeline constructor; the stage
-            # rebuild below overwrites both stages with per-checkpoint
-            # policies. DiffusionStage defers weight load so this
-            # placeholder never actually touches a DiT checkpoint.
-            quantization = quantization_dev
-            logger.info(
-                "FP8 mode: scaled_mm (W8A8, TRT-LLM cublas_scaled_mm, H100-optimised)"
-            )
-        else:
-            quantization = QuantizationPolicy.fp8_cast()
-            quantization_dev = None
-            quantization_distilled = None
-            logger.info("FP8 mode: cast (W8A16, weights FP8 / activations BF16)")
-
-        # Upstream PR #201 constraint: DiffusionStage rejects
-        # `offload_mode != NONE` combined with either `quantization` or
-        # `torch_compile`. On H100 (our primary target) offload_mode is
-        # NONE so this is a no-op. On a <40 GB pod we'd otherwise hit
-        # a ValueError at pipeline init; drop quantization + compile so
-        # the pipeline still boots in streaming BF16 mode.
-        if offload_mode != OffloadMode.NONE and quantization is not None:
-            logger.warning(
-                "Offload mode %s requires non-quantized BF16 weights — "
-                "dropping FP8 quantization and torch.compile for this run. "
-                "This branch is tuned for ≥40 GB GPUs; consider a larger pod.",
-                offload_mode.value,
-            )
-            quantization = None
-            quantization_dev = None
-            quantization_distilled = None
-            fp8_mode = "bf16"
-            self._fp8_mode = fp8_mode
-
-        # CPU weight caching — only one model on GPU at a time
-        registry = None
-        try:
-            from ltx_core.loader import StateDictRegistry
-            registry = StateDictRegistry()
-            logger.info("Using StateDictRegistry (CPU weight caching)")
-        except ImportError:
-            logger.warning("StateDictRegistry not available")
-
-        # Distilled LoRA — only meaningful on the cast path. scaled_mm
-        # cannot fuse a BF16 LoRA into pre-quantized FP8 weights at load
-        # time; we instead swap Stage 2 to the pre-fused distilled-fp8
-        # checkpoint further down.
-        from ltx_core.loader import (
-            LTXV_LORA_COMFY_RENAMING_MAP,
-            LoraPathStrengthAndSDOps,
-        )
-        if fp8_mode == "cast":
-            distilled_lora = [
-                LoraPathStrengthAndSDOps(
-                    path=distilled_lora_path,
-                    strength=0.8,
-                    sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+                    logger.info("FP8 probe extras (first 5): %s%s", preview, more)
+                quantization = _build_scaled_mm_policy(extras)
+                logger.info(
+                    "FP8 mode: scaled_mm (W8A8, TRT-LLM cublas_scaled_mm, H100-optimised)"
                 )
-            ]
+            else:
+                quantization = QuantizationPolicy.fp8_cast()
+                logger.info("FP8 mode: cast (W8A16, weights FP8 / activations BF16)")
         else:
-            distilled_lora = []
+            quantization = None
 
-        # Build pipeline. On scaled_mm we pass the BF16 checkpoint so
-        # PromptEncoder / ImageConditioner / VideoDecoder / AudioDecoder /
-        # VideoUpsampler see their VAE + encoder keys; Stage 1 and Stage 2
-        # DiffusionStages are rebuilt below to point at the FP8 DiT files.
-        pipeline_kwargs = dict(
-            checkpoint_path=checkpoint_path,
-            distilled_lora=distilled_lora,
-            spatial_upsampler_path=spatial_upsampler_path,
-            gemma_root=gemma_root,
-            loras=[],
-            offload_mode=offload_mode,
-        )
-        if quantization is not None:
-            pipeline_kwargs["quantization"] = quantization
-        if registry is not None:
-            pipeline_kwargs["registry"] = registry
+        # CPU weight cache — the distilled-1.1 BF16 file is read by stage_1,
+        # by upstream's stage_2, AND by PromptEncoder/ImageConditioner/
+        # VideoDecoder/VideoUpsampler/AudioDecoder (each consumes its own
+        # *_COMFY_KEYS_FILTER subset). Caching parsed bytes once on CPU
+        # avoids re-reading the 46 GB file multiple times during init.
+        registry = StateDictRegistry()
+        logger.info("Using StateDictRegistry (CPU weight caching)")
 
-        # torch.compile — LTX-2's regional compile (per transformer block,
-        # not whole model) via COMPILE_TRANSFORMER SDOps in
-        # ltx_core/model/transformer/compiling.py. Each transformer block
-        # gets wrapped with torch.compile(m); small blocks compile fast
-        # and are cached, so the effective cost is paid once per pod boot.
-        # Expected ~15-30% Stage 1 speedup on Ada + Hopper; transparent to
-        # numerics. Default ON; set ENABLE_TORCH_COMPILE=0 to disable.
-        torch_compile_enabled = os.getenv("ENABLE_TORCH_COMPILE", "1").strip().lower() not in (
-            "0", "false", "no", "off", "",
-        )
-        if torch_compile_enabled and offload_mode == OffloadMode.NONE:
-            pipeline_kwargs["torch_compile"] = True
-            logger.info("torch.compile ENABLED (regional per transformer block)")
-        elif torch_compile_enabled:
+        # Compile is allowed only when offload_mode == NONE (upstream guard
+        # in DiffusionStage). FP8 path satisfies that; BF16 with CPU offload
+        # does not — kept the warn so a future re-enable surfaces.
+        torch_compile_enabled = os.getenv(
+            "ENABLE_TORCH_COMPILE", "1"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+        if torch_compile_enabled and offload_mode != OffloadMode.NONE:
             logger.warning(
                 "torch.compile requested but offload_mode=%s disallows it "
-                "(upstream DiffusionStage guard); running uncompiled.",
+                "(upstream DiffusionStage guard). Running uncompiled. "
+                "Set LTX_FP8_MODE=scaled_mm to unblock compile on H100.",
                 offload_mode.value,
             )
-        else:
-            logger.info("torch.compile disabled via ENABLE_TORCH_COMPILE=%s", os.getenv("ENABLE_TORCH_COMPILE"))
+            torch_compile_enabled = False
+        elif torch_compile_enabled:
+            logger.info("torch.compile ENABLED (regional per transformer block)")
 
-        # Optional FA3 enablement. When `LTX_ATTENTION_TYPE=flash_attention_3`
-        # is set, patch LTX's model configurator so every Attention module
-        # constructed by the pipeline routes through the FA3 wrapper. Must
-        # run before the TI2VidTwoStagesPipeline's Builder constructs any
-        # transformer, which happens lazily on the first __call__.
+        # FA3 — patch the configurator BEFORE the pipeline builds any
+        # transformer (lazy on first __call__).
         _requested_attn = os.environ.get("LTX_ATTENTION_TYPE", "").lower()
         if _requested_attn == "flash_attention_3":
             from src.attention_override import enable_flash_attention_3
             enable_flash_attention_3()
 
+        # Stage 1 receives the IC-LoRA Union-Control as the single LoRA
+        # fusion. The base checkpoint is already distilled-1.1, so no
+        # dev → distilled converter LoRA is required; this matches the
+        # exact configuration IC-LoRA Union-Control was trained against.
+        # Upstream's stage_2 ships with loras=() — correct, since the base
+        # is already distilled and IC-LoRA cross-attention deltas are not
+        # used in stage_2 (which uses combined_image_conditionings).
+        stage_1_loras = [
+            LoraPathStrengthAndSDOps(
+                path=ic_lora_path,
+                strength=1.0,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            ),
+        ]
+
         _t0 = time.perf_counter()
-        self._pipeline = TI2VidTwoStagesPipeline(**pipeline_kwargs)
-        logger.info(
-            "Init timing: TI2VidTwoStagesPipeline construction took %.2fs",
-            time.perf_counter() - _t0,
+        self._pipeline = ICLoraPipeline(
+            distilled_checkpoint_path=checkpoint_path,
+            spatial_upsampler_path=spatial_upsampler_path,
+            gemma_root=gemma_root,
+            loras=stage_1_loras,
+            quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile_enabled,
+            offload_mode=offload_mode,
         )
+        logger.info(
+            "Init timing: ICLoraPipeline construction took %.2fs "
+            "(reference_downscale_factor=%d)",
+            time.perf_counter() - _t0,
+            self._pipeline.reference_downscale_factor,
+        )
+        self._reference_downscale_factor = self._pipeline.reference_downscale_factor
         self._log_vram("after pipeline init")
 
-        # scaled_mm: swap Stage 1 and Stage 2 DiffusionStages to point at
-        # the pre-quantized FP8 DiT checkpoints. The upstream
-        # TI2VidTwoStagesPipeline exposes a single checkpoint_path that it
-        # feeds to every block, which is fine for the cast path but wrong
-        # here — we need BF16 for the VAE/encoder blocks and FP8 for the
-        # two DiT stages. Rebuilding after construction is safe because
-        # DiffusionStage defers weight load to its first __call__.
-        if fp8_mode == "scaled_mm":
+        # FP8 path: rebuild both DiffusionStages to point at the FP8 DiT file.
+        # ICLoraPipeline ships every block with the BF16 distilled-1.1
+        # checkpoint, which is required for the non-DiT blocks (PromptEncoder
+        # / ImageConditioner / VideoUpsampler / VideoDecoder / AudioDecoder
+        # — each pulls its slice via *_COMFY_KEYS_FILTER). The FP8 DiT file is
+        # DiT-only, so we keep the BF16 file at construction time and only
+        # swap the two DiffusionStages here. DiffusionStage defers weight
+        # load to its first __call__, so this swap is cheap.
+        if fp8_enabled:
             from ltx_pipelines.utils.blocks import DiffusionStage
-            # No registry on the DiT stages: state dicts load straight to
-            # GPU and are kept alive by registry refs even after
-            # `gpu_model.__exit__` runs `model.to("meta")`. With both
-            # ~40 GB FP8 stages pinned, the Stage 2 build OOMs on H100
-            # 80 GB. Builder defaults to DummyRegistry → no caching.
             _t1 = time.perf_counter()
             self._pipeline.stage_1 = DiffusionStage(
-                checkpoint_path=dev_fp8_path,
+                checkpoint_path=distilled_fp8_path,
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
-                loras=(),
-                quantization=quantization_dev,
+                loras=tuple(stage_1_loras),
+                quantization=quantization,
                 registry=None,
-                torch_compile=pipeline_kwargs.get("torch_compile", False),
+                torch_compile=torch_compile_enabled,
                 offload_mode=offload_mode,
             )
-            logger.info(
-                "Init timing: DiffusionStage(stage_1) constructor took %.3fs "
-                "(weight load deferred to first __call__)",
-                time.perf_counter() - _t1,
-            )
-            # Stage 2 uses the distilled-fp8 checkpoint (distilled weights
-            # already fused in) instead of base + distilled LoRA.
-            _t2 = time.perf_counter()
             self._pipeline.stage_2 = DiffusionStage(
                 checkpoint_path=distilled_fp8_path,
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
                 loras=(),
-                quantization=quantization_distilled,
+                quantization=quantization,
                 registry=None,
-                torch_compile=pipeline_kwargs.get("torch_compile", False),
+                torch_compile=torch_compile_enabled,
                 offload_mode=offload_mode,
             )
             logger.info(
-                "Init timing: DiffusionStage(stage_2) constructor took %.3fs "
+                "Init timing: FP8 DiffusionStage rebuild took %.3fs "
                 "(weight load deferred to first __call__)",
-                time.perf_counter() - _t2,
+                time.perf_counter() - _t1,
             )
-            logger.info(
-                "scaled_mm: rebuilt stage_1 → %s, stage_2 → %s (distilled pre-fused)",
-                os.path.basename(dev_fp8_path),
-                os.path.basename(distilled_fp8_path),
-            )
-
-            # Wrap each stage's _build_transformer to log wall time +
-            # post-load dtype histogram. This is the only place we can
-            # observe the actual swapped-vs-skipped result, because the
-            # swap happens inside Builder.build(...) at the END of the
-            # weight load — well after _prepare(model) returns, when
-            # the safetensors values get assigned via load_state_dict
-            # (assign=True). A meta module renamed wrong by _prepare
-            # would still log "swapped" there but the actual weight
-            # buffer would land on a stale nn.Linear. The histogram
-            # below reads `module.weight.dtype` after the load → ground
-            # truth.
             _install_build_transformer_audit(self._pipeline.stage_1, "stage_1")
             _install_build_transformer_audit(self._pipeline.stage_2, "stage_2")
 
-        # Aggressive allocator flush at the Stage 1 → Stage 2 boundary.
-        # Fixes intermittent
-        #   torch.AcceleratorError: CUDA error: invalid argument
-        # out of block_streaming.py on small (<40 GB) cards: the streaming
-        # path pins transformer blocks in host memory and PR #201 removed
-        # the host-side empty_cache that used to drain that arena. This
-        # hook restores that drain.
-        #
-        # Skip on OffloadMode.NONE (H100): the streaming path is inactive,
-        # Stage 1 is already released by gpu_model.__exit__ before the
-        # hook runs, and the allocator has already returned reserved
-        # bytes. Empirically (cold + warm runs on H100 80 GB):
-        #   alloc 32.42 → 32.42 GB (unchanged), reserved 32.92 → 32.92 GB
-        # — i.e. exactly zero work for the hook to do, and a misleading
-        # log line. Drop it on the NONE path.
+        # Stage 1 → Stage 2 boundary cleanup is only meaningful when the
+        # streaming arena pins host pages — i.e. CPU offload. On the FP8
+        # NONE-offload path the streaming arena is inactive and the hook
+        # is a no-op, so skip the install.
         if offload_mode != OffloadMode.NONE:
-            _t3 = time.perf_counter()
+            _t2 = time.perf_counter()
             _install_stage2_cleanup_hook(self._pipeline)
             logger.info(
                 "Init timing: _install_stage2_cleanup_hook took %.3fs",
-                time.perf_counter() - _t3,
-            )
-        else:
-            logger.info(
-                "Stage 2 cleanup hook skipped: offload_mode=NONE "
-                "(streaming path inactive; gpu_model.__exit__ already "
-                "drains stage 1 before stage 2 builds)"
+                time.perf_counter() - _t2,
             )
 
-        # TeaCache — opt-in via ENABLE_TEACACHE=1. Skips the transformer
-        # forward on diffusion steps where the input hasn't changed
-        # enough (rescaled relative-L1 below TEACACHE_THRESHOLD). Works
-        # across any GPU + attention backend — it never touches the
-        # attention kernel, just caches the module's output. Validated
-        # on LTX-Video with ~1.6–2.1× lossless speedup.
+        logger.info(
+            "Pipeline configured: precision=%s mode=%s offload=%s torch_compile=%s",
+            "fp8" if fp8_enabled else "bf16",
+            fp8_mode or "n/a", offload_mode.value, torch_compile_enabled,
+        )
+
+        # TeaCache — opt-in via ENABLE_TEACACHE=1. Default OFF:
+        # MEMORY.md notes TeaCache hurts I2V quality; with IC-LoRA always
+        # loaded and the reference-token cross-attention path active on
+        # any I2V/V2V request, skipping forwards is even more harmful.
         from src.teacache import enable_teacache, teacache_config_from_env
         teacache_cfg = teacache_config_from_env()
         self._teacache_enabled = teacache_cfg is not None
         if self._teacache_enabled:
-            _t4 = time.perf_counter()
+            _t3 = time.perf_counter()
             enable_teacache(self._pipeline, **teacache_cfg)
             logger.info(
                 "Init timing: enable_teacache took %.3fs",
-                time.perf_counter() - _t4,
+                time.perf_counter() - _t3,
             )
 
-        # Boot-time attention-backend fingerprint. LTX-2's
-        # `AttentionFunction.DEFAULT` resolves to `PytorchAttention` (torch
-        # SDPA dispatcher) in this image. We probe ltx_core's actual
-        # module-level binding of `flash_attn_interface` (not our env) so
-        # the log reflects what the pipeline will use.
+        # Boot-time attention-backend fingerprint.
         try:
             from ltx_core.model.transformer import attention as _ltx_attn
             from ltx_core.model.transformer.attention import AttentionFunction
             _has_fa3_live = _ltx_attn.flash_attn_interface is not None
-            _attn_resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
+            _default_resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
+            if _requested_attn == "flash_attention_3":
+                _effective_enum = AttentionFunction.FLASH_ATTENTION_3
+            else:
+                _effective_enum = AttentionFunction.DEFAULT
+            _effective_resolved = type(_effective_enum.to_callable()).__name__
         except Exception as _e:
             _has_fa3_live = None
-            _attn_resolved = f"unknown ({type(_e).__name__})"
+            _default_resolved = f"unknown ({type(_e).__name__})"
+            _effective_resolved = _default_resolved
         logger.info(
-            "Attention fingerprint — ltx_core.fa3=%s, "
-            "LTX default resolves to: %s, requested: %s",
-            _has_fa3_live, _attn_resolved, _requested_attn or "default",
+            "Attention fingerprint — ltx_core.fa3=%s, requested=%s, "
+            "effective enum resolves to: %s (DEFAULT enum would resolve to: %s)",
+            _has_fa3_live, _requested_attn or "default",
+            _effective_resolved, _default_resolved,
         )
-        if _requested_attn == "flash_attention_3" and _has_fa3_live is False:
-            logger.warning(
-                "FA3 requested but ltx_core.attention.flash_attn_interface is None "
-                "— first attention call will fail."
-            )
+        if _requested_attn == "flash_attention_3":
+            if _has_fa3_live is False:
+                logger.warning(
+                    "FA3 requested but ltx_core.attention.flash_attn_interface is None "
+                    "— first attention call will fail."
+                )
+            elif _effective_resolved != "FlashAttention3":
+                logger.warning(
+                    "FA3 requested and flash_attn_interface is live, but "
+                    "AttentionFunction.FLASH_ATTENTION_3.to_callable() returned %s "
+                    "instead of FlashAttention3 — investigate.",
+                    _effective_resolved,
+                )
 
-        # Optional components (guiders, tiling)
-        self._MultiModalGuiderParams = None
-        try:
-            from ltx_core.components.guiders import MultiModalGuiderParams
-            self._MultiModalGuiderParams = MultiModalGuiderParams
-        except ImportError:
-            pass
+        logger.info(
+            "torch debug env — TORCH_LOGS=%r, TORCHDYNAMO_VERBOSE=%r",
+            os.environ.get("TORCH_LOGS"),
+            os.environ.get("TORCHDYNAMO_VERBOSE"),
+        )
 
+        # Tiling helpers (unchanged from the previous pipeline).
         self._TilingConfig = None
         self._get_video_chunks_number = None
         try:
@@ -937,80 +806,134 @@ class LTXVideoGenerator:
         self,
         prompt: str,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: int = 1024,
-        height: int = 1536,
+        width: int | None = None,
+        height: int | None = None,
         num_frames: int = 121,
-        num_inference_steps: int = 30,
         seed: int = 42,
         frame_rate: float = 24.0,
-        cfg_scale: float = 3.0,
-        stg_scale: float = 1.0,
-        rescale_scale: float = 0.7,
+        image_url: str | None = None,
+        image_b64: str | None = None,
+        reference_video_url: str | None = None,
+        reference_video_b64: str | None = None,
+        reference_video_strength: float = 1.0,
+        conditioning_attention_strength: float = 1.0,
+        enhance_prompt: bool = False,
     ) -> dict:
-        """Run inference and encode MP4. Returns dict with output_path, output_filename, etc."""
-        width, height, num_frames = _round_user_inputs(width, height, num_frames)
-        job_id = uuid.uuid4().hex[:12]
+        """Run inference and encode MP4. Routes to T2V / I2V / V2V by input.
 
-        logger.info(
-            "Job %s: prompt=%r, %dx%d, %d frames, %d steps, seed=%d",
-            job_id, prompt[:80], width, height, num_frames, num_inference_steps, seed,
+        - prompt only → T2V
+        - prompt + image → I2V (identity-strict via IC-LoRA reference token)
+        - prompt + reference_video (± image) → V2V (style transfer / edit)
+
+        ``negative_prompt`` is accepted for wire compatibility but the
+        upstream ICLoraPipeline uses ``SimpleDenoiser`` (no CFG/STG), so
+        it is a no-op.
+        """
+        del negative_prompt  # SimpleDenoiser has no negative-prompt path
+
+        job_id = uuid.uuid4().hex[:12]
+        has_image = image_url is not None or image_b64 is not None
+        has_ref_video = (
+            reference_video_url is not None or reference_video_b64 is not None
         )
 
+        image_path: str | None = None
+        ref_video_path: str | None = None
         try:
-            # Guidance params
-            video_guider_params = None
-            audio_guider_params = None
-            if self._MultiModalGuiderParams is not None:
-                video_guider_params = self._MultiModalGuiderParams(
-                    cfg_scale=cfg_scale, stg_scale=stg_scale,
-                    rescale_scale=rescale_scale, modality_scale=3.0, stg_blocks=[28],
+            if has_image:
+                from src.image_input import (
+                    derive_dims_from_image,
+                    materialize_image,
                 )
-                audio_guider_params = self._MultiModalGuiderParams(
-                    cfg_scale=7.0, stg_scale=1.0, rescale_scale=0.7,
-                    modality_scale=3.0, stg_blocks=[28],
+                image_path = materialize_image(image_url, image_b64)
+                if width is None and height is None:
+                    width, height = derive_dims_from_image(image_path)
+
+            if has_ref_video:
+                from src.video_input import materialize_video
+                ref_video_path = materialize_video(
+                    reference_video_url, reference_video_b64
                 )
 
-            # Tiling config
+            if width is None:
+                width = 1024
+            if height is None:
+                height = 1536
+            width, height, num_frames = _round_user_inputs(width, height, num_frames)
+
+            if has_ref_video:
+                mode = "V2V"
+            elif has_image:
+                mode = "I2V"
+            else:
+                mode = "T2V"
+
+            src_label = (
+                "image_url" if image_url is not None
+                else "image_b64" if image_b64 is not None
+                else "none"
+            )
+            ref_label = (
+                "reference_video_url" if reference_video_url is not None
+                else "reference_video_b64" if reference_video_b64 is not None
+                else "none"
+            )
+            logger.info(
+                "Job %s: %s (image_src=%s, ref_video_src=%s) "
+                "prompt=%r, %dx%d, %d frames, seed=%d, "
+                "ref_strength=%.2f, attn_strength=%.2f, enhance_prompt=%s",
+                job_id, mode, src_label, ref_label, prompt[:80],
+                width, height, num_frames, seed,
+                reference_video_strength, conditioning_attention_strength,
+                enhance_prompt,
+            )
+
             tiling_config = None
             video_chunks_number = None
             if self._TilingConfig and self._get_video_chunks_number:
                 tiling_config = self._TilingConfig.default()
                 video_chunks_number = self._get_video_chunks_number(num_frames, tiling_config)
 
-            # Run pipeline
             start_time = time.time()
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(0)
 
-            # Weight placement was decided at __init__ time via
-            # `offload_mode` (PR #201 upstream refactor — `streaming_prefetch_count`
-            # no longer exists on `__call__`). `max_batch_size=1` is the
-            # upstream default and is correct on big GPUs; raising it
-            # above 1 has previously caused issues on ≥40 GB pods.
-            max_batch_size = 1
             logger.info(
-                "Job %s: offload_mode=%s, max_batch_size=%d, teacache=%s",
-                job_id, self._offload_mode.value, max_batch_size,
+                "Job %s: offload_mode=%s, teacache=%s, ref_downscale=%d",
+                job_id, self._offload_mode.value,
                 getattr(self, "_teacache_enabled", False),
+                self._reference_downscale_factor,
             )
 
-            call_kwargs = dict(
-                prompt=prompt, negative_prompt=negative_prompt, seed=seed,
-                height=height, width=width, num_frames=num_frames,
-                frame_rate=frame_rate, num_inference_steps=num_inference_steps,
-                images=[],
-                max_batch_size=max_batch_size,
-            )
-            if video_guider_params is not None:
-                call_kwargs["video_guider_params"] = video_guider_params
-            if audio_guider_params is not None:
-                call_kwargs["audio_guider_params"] = audio_guider_params
-            if tiling_config is not None:
-                call_kwargs["tiling_config"] = tiling_config
-
-            result = self._pipeline(**call_kwargs)
+            if has_ref_video:
+                result = self._run_v2v(
+                    prompt=prompt, seed=seed, height=height, width=width,
+                    num_frames=num_frames, frame_rate=frame_rate,
+                    image_path=image_path, ref_video_path=ref_video_path,  # type: ignore[arg-type]
+                    reference_video_strength=reference_video_strength,
+                    conditioning_attention_strength=conditioning_attention_strength,
+                    enhance_prompt=enhance_prompt,
+                    tiling_config=tiling_config,
+                )
+            elif has_image:
+                result = self._run_i2v(
+                    prompt=prompt, seed=seed, height=height, width=width,
+                    num_frames=num_frames, frame_rate=frame_rate,
+                    image_path=image_path,  # type: ignore[arg-type]
+                    conditioning_attention_strength=conditioning_attention_strength,
+                    enhance_prompt=enhance_prompt,
+                    tiling_config=tiling_config,
+                )
+            else:
+                result = self._run_t2v(
+                    prompt=prompt, seed=seed, height=height, width=width,
+                    num_frames=num_frames, frame_rate=frame_rate,
+                    enhance_prompt=enhance_prompt,
+                    tiling_config=tiling_config,
+                )
             video, audio = result if isinstance(result, tuple) else (result, None)
             generation_time = time.time() - start_time
+
             if torch.cuda.is_available():
                 peak = torch.cuda.max_memory_allocated(0) / 1e9
                 logger.info(
@@ -1020,7 +943,6 @@ class LTXVideoGenerator:
             else:
                 logger.info("Job %s: generation took %.1fs", job_id, generation_time)
 
-            # Encode video
             output_filename = f"ltx_{job_id}.mp4"
             output_path = os.path.join(tempfile.gettempdir(), output_filename)
             encode_kwargs = dict(video=video, fps=int(frame_rate), output_path=output_path)
@@ -1040,10 +962,18 @@ class LTXVideoGenerator:
                 "output_filename": output_filename,
                 "generation_time_seconds": round(generation_time, 2),
                 "parameters": {
+                    "mode": mode.lower(),
                     "width": width, "height": height, "num_frames": num_frames,
-                    "num_inference_steps": num_inference_steps, "seed": seed,
-                    "frame_rate": frame_rate, "cfg_scale": cfg_scale,
-                    "stg_scale": stg_scale, "rescale_scale": rescale_scale,
+                    "seed": seed, "frame_rate": frame_rate,
+                    "reference_downscale_factor": self._reference_downscale_factor,
+                    "reference_video_strength": (
+                        reference_video_strength if has_ref_video else None
+                    ),
+                    "conditioning_attention_strength": (
+                        conditioning_attention_strength
+                        if (has_image or has_ref_video) else None
+                    ),
+                    "enhance_prompt": enhance_prompt,
                 },
             }
 
@@ -1051,3 +981,81 @@ class LTXVideoGenerator:
             logger.exception("Job %s failed", job_id)
             torch.cuda.empty_cache()
             raise
+        finally:
+            if image_path is not None:
+                try:
+                    os.unlink(image_path)
+                except OSError:
+                    logger.debug("I2V tempfile cleanup failed for %s", image_path, exc_info=True)
+            if ref_video_path is not None:
+                try:
+                    os.unlink(ref_video_path)
+                except OSError:
+                    logger.debug("V2V tempfile cleanup failed for %s", ref_video_path, exc_info=True)
+
+    def _run_t2v(
+        self,
+        prompt: str, seed: int, height: int, width: int,
+        num_frames: int, frame_rate: float,
+        enhance_prompt: bool,
+        tiling_config,
+    ):
+        kwargs = dict(
+            prompt=prompt, seed=seed, height=height, width=width,
+            num_frames=num_frames, frame_rate=frame_rate,
+            images=[], video_conditioning=[],
+            enhance_prompt=enhance_prompt,
+        )
+        if tiling_config is not None:
+            kwargs["tiling_config"] = tiling_config
+        return self._pipeline(**kwargs)
+
+    def _run_i2v(
+        self,
+        prompt: str, seed: int, height: int, width: int,
+        num_frames: int, frame_rate: float,
+        image_path: str,
+        conditioning_attention_strength: float,
+        enhance_prompt: bool,
+        tiling_config,
+    ):
+        from ltx_pipelines.utils.args import ImageConditioningInput
+        kwargs = dict(
+            prompt=prompt, seed=seed, height=height, width=width,
+            num_frames=num_frames, frame_rate=frame_rate,
+            images=[ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)],
+            video_conditioning=[],
+            conditioning_attention_strength=conditioning_attention_strength,
+            enhance_prompt=enhance_prompt,
+        )
+        if tiling_config is not None:
+            kwargs["tiling_config"] = tiling_config
+        return self._pipeline(**kwargs)
+
+    def _run_v2v(
+        self,
+        prompt: str, seed: int, height: int, width: int,
+        num_frames: int, frame_rate: float,
+        image_path: str | None,
+        ref_video_path: str,
+        reference_video_strength: float,
+        conditioning_attention_strength: float,
+        enhance_prompt: bool,
+        tiling_config,
+    ):
+        from ltx_pipelines.utils.args import ImageConditioningInput
+        images = (
+            [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
+            if image_path is not None else []
+        )
+        kwargs = dict(
+            prompt=prompt, seed=seed, height=height, width=width,
+            num_frames=num_frames, frame_rate=frame_rate,
+            images=images,
+            video_conditioning=[(ref_video_path, reference_video_strength)],
+            conditioning_attention_strength=conditioning_attention_strength,
+            enhance_prompt=enhance_prompt,
+        )
+        if tiling_config is not None:
+            kwargs["tiling_config"] = tiling_config
+        return self._pipeline(**kwargs)
