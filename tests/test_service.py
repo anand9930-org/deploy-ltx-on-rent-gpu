@@ -21,7 +21,8 @@ def _run_generate(mock_gen, **kwargs):
         prompt="test prompt",
         negative_prompt="worst quality",
         width=512, height=768, num_frames=25,
-        seed=42, frame_rate=24.0,
+        num_inference_steps=30, seed=42, frame_rate=24.0,
+        cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7,
         image_url=None, image_b64=None,
         reference_video_url=None, reference_video_b64=None,
         reference_video_strength=1.0,
@@ -58,7 +59,8 @@ def _run_generate_sync(mock_gen, **kwargs):
         prompt="test prompt",
         negative_prompt="worst quality",
         width=512, height=768, num_frames=25,
-        seed=42, frame_rate=24.0,
+        num_inference_steps=30, seed=42, frame_rate=24.0,
+        cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7,
         image_url=None, image_b64=None,
         reference_video_url=None, reference_video_b64=None,
         reference_video_strength=1.0,
@@ -126,7 +128,24 @@ class TestDefaults:
         assert params["seed"] == 42
         assert params["frame_rate"] == 24.0
         assert params["mode"] == "t2v"
+
+    def test_t2v_scheduler_defaults(self, mock_generator):
+        """T2V path emits the proven fp8-h100 scheduler config: 30 steps,
+        CFG 3.0, STG 1.0, rescale 0.7."""
+        result = _run_generate(mock_generator)
+        params = result["parameters"]
+        assert params["num_inference_steps"] == 30
+        assert params["cfg_scale"] == 3.0
+        assert params["stg_scale"] == 1.0
+        assert params["rescale_scale"] == 0.7
+
+    def test_i2v_default_includes_enhance_prompt(self, mock_generator):
+        result = _run_generate(mock_generator, image_url="https://example.com/cat.png")
+        params = result["parameters"]
         assert params["enhance_prompt"] is False
+        # T2V scheduler fields are not surfaced on the unified path.
+        assert "cfg_scale" not in params
+        assert "num_inference_steps" not in params
 
 
 class TestModeRouting:
@@ -164,6 +183,28 @@ class TestModeRouting:
             reference_video_url="https://example.com/ref.mp4",
         )
         assert result["parameters"]["mode"] == "v2v"
+
+
+class TestT2VForwarding:
+    """T2V scheduler args must reach the generator unchanged — these pin the
+    ``feature/fp8-h100`` proven configuration so a future refactor that drops
+    the params from the forward chain fails fast."""
+
+    def test_num_inference_steps_reaches_generator(self, mock_generator):
+        _run_generate(mock_generator, num_inference_steps=20)
+        assert mock_generator.last_call["num_inference_steps"] == 20
+
+    def test_cfg_stg_rescale_reach_generator(self, mock_generator):
+        _run_generate(
+            mock_generator, cfg_scale=4.0, stg_scale=2.0, rescale_scale=0.5,
+        )
+        assert mock_generator.last_call["cfg_scale"] == 4.0
+        assert mock_generator.last_call["stg_scale"] == 2.0
+        assert mock_generator.last_call["rescale_scale"] == 0.5
+
+    def test_negative_prompt_reaches_generator(self, mock_generator):
+        _run_generate(mock_generator, negative_prompt="bad quality")
+        assert mock_generator.last_call["negative_prompt"] == "bad quality"
 
 
 class TestImageInputForwarding:

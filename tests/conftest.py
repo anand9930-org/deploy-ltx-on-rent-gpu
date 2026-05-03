@@ -47,11 +47,21 @@ class MockGenerator:
         else:
             mode = "t2v"
 
-        return {
-            "output_path": output_path,
-            "output_filename": output_filename,
-            "generation_time_seconds": 0.01,
-            "parameters": {
+        if mode == "t2v":
+            parameters = {
+                "mode": mode,
+                "width": kwargs.get("width", 1024),
+                "height": kwargs.get("height", 1536),
+                "num_frames": kwargs.get("num_frames", 121),
+                "num_inference_steps": kwargs.get("num_inference_steps", 30),
+                "seed": kwargs.get("seed", 42),
+                "frame_rate": kwargs.get("frame_rate", 24.0),
+                "cfg_scale": kwargs.get("cfg_scale", 3.0),
+                "stg_scale": kwargs.get("stg_scale", 1.0),
+                "rescale_scale": kwargs.get("rescale_scale", 0.7),
+            }
+        else:
+            parameters = {
                 "mode": mode,
                 "width": kwargs.get("width", 512),
                 "height": kwargs.get("height", 768),
@@ -68,7 +78,13 @@ class MockGenerator:
                     if (has_image or has_ref_video) else None
                 ),
                 "enhance_prompt": kwargs.get("enhance_prompt", False),
-            },
+            }
+
+        return {
+            "output_path": output_path,
+            "output_filename": output_filename,
+            "generation_time_seconds": 0.01,
+            "parameters": parameters,
         }
 
 

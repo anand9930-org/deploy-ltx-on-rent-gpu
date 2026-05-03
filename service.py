@@ -1,10 +1,19 @@
 """BentoML service for LTX-2.3 unified video generation (T2V / I2V / V2V).
 
 Mode is selected by which inputs the caller supplies (Veo-style):
-    prompt only                                    → T2V
+    prompt only                                    → T2V (TI2VidTwoStagesPipeline,
+                                                          30 inference steps)
     prompt + image_url|image_b64                   → I2V (identity-strict via IC-LoRA)
     prompt + reference_video_url|reference_video_b64 (± image)
                                                    → V2V (style transfer / edit)
+
+Cross-mode requests trigger a ~30-60 s pipeline rebuild on the worker —
+H100 80 GB cannot hold both upstream pipelines resident simultaneously.
+``LTX_DEFAULT_MODE`` env var (``t2v`` default) picks the boot-preloaded side.
+
+T2V scheduler args (``num_inference_steps``, ``cfg_scale``, ``stg_scale``,
+``rescale_scale``, ``negative_prompt``) only apply on the T2V path; the
+unified (ICLora) path uses its own SimpleDenoiser without CFG/STG.
 
 Endpoints:
     generate      — async task (POST /generate/submit, GET /status, /get)
@@ -58,8 +67,12 @@ class LTXVideoService:
         width: Annotated[int | None, Field(ge=256, le=1920)] = None,
         height: Annotated[int | None, Field(ge=256, le=1920)] = None,
         num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
+        num_inference_steps: Annotated[int, Field(ge=1, le=100)] = 30,
         seed: int = 42,
         frame_rate: float = 24.0,
+        cfg_scale: Annotated[float, Field(ge=0.0, le=20.0)] = 3.0,
+        stg_scale: Annotated[float, Field(ge=0.0, le=10.0)] = 1.0,
+        rescale_scale: Annotated[float, Field(ge=0.0, le=1.0)] = 0.7,
         image_url: Annotated[str | None, Field(max_length=2048)] = None,
         image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
         reference_video_url: Annotated[str | None, Field(max_length=2048)] = None,
@@ -72,7 +85,10 @@ class LTXVideoService:
         result = self.generator.generate(
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
             seed=seed, frame_rate=frame_rate,
+            cfg_scale=cfg_scale, stg_scale=stg_scale,
+            rescale_scale=rescale_scale,
             image_url=image_url, image_b64=image_b64,
             reference_video_url=reference_video_url,
             reference_video_b64=reference_video_b64,
@@ -107,8 +123,12 @@ class LTXVideoService:
         width: Annotated[int | None, Field(ge=256, le=1920)] = None,
         height: Annotated[int | None, Field(ge=256, le=1920)] = None,
         num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
+        num_inference_steps: Annotated[int, Field(ge=1, le=100)] = 30,
         seed: int = 42,
         frame_rate: float = 24.0,
+        cfg_scale: Annotated[float, Field(ge=0.0, le=20.0)] = 3.0,
+        stg_scale: Annotated[float, Field(ge=0.0, le=10.0)] = 1.0,
+        rescale_scale: Annotated[float, Field(ge=0.0, le=1.0)] = 0.7,
         image_url: Annotated[str | None, Field(max_length=2048)] = None,
         image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
         reference_video_url: Annotated[str | None, Field(max_length=2048)] = None,
@@ -120,7 +140,10 @@ class LTXVideoService:
         result = self.generator.generate(
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
             seed=seed, frame_rate=frame_rate,
+            cfg_scale=cfg_scale, stg_scale=stg_scale,
+            rescale_scale=rescale_scale,
             image_url=image_url, image_b64=image_b64,
             reference_video_url=reference_video_url,
             reference_video_b64=reference_video_b64,
