@@ -37,8 +37,7 @@ def enable_compile_config_shim() -> None:
     if _applied:
         return
 
-    from ltx_core.model.transformer import compiling as _c
-    from ltx_core.model.transformer.model import LTXModel
+    from src.upstream import ltx_compiling as _c, LTXModel
 
     # `accumulated_recompile_limit` defaults to 256 in PyTorch. On this stack
     # the upstream pipeline rebuilds the entire transformer per job and the
@@ -129,7 +128,7 @@ def enable_compile_config_shim() -> None:
     # `DiffusionStage._build_transformer`. Patching both module bindings
     # covers it. (`compile_transformer` also gets reassigned in case other
     # code paths call it directly.)
-    from ltx_core.loader.module_ops import ModuleOps
+    from src.upstream import ModuleOps, ltx_blocks as _blocks
 
     new_op = ModuleOps(
         name=_c.COMPILE_TRANSFORMER.name,
@@ -138,15 +137,17 @@ def enable_compile_config_shim() -> None:
     )
     _c.compile_transformer = patched_compile_transformer
     _c.COMPILE_TRANSFORMER = new_op
+    # Defensive: if the ACL re-exports change shape, fail loud here rather
+    # than silently leaving the upstream module unpatched.
+    assert _c.compile_transformer is patched_compile_transformer
+    assert _c.COMPILE_TRANSFORMER is new_op
 
-    try:
-        from ltx_pipelines.utils import blocks as _blocks
-        if hasattr(_blocks, "COMPILE_TRANSFORMER"):
-            _blocks.COMPILE_TRANSFORMER = new_op
-            logger.info(
-                "torch.compile shim: ltx_pipelines.utils.blocks.COMPILE_TRANSFORMER rebound"
-            )
-    except ImportError:
+    if _blocks is not None and hasattr(_blocks, "COMPILE_TRANSFORMER"):
+        _blocks.COMPILE_TRANSFORMER = new_op
+        logger.info(
+            "torch.compile shim: ltx_pipelines.utils.blocks.COMPILE_TRANSFORMER rebound"
+        )
+    elif _blocks is None:
         logger.warning(
             "torch.compile shim: ltx_pipelines.utils.blocks not importable; "
             "compile shim may not take effect if blocks.py held a stale binding"
