@@ -620,6 +620,16 @@ class LTXVideoGenerator:
         if self._torch_compile_enabled:
             from src.compile_override import enable_compile_config_shim
             enable_compile_config_shim()
+            # Stabilise id() of every Attention.attention_function across
+            # transformer rebuilds. Without this the Dynamo obj_id guard
+            # on attn{1,2}.attention_function fails on every per-job
+            # rebuild (47 blocks × 2 attns × N rebuilds), exhausts the
+            # accumulated_recompile_limit, and drops back to eager — the
+            # smoking gun in the 2026-05-01 P3/P4 latency report and again
+            # in the 2026-05-04 logs (28).txt: 191 recompiles across 2
+            # jobs, warm-start first-step 190 s vs cold-start 128 s.
+            from src.attention_override import enable_attention_callable_singleton
+            enable_attention_callable_singleton()
 
         # Shared TilingConfig helpers (optional).
         self._TilingConfig = None
