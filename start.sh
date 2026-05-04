@@ -20,9 +20,15 @@ echo "LTX_ATTENTION_TYPE=${LTX_ATTENTION_TYPE}"
 echo "LTX_DEFAULT_MODE=${LTX_DEFAULT_MODE}"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'not available')"
 
-# Download models (idempotent — skips if already present)
+# Download models (idempotent — skips if already present).
+# Module form (`-m src.download_models`) is load-bearing: the script-form
+# `python3 /app/src/download_models.py` puts /app/src/ on sys.path instead
+# of /app, breaking `from src.config import get_settings` (added in the
+# pydantic-settings refactor). WORKDIR=/app in the Dockerfile makes the
+# module form resolve correctly without an explicit PYTHONPATH.
+cd /app
 echo "=== Checking/downloading models ==="
-python3 -u /app/src/download_models.py
+python3 -u -m src.download_models
 
 # Pre-warm Linux page cache for the large weight files. Reads are dropped
 # to /dev/null; the kernel keeps the bytes in page cache so the
