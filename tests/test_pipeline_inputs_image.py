@@ -1,4 +1,4 @@
-"""Tests for src/image_input.py — URL fetch, base64 decode, validation, auto-AR."""
+"""Tests for src/pipeline/inputs/image.py — URL fetch, base64 decode, validation, auto-AR."""
 
 import base64
 import os
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from src.image_input import (
+from src.pipeline.inputs.image import (
     MAX_DOWNLOAD_BYTES,
     derive_dims_from_image,
     materialize_image,
@@ -27,7 +27,7 @@ def _mock_response(content: bytes, status_code: int = 200, content_type: str = "
 class TestMaterializeImage:
     def test_url_fetch_writes_tempfile(self):
         png = minimal_png_bytes(64, 32)
-        with patch("src.image_input.httpx.get", return_value=_mock_response(png)):
+        with patch("src.pipeline.inputs.image.httpx.get", return_value=_mock_response(png)):
             path = materialize_image(image_url="https://example.com/x.png", image_b64=None)
         try:
             assert os.path.exists(path)
@@ -43,7 +43,7 @@ class TestMaterializeImage:
         # so a future refactor that drops the headers re-breaks loudly in
         # tests instead of silently in production.
         png = minimal_png_bytes(8, 8)
-        with patch("src.image_input.httpx.get", return_value=_mock_response(png)) as mock_get:
+        with patch("src.pipeline.inputs.image.httpx.get", return_value=_mock_response(png)) as mock_get:
             path = materialize_image(image_url="https://example.com/x.png", image_b64=None)
         try:
             headers = mock_get.call_args.kwargs["headers"]
@@ -56,7 +56,7 @@ class TestMaterializeImage:
         # Surface the host in the error so a CDN block is debuggable from
         # pod logs without guessing which URL the caller passed.
         with patch(
-            "src.image_input.httpx.get",
+            "src.pipeline.inputs.image.httpx.get",
             return_value=_mock_response(b"", status_code=403),
         ):
             with pytest.raises(ValueError, match="403.*example.com"):
@@ -111,7 +111,7 @@ class TestMaterializeImage:
 
     def test_rejects_non_image_content_type(self):
         with patch(
-            "src.image_input.httpx.get",
+            "src.pipeline.inputs.image.httpx.get",
             return_value=_mock_response(b"<html></html>", content_type="text/html"),
         ):
             with pytest.raises(ValueError, match="Content-Type"):
@@ -119,13 +119,13 @@ class TestMaterializeImage:
 
     def test_rejects_oversize_url(self):
         big = b"x" * (MAX_DOWNLOAD_BYTES + 1)
-        with patch("src.image_input.httpx.get", return_value=_mock_response(big)):
+        with patch("src.pipeline.inputs.image.httpx.get", return_value=_mock_response(big)):
             with pytest.raises(ValueError, match="exceeds"):
                 materialize_image(image_url="https://x/y.png", image_b64=None)
 
     def test_rejects_http_error(self):
         with patch(
-            "src.image_input.httpx.get",
+            "src.pipeline.inputs.image.httpx.get",
             return_value=_mock_response(b"", status_code=404),
         ):
             with pytest.raises(ValueError, match="404"):
