@@ -3,6 +3,8 @@ import logging
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,34 +57,22 @@ def _hf_get(repo_id: str, filename: str, model_dir: str, hf_token: str, label: s
 
 
 def ensure_models_downloaded(model_dir: str) -> None:
-    """Download all required LTX-2.3 models to *model_dir* if not already present.
-
-    The wrapper dispatches across two upstream pipelines (TI2VidTwoStagesPipeline
-    for T2V; ICLoraPipeline for I2V/V2V), so we materialise both asset families:
-
-      - dev BF16 (~46 GB): T2V stage 1 (cast) and source for non-DiT blocks
-        (VAE, audio decoder, vocoder, image encoder, embeddings processor).
-      - distilled-LoRA-384 (~7.6 GB): T2V cast-path stage 2 LoRA. Skipped on
-        scaled_mm (LoRA is pre-fused inside distilled-fp8).
-      - dev-fp8 (~30 GB, scaled_mm only): T2V stage 1 quantised.
-      - distilled-1.1 BF16 (~46 GB): Unified pipeline base. IC-LoRA was
-        trained against this exact checkpoint.
-      - spatial upsampler (~1 GB): used by VideoUpsampler between stages.
-      - IC-LoRA Union-Control: cross-attention deltas keeping I2V identity /
-        V2V structure aligned to the reference image / video.
-      - distilled-fp8 (~30 GB, scaled_mm/cast only): shared FP8 DiT — T2V
-        stage 2 and unified stages 1+2.
-      - Gemma 3 12B text encoder (~26 GB).
+    """Download every checkpoint both upstream pipelines need into
+    ``model_dir``. Required regardless of mode: dev-BF16, distilled-1.1 BF16,
+    spatial upsampler, IC-LoRA, Gemma 3 12B. FP8-mode-gated: dev-fp8
+    (scaled_mm only), distilled-LoRA (cast/bf16 only), distilled-fp8
+    (scaled_mm + cast).
     """
     os.makedirs(model_dir, exist_ok=True)
-    hf_token = os.getenv("HF_TOKEN")
+    settings = get_settings()
+    hf_token = settings.hf_token
     if not hf_token:
         raise RuntimeError(
             "HF_TOKEN env var required. Gemma 3 model needs license acceptance at "
             "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
         )
 
-    fp8_mode = os.environ.get("LTX_FP8_MODE", "").strip().lower()
+    fp8_mode = settings.ltx_fp8_mode.strip().lower()
 
     # 1. dev BF16 — T2V stage 1 base (cast) + non-DiT blocks for both pipelines.
     _hf_get(
@@ -162,8 +152,15 @@ def ensure_models_downloaded(model_dir: str) -> None:
 
 
 if __name__ == "__main__":
+    # python-dotenv populates os.environ from .env (if present) before
+    # Settings reads it. In production .env is absent and load_dotenv()
+    # is a silent no-op; env vars come from the orchestrator.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    ensure_models_downloaded(os.getenv("MODEL_DIR", "/models"))
+    ensure_models_downloaded(get_settings().model_dir)

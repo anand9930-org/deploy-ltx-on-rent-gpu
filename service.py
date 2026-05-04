@@ -1,25 +1,11 @@
 """BentoML service for LTX-2.3 unified video generation (T2V / I2V / V2V).
 
-Mode is selected by which inputs the caller supplies (Veo-style):
-    prompt only                                    → T2V (TI2VidTwoStagesPipeline,
-                                                          30 inference steps)
-    prompt + image_url|image_b64                   → I2V (identity-strict via IC-LoRA)
-    prompt + reference_video_url|reference_video_b64 (± image)
-                                                   → V2V (style transfer / edit)
+Mode is selected Veo-style by which inputs the caller supplies (prompt-only
+→ T2V; +image → I2V; +reference_video → V2V). Cross-mode requests pay a
+~30-60 s pipeline rebuild — H100 80 GB can't hold both upstream pipelines
+resident; ``LTX_DEFAULT_MODE`` picks the boot-preloaded side.
 
-Cross-mode requests trigger a ~30-60 s pipeline rebuild on the worker —
-H100 80 GB cannot hold both upstream pipelines resident simultaneously.
-``LTX_DEFAULT_MODE`` env var (``t2v`` default) picks the boot-preloaded side.
-
-T2V scheduler args (``num_inference_steps``, ``cfg_scale``, ``stg_scale``,
-``rescale_scale``, ``negative_prompt``) only apply on the T2V path; the
-unified (ICLora) path uses its own SimpleDenoiser without CFG/STG.
-
-Endpoints:
-    generate      — async task (POST /generate/submit, GET /status, /get)
-    generate_sync — synchronous, returns MP4 directly
-
-Built-in: /readyz, /healthz, /metrics, /docs
+Endpoints: ``generate`` (async task), ``generate_sync`` (returns MP4).
 """
 
 import logging
@@ -27,17 +13,30 @@ import os
 from pathlib import Path
 from typing import Annotated
 
+# python-dotenv populates os.environ from .env (if present) BEFORE any
+# src.* import — load-bearing because src/pipeline.py runs a module-level
+# read of LTX_FP8_MODE at import time to decide whether to set
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments. In production .env does
+# not exist; load_dotenv() is a silent no-op and env vars come from the
+# RunPod pod template / GitHub Actions secrets.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import bentoml
 from pydantic import Field
 
 from src import storage
+from src.config import get_settings
 from src.pipeline import DEFAULT_NEGATIVE_PROMPT, LTXVideoGenerator
+
+_settings = get_settings()
 
 # BentoML leaves the root logger at WARNING by default, which suppresses the
 # INFO lines our pipeline emits for feature activation, VRAM, timing, and
 # TeaCache stats. Configure once at import time so pod logs actually show
 # them. Respect LOG_LEVEL so operators can dial it up/down without a rebuild.
-_level = os.getenv("LOG_LEVEL", "INFO").upper()
+_level = _settings.log_level.upper()
 logging.basicConfig(
     level=_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -56,8 +55,7 @@ logger = logging.getLogger(__name__)
 class LTXVideoService:
 
     def __init__(self) -> None:
-        model_dir = os.getenv("MODEL_DIR", "/models")
-        self.generator = LTXVideoGenerator(model_dir=model_dir)
+        self.generator = LTXVideoGenerator(model_dir=get_settings().model_dir)
 
     @bentoml.task
     def generate(

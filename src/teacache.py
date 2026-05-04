@@ -1,46 +1,36 @@
-"""TeaCache integration for LTX-2.3.
+"""TeaCache (training-free diffusion-step caching) for LTX-2.3.
 
-Training-free diffusion-step caching. At each inference step, measures
-how much the transformer input changed vs the previous step; if the
-rescaled relative L1 distance falls below a threshold, skips the
-transformer forward and reuses the previous output. Validated on
-LTX-Video with 1.6–2.1× lossless end-to-end speedup (ali-vilab/TeaCache).
+At each step, measures the rescaled relative-L1 distance between the
+current transformer input and the previous one; if below threshold,
+skips the forward and reuses the previous output. 1.6–2.1× lossless
+end-to-end speedup on LTX-Video (ali-vilab/TeaCache).
 
-We patch at the `DiffusionStage._transformer_ctx` layer rather than
-wrapping the denoising loop — this way the streaming + batch-split
-machinery downstream is untouched, and the same patch works for
-guided and simple denoisers alike.
-
-Toggled via env var `ENABLE_TEACACHE=1`. By default caches only
-`stage_1` (the expensive 30-step stage); `stage_2` has a fixed 3-step
-distilled schedule so caching has no room to pay for itself.
-
-Environment variables:
-    ENABLE_TEACACHE        "1" / "true" / "yes" to enable (default off)
-    TEACACHE_THRESHOLD     float in (0, 1], typically 0.03 lossless /
-                           0.05 aggressive (default 0.03)
-    TEACACHE_STAGES        comma-separated stage attrs to patch, e.g.
-                           "stage_1" (default) or "stage_1,stage_2"
+Patched at ``DiffusionStage._transformer_ctx`` so streaming / batch-split
+downstream is untouched and the same patch works for guided and simple
+denoisers. Configured via :class:`src.config.Settings`
+(``ENABLE_TEACACHE`` / ``TEACACHE_THRESHOLD`` / ``TEACACHE_STAGES``);
+default caches only ``stage_1`` — ``stage_2``'s 3-step distilled
+schedule is too short to amortise.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
-import os
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
-# Polynomial coefficients fitted on LTX-Video (ali-vilab/TeaCache).
-# Kept in the same ordering used by numpy.polyval: highest-degree first.
-# These may need re-fitting for LTX-2.3's longer seq_len + two-stage
-# schedule; empirical testing comes first, re-fitting if needed.
+# Polynomial coefficients fitted on LTX-Video (ali-vilab/TeaCache),
+# numpy.polyval ordering (highest-degree first). May need re-fitting
+# for LTX-2.3's longer seq_len + two-stage schedule.
 _POLY_COEFFS: tuple[float, ...] = (
     2.14700694e1,
     -1.28016453e1,
@@ -51,8 +41,7 @@ _POLY_COEFFS: tuple[float, ...] = (
 
 
 def _polyval(coeffs: tuple[float, ...], x: float) -> float:
-    """Horner-method polynomial evaluation, numpy-free so we don't
-    drag numpy onto the hot path."""
+    """Horner polynomial eval; numpy-free to keep numpy off the hot path."""
     acc = 0.0
     for c in coeffs:
         acc = acc * x + c
@@ -60,16 +49,15 @@ def _polyval(coeffs: tuple[float, ...], x: float) -> float:
 
 
 def _rescale(rel_l1: float) -> float:
-    """Apply TeaCache's learned rescaling to a raw relative-L1 distance.
-    Clamps the input to [0, 1] to stay inside the fit's validity region."""
+    """TeaCache's learned rescaling on a raw relative-L1 distance.
+    Input clamped to [0, 1] (the fit's validity region)."""
     x = max(0.0, min(1.0, rel_l1))
     return _polyval(_POLY_COEFFS, x)
 
 
 @dataclass
 class _State:
-    """Per-stage cache state, recreated fresh on each ``_transformer_ctx``
-    entry (i.e. once per pipeline stage per generation)."""
+    """Per-stage cache state, fresh on each ``_transformer_ctx`` entry."""
 
     rel_l1_thresh: float
     prev_input: torch.Tensor | None = None
@@ -99,10 +87,8 @@ class _State:
 
 
 def _extract_reference_input(video: Any, audio: Any) -> torch.Tensor | None:
-    """Pick a single tensor to use as the similarity key for this call.
-    Prefer video (bigger, dominates compute). Fall back to audio.
-    Returns None iff both modalities are absent (shouldn't happen in
-    LTX-2.3's two-stage pipeline but guarded for safety)."""
+    """Similarity-key tensor for this call. Video preferred (bigger,
+    dominates compute), audio fallback; None only if both are absent."""
     if video is not None and getattr(video, "latent", None) is not None:
         return video.latent
     if audio is not None and getattr(audio, "latent", None) is not None:
@@ -114,10 +100,9 @@ def _make_wrapped_forward(
     original_forward: Callable[..., tuple[torch.Tensor | None, torch.Tensor | None]],
     state: _State,
 ) -> Callable[..., tuple[torch.Tensor | None, torch.Tensor | None]]:
-    """Build a replacement for ``X0Model.forward`` that short-circuits
-    on cache hits. Captures ``original_forward`` (a bound method) and
-    ``state`` in closure; the returned callable is assigned onto the
-    transformer instance."""
+    """Build a ``X0Model.forward`` replacement that short-circuits on
+    cache hits. Captures the bound ``original_forward`` + ``state`` in
+    closure; returned callable is assigned onto the transformer."""
 
     def forward(
         video: Any = None,
@@ -170,10 +155,8 @@ def _make_wrapped_forward(
 
 
 class _PatchedContextManager:
-    """Wraps ``DiffusionStage._transformer_ctx``'s returned context
-    manager so that, on entry, we patch ``X0Model.forward`` with the
-    TeaCache wrapper. Restores the original forward on exit and logs
-    per-stage stats (computes / skips / skip-rate)."""
+    """Patches ``X0Model.forward`` with the TeaCache wrapper on entry;
+    restores the original and logs per-stage stats on exit."""
 
     def __init__(
         self,
@@ -233,9 +216,8 @@ class _PatchedContextManager:
 
 
 def _patch_stage(stage: Any, threshold: float, stage_name: str) -> None:
-    """Install TeaCache on one ``DiffusionStage`` by wrapping its
-    ``_transformer_ctx`` method. Idempotent-ish: marks the stage with
-    ``_teacache_patched`` so a second call is a no-op."""
+    """Wrap one ``DiffusionStage._transformer_ctx``. Idempotent via the
+    ``_teacache_patched`` marker."""
     if getattr(stage, "_teacache_patched", False):
         logger.warning(
             "TeaCache [%s]: already patched, skipping", stage_name
@@ -258,20 +240,11 @@ def enable_teacache(
     threshold: float = 0.03,
     stages: tuple[str, ...] = ("stage_1",),
 ) -> int:
-    """Install TeaCache on the named stages of a two-stage LTX pipeline.
+    """Patch named stages of a two-stage LTX pipeline; returns count patched.
 
-    Args:
-        pipeline: a ``TI2VidTwoStagesPipeline`` instance (or any object
-            exposing the named stages as attributes with a
-            ``_transformer_ctx`` method).
-        threshold: rel_l1 cache-miss cutoff. 0.03 ≈ lossless; 0.05 ≈
-            aggressive (≈ 2× speedup with small quality hit).
-        stages: which stage attributes to patch. ``stage_2`` has a
-            fixed 3-step distilled schedule, so caching there is
-            rarely worth it; default patches ``stage_1`` only.
-
-    Returns:
-        Number of stages successfully patched.
+    ``threshold`` is the rel_l1 cache-miss cutoff (0.03 ≈ lossless, 0.05 ≈
+    aggressive ≈ 2× speedup with small quality hit). ``stage_2``'s 3-step
+    distilled schedule is too short to amortise caching.
     """
     patched = 0
     for stage_attr in stages:
@@ -291,36 +264,9 @@ def enable_teacache(
 
 
 def teacache_config_from_env() -> dict[str, Any] | None:
-    """Read ENABLE_TEACACHE / TEACACHE_THRESHOLD / TEACACHE_STAGES and
-    return a config dict suitable for ``enable_teacache(**cfg)``, or
-    ``None`` if disabled.
-
-    Defaults:
-        ENABLE_TEACACHE=0
-        TEACACHE_THRESHOLD=0.03
-        TEACACHE_STAGES=stage_1
-    """
-    if os.getenv("ENABLE_TEACACHE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    """Build kwargs for ``enable_teacache(**cfg)`` from
+    :class:`src.config.Settings`; ``None`` when disabled."""
+    s = get_settings()
+    if not s.enable_teacache:
         return None
-
-    try:
-        threshold = float(os.getenv("TEACACHE_THRESHOLD", "0.03"))
-    except ValueError:
-        logger.warning(
-            "TeaCache: TEACACHE_THRESHOLD is not a float, falling back to 0.03"
-        )
-        threshold = 0.03
-
-    if not (0.0 < threshold <= 1.0):
-        logger.warning(
-            "TeaCache: TEACACHE_THRESHOLD=%r out of (0, 1], falling back to 0.03",
-            threshold,
-        )
-        threshold = 0.03
-
-    stages_env = os.getenv("TEACACHE_STAGES", "stage_1")
-    stages = tuple(s.strip() for s in stages_env.split(",") if s.strip())
-    if not stages:
-        stages = ("stage_1",)
-
-    return {"threshold": threshold, "stages": stages}
+    return {"threshold": s.teacache_threshold, "stages": s.teacache_stages}

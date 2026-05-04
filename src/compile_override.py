@@ -1,23 +1,18 @@
-"""torch.compile config-flag compatibility shim for LTX-2 on NGC 25.06.
+"""torch.compile config-flag shim for LTX-2 on NGC 25.06.
 
-Upstream `ltx_core/model/transformer/compiling.py` wraps each compiled
-forward in a `with` block that patches four config flags. One of them,
-`torch._inductor.config.unsafe_skip_cache_dynamic_shape_guards`, was added
-in PyTorch PR #150670 (merged 2025-04-15) — a few hours AFTER the SHA that
-NGC 25.06 pins. So on this image, attempting to enter that context manager
-raises `AttributeError` on the first compiled forward, and the entire
-context rolls back without ever calling the model.
+Upstream `compile_transformer` patches four `_inductor` / `_dynamo` flags.
+One — `unsafe_skip_cache_dynamic_shape_guards` — was added in PyTorch
+PR #150670 (2025-04-15), AFTER the SHA NGC 25.06 pins, so entering its
+context raises AttributeError on the first compiled forward.
 
-We monkey-patch `compile_transformer` to use an `ExitStack` that gates each
-flag on `hasattr` before patching. The dropped flag is a cache-lookup
-speed knob (skips sympy guard evaluation in `FxGraphCache._lookup_graph`),
-not a correctness or kernel-runtime knob — so the big perf wins
-(tracing inlining, recompile budget, int unspecialization) all still
+This shim wraps the patches in an ExitStack that hasattr-gates each flag.
+The dropped flag is a cache-lookup speed knob (sympy guard eval in
+`FxGraphCache._lookup_graph`) — not correctness, not kernel runtime — so
+the real perf wins (tracing inlining, recompile budget, int unspec) still
 apply on NGC 25.06.
 
-Activated via `enable_compile_config_shim()` from `src/pipeline.py`. Must
-run BEFORE `TI2VidTwoStagesPipeline` lazily builds any transformer (i.e.
-before the first `__call__`).
+Install via `enable_compile_config_shim()` BEFORE the first transformer
+build.
 """
 
 import contextlib
