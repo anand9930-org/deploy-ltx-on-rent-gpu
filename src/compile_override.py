@@ -40,10 +40,20 @@ def enable_compile_config_shim() -> None:
     from ltx_core.model.transformer import compiling as _c
     from ltx_core.model.transformer.model import LTXModel
 
+    # `accumulated_recompile_limit` defaults to 256 in PyTorch. On this stack
+    # the upstream pipeline rebuilds the entire transformer per job and the
+    # default ceiling gets hit after ~3 jobs (47 blocks × 2 attns × ~3 rebuilds
+    # ≈ 280 entries) — Dynamo then prints
+    #   "torch._dynamo hit config.accumulated_recompile_limit (256)"
+    # and falls back to eager, which is the failure mode observed in the
+    # 2026-05-01 P3/P4 logs. Bumping to 8192 is harmless (it just caps the
+    # cache memory budget) and gives plenty of headroom even if the
+    # singleton patch in src/attention_override.py misses an edge case.
     desired = [
         (torch._inductor.config, "unsafe_skip_cache_dynamic_shape_guards", True),
         (torch._dynamo.config, "inline_inbuilt_nn_modules", True),
         (torch._dynamo.config, "cache_size_limit", 256),
+        (torch._dynamo.config, "accumulated_recompile_limit", 8192),
         (torch._dynamo.config, "allow_unspec_int_on_nn_module", True),
     ]
 
@@ -60,10 +70,34 @@ def enable_compile_config_shim() -> None:
     )
 
     _logged_first_forward = {"done": False}
+    _rebuild_counter = {"n": 0}
 
     def patched_compile_transformer(model: LTXModel) -> LTXModel:
+        _rebuild_counter["n"] += 1
+        rebuild_n = _rebuild_counter["n"]
+
+        # Snapshot attention-function singleton state at the moment the
+        # transformer is built. After the first build, every subsequent
+        # build should be all hits (no new ids), confirming the Dynamo
+        # obj_id guard on attention_function will pass across rebuilds.
+        try:
+            from src.attention_override import singleton_stats as _attn_stats
+            attn_snapshot = (
+                f"installed={_attn_stats['installed']} "
+                f"hits={_attn_stats['hits']} misses={_attn_stats['misses']} "
+                f"ids={_attn_stats['ids']}"
+            )
+        except Exception:  # noqa: BLE001 — diagnostic, never fail the build
+            attn_snapshot = "unavailable"
+
+        n_blocks = len(model.transformer_blocks)
         model.transformer_blocks = torch.nn.ModuleList(
             torch.compile(m) for m in model.transformer_blocks
+        )
+        logger.info(
+            "torch.compile rebuild #%d: wrapped %d transformer blocks. "
+            "AttentionFunction singleton stats — %s",
+            rebuild_n, n_blocks, attn_snapshot,
         )
 
         def patched_dynamo_forward(*args, **kwargs):

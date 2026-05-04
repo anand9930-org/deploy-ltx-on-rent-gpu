@@ -1,19 +1,33 @@
-"""FlashAttention 3 enablement for LTX-2.3.
+"""FlashAttention 3 enablement + AttentionFunction singleton-cache for LTX-2.3.
 
-LTX-2's ``AttentionFunction.DEFAULT`` resolves to PytorchAttention — never
-FA3. To force FA3 we monkey-patch the model configurator at process boot to
-inject ``attention_type=flash_attention_3`` into the transformer config dict
-before the LTXModel is built. Every ``Attention`` module constructed
-thereafter captures ``FlashAttention3()`` as its callable.
+Two patches live here, both targeting ``ltx_core.model.transformer.attention``:
 
-A defensive SDPA fallback is installed on ``FlashAttention3.__call__`` for
-any non-None mask. Static trace of the 22B AV pipeline confirmed every
-attention call site receives ``mask=None`` for normal text-to-video inputs
-(Gemma's attention_mask is produced but immediately discarded in
+1. ``enable_flash_attention_3()`` — patches the model configurator so every
+   ``Attention`` module routes through the FA3 wrapper, plus a defensive SDPA
+   fallback for any non-None mask.
+
+2. ``enable_attention_callable_singleton()`` — memoises
+   ``AttentionFunction.to_callable()`` so the resolved callable is
+   id-stable across transformer rebuilds. Without this, every per-job
+   rebuild gives every ``Attention`` module a freshly-constructed
+   ``FlashAttention3()`` (or whichever) instance, which makes the Dynamo
+   guard ``___check_obj_id(self._modules['attn1'].attention_function, ...)``
+   fail and forces a full recompile. With 47 blocks × 2 attentions per
+   block × N rebuilds, the ``accumulated_recompile_limit`` (default 256)
+   gets exhausted after ~3 jobs and Dynamo falls back to eager — the
+   smoking gun in the 2026-05-01 P3/P4 latency report.
+
+Both are stateless callables (no instance state held), so sharing one
+instance across every Attention module is semantically identical to
+per-module instantiation.
+
+Static trace of the 22B AV pipeline confirmed every attention call site
+receives ``mask=None`` for normal text-to-video inputs (Gemma's
+attention_mask is produced but immediately discarded in
 ``TI2VidTwoStagesPipeline.__call__``, and ``modality_from_latent_state``
-hardcodes ``context_mask=None``). The fallback is insurance against future
-pipeline variants — if the first-call log line fires, FA3's fast path is not
-being taken on every layer and we need to investigate.
+hardcodes ``context_mask=None``). The mask-fallback is insurance against
+future pipeline variants — if the first-call log line fires, FA3's fast
+path is not being taken on every layer and we need to investigate.
 """
 
 import logging
@@ -23,6 +37,16 @@ import torch
 logger = logging.getLogger(__name__)
 
 _applied = False
+_singleton_applied = False
+
+# Exposed for the compile shim to print a per-rebuild diagnostic summary.
+# Updated in-place by the patched ``to_callable``.
+singleton_stats: dict = {
+    "installed": False,
+    "hits": 0,
+    "misses": 0,
+    "ids": {},  # enum_name -> id(callable)
+}
 
 
 def enable_flash_attention_3() -> None:
@@ -44,6 +68,53 @@ def enable_flash_attention_3() -> None:
     logger.info(
         "FA3 enabled: configurator patched (flash_attn_interface %s), mask-fallback installed",
         fa3_version,
+    )
+
+
+def enable_attention_callable_singleton() -> None:
+    """Memoise ``AttentionFunction.to_callable`` so every Attention module
+    binds the same callable instance per enum value.
+
+    Idempotent. Must run BEFORE ``TI2VidTwoStagesPipeline`` lazily builds
+    any transformer (i.e. before the first ``__call__``).
+
+    The fix is the dominant lever against torch.compile recompile thrash
+    on this stack: with id-stable ``attention_function``, the per-block
+    Dynamo guard hits across rebuilds and the compile cache survives the
+    per-job ``gpu_model() -> meta-device`` lifecycle.
+    """
+    global _singleton_applied
+    if _singleton_applied:
+        return
+
+    from ltx_core.model.transformer.attention import AttentionFunction
+
+    _original_to_callable = AttentionFunction.to_callable
+    _cache: dict = {}
+
+    def _patched_to_callable(self):
+        cached = _cache.get(self)
+        if cached is not None:
+            singleton_stats["hits"] += 1
+            return cached
+        callable_obj = _original_to_callable(self)
+        _cache[self] = callable_obj
+        singleton_stats["misses"] += 1
+        singleton_stats["ids"][self.name] = id(callable_obj)
+        logger.info(
+            "AttentionFunction.to_callable: cached %s -> %s (id=%d). "
+            "Future rebuilds will return this same instance — Dynamo "
+            "obj_id guard on attn{1,2}.attention_function should now hit.",
+            self.name, type(callable_obj).__name__, id(callable_obj),
+        )
+        return callable_obj
+
+    AttentionFunction.to_callable = _patched_to_callable
+    singleton_stats["installed"] = True
+    _singleton_applied = True
+    logger.info(
+        "AttentionFunction singleton-cache installed on %s.to_callable",
+        AttentionFunction.__module__,
     )
 
 
