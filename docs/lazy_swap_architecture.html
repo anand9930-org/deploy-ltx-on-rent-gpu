@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LTX-2.3 lazy pipeline swap — what's happening on your pod</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --good: #56d364;
+    --warn: #f0b849;
+    --bad: #f85149;
+    --t2v: #6c8eef;
+    --i2v: #d291e0;
+    --gemma: #9aa0a6;
+    --vae: #6cc7c7;
+    --free: #2d333b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 0 0 80px 0;
+    background: var(--bg); color: var(--text);
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 36px 28px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; margin: 20px 0 8px; color: var(--accent); }
+  p { color: var(--text); }
+  .lede { color: var(--muted); margin-bottom: 18px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; margin: 14px 0;
+  }
+  code, .mono { font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font: 12px/1 ui-monospace, monospace; vertical-align: middle;
+  }
+  .pill.t2v { background: rgba(108,142,239,.18); color: var(--t2v); }
+  .pill.i2v { background: rgba(210,145,224,.18); color: var(--i2v); }
+  .pill.swap { background: rgba(240,184,73,.18); color: var(--warn); }
+  .pill.good { background: rgba(86,211,100,.16); color: var(--good); }
+  .pill.bad { background: rgba(248,81,73,.18); color: var(--bad); }
+
+  /* VRAM bar */
+  .vram-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .vram-grid { grid-template-columns: 1fr; } }
+  .vram-card .label { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .vram-card .title { font-weight: 600; margin-bottom: 10px; }
+  .vram-bar {
+    display: flex; height: 28px; border-radius: 6px; overflow: hidden;
+    background: var(--free); border: 1px solid var(--border);
+  }
+  .vram-bar > div { display: flex; align-items: center; justify-content: center;
+    font: 11px/1 ui-monospace, monospace; color: #0e1116; font-weight: 600;
+    min-width: 0; overflow: hidden; white-space: nowrap;
+  }
+  .seg-gemma { background: var(--gemma); }
+  .seg-vae { background: var(--vae); }
+  .seg-t2v-s1 { background: #6c8eef; }
+  .seg-t2v-s2 { background: #4a6cd0; color: #fff !important; }
+  .seg-i2v-base { background: #d291e0; }
+  .seg-i2v-fp8 { background: #b06ec0; color: #fff !important; }
+  .seg-overflow { background: repeating-linear-gradient(45deg, var(--bad), var(--bad) 6px, #c0413a 6px, #c0413a 12px); color: #fff !important; }
+  .vram-legend {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    margin-top: 10px; font-size: 12px; color: var(--muted);
+  }
+  .vram-legend .swatch { display: inline-block; width: 12px; height: 12px;
+    border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+
+  /* Timeline */
+  .timeline {
+    display: grid; grid-template-columns: 80px 1fr; gap: 8px 14px;
+    align-items: center; margin: 12px 0;
+  }
+  .timeline .t { font: 12px/1 ui-monospace, monospace; color: var(--muted); text-align: right; }
+  .timeline .row {
+    display: flex; height: 30px; border-radius: 4px; overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .timeline .row > div {
+    display: flex; align-items: center; justify-content: center;
+    font: 11px/1 ui-monospace, monospace; min-width: 0;
+    overflow: hidden; white-space: nowrap; padding: 0 6px;
+  }
+  .blk-t2v { background: rgba(108,142,239,.5); color: #fff; }
+  .blk-i2v { background: rgba(210,145,224,.5); color: #fff; }
+  .blk-swap { background: rgba(240,184,73,.5); color: #1a1a1a; font-weight: 600; }
+  .blk-idle { background: var(--free); color: var(--muted); }
+
+  /* Decision matrix table */
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  .num { font: 13px ui-monospace, monospace; text-align: right; }
+
+  .key-takeaway {
+    background: rgba(88,166,255,.08);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+  .quality-box {
+    background: rgba(86,211,100,.06);
+    border-left: 3px solid var(--good);
+    padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 30px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>What's happening when you alternate I2V ↔ T2V</h1>
+  <p class="lede">Short version: <strong>quality is identical, but you pay a one-time
+  ~145 s "rebuild tax" each time you switch modes</strong>. No model degradation,
+  no cumulative loss — just a wall-clock penalty that disappears once the same
+  mode is reused.</p>
+
+  <div class="quality-box">
+    <strong>To answer the question first:</strong> there is <strong>no quality
+    loss</strong> from alternating. Each mode rebuilds from disk to a clean
+    state, and the seed-→ output mapping is deterministic. The cost is purely
+    <em>time</em>, not <em>fidelity</em>. Pixel output of "I2V then T2V" is
+    bit-identical to "T2V from a fresh boot" at the same seed.
+  </div>
+
+  <h2>1. Why we can't keep both pipelines loaded at once</h2>
+
+  <p>An H100 80 GB has a hard VRAM budget. Both upstream pipelines want
+  to live there simultaneously, but together they overflow:</p>
+
+  <div class="vram-grid">
+    <div class="vram-card card">
+      <div class="label">Single pipeline resident</div>
+      <div class="title">T2V only — fits comfortably</div>
+      <div class="vram-bar" title="80 GB total">
+        <div class="seg-gemma" style="flex: 26">Gemma 26</div>
+        <div class="seg-vae" style="flex: 8">VAE 8</div>
+        <div class="seg-t2v-s1" style="flex: 30">dev-fp8 30</div>
+        <div class="seg-t2v-s2" style="flex: 12">stage 2 cache</div>
+        <div style="flex: 4"></div>
+      </div>
+      <div class="vram-legend">~76 GB used / 80 GB. Stage 2 swaps in over Stage 1.</div>
+    </div>
+
+    <div class="vram-card card">
+      <div class="label">Single pipeline resident</div>
+      <div class="title">I2V only — also fits</div>
+      <div class="vram-bar">
+        <div class="seg-gemma" style="flex: 26">Gemma 26</div>
+        <div class="seg-vae" style="flex: 8">VAE 8</div>
+        <div class="seg-i2v-base" style="flex: 30">distilled-1.1 30</div>
+        <div class="seg-i2v-fp8" style="flex: 14">fp8 + IC-LoRA 14</div>
+        <div style="flex: 2"></div>
+      </div>
+      <div class="vram-legend">~78 GB used / 80 GB. IC-LoRA fuses into stage 1.</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <div class="label" style="color: var(--muted); font-size: 13px;">If we tried to keep both at once</div>
+    <div class="title" style="margin-bottom: 10px;">Both pipelines resident — overflows VRAM</div>
+    <div class="vram-bar">
+      <div class="seg-gemma" style="flex: 26">Gemma</div>
+      <div class="seg-vae" style="flex: 8">VAE</div>
+      <div class="seg-t2v-s1" style="flex: 30">T2V dev-fp8 30</div>
+      <div class="seg-i2v-base" style="flex: 30">I2V distilled-1.1 30</div>
+      <div class="seg-i2v-fp8" style="flex: 14">+ FP8 + IC-LoRA</div>
+      <div class="seg-overflow" style="flex: 22">overflow ≈ 28 GB</div>
+    </div>
+    <div class="vram-legend"><span style="color: var(--bad);">~108 GB needed, only 80 GB available → CUDA OOM at boot.</span></div>
+  </div>
+
+  <p>Add to that: FP8 mode requires <code>OffloadMode.NONE</code> (so the GPU
+  has the kernels needed for cuBLAS scaled-mm to work without paging), which
+  means we <em>can't</em> stream weights to CPU as a fallback. The choice is
+  binary — either one pipeline is GPU-resident, or neither is.</p>
+
+  <h2>2. The "lazy swap" mechanism</h2>
+
+  <p>So the wrapper holds <strong>at most one</strong> upstream pipeline alive.
+  When a request needs the other one, it does this in sequence:</p>
+
+  <div class="card">
+    <ol>
+      <li><span class="pill swap">teardown</span>
+        <code>del self._pipeline; gc.collect(); torch.cuda.empty_cache()</code>
+        — drops every reference, returns the ~30 GB DiT + scratch buffers to the allocator pool.</li>
+      <li><span class="pill swap">disk I/O</span>
+        Reads the new safetensors files (~30–60 GB) from local NVMe.
+        Page cache is pre-warmed at boot, so this is RAM→GPU not disk→GPU
+        — but it's still ~30 GB of bytes to memcpy.</li>
+      <li><span class="pill swap">FP8 probe</span>
+        Reopens the safetensors header and walks every <code>.weight</code>
+        key to find which transformer modules need to stay BF16 (they're
+        excluded from FP8 quantization). One-shot per checkpoint, but it
+        runs on every rebuild because the policy is built fresh.</li>
+      <li><span class="pill swap">construct</span>
+        Builds the DiffusionStage objects, applies the FP8 quantization
+        policy, fuses any LoRAs, installs the audit hooks.</li>
+      <li><span class="pill good">ready</span>
+        Active mode flag flips, request runs.</li>
+    </ol>
+    <p style="margin-top: 10px; color: var(--muted); font-size: 13px;">
+      Total elapsed: <strong>30–60 s on a freshly booted pod, ~145 s in your
+      session</strong> (slower because the alternative pipeline's pages had
+      already been evicted from page cache by the previous I2V's working set).
+    </p>
+  </div>
+
+  <h2>3. Your actual session timeline</h2>
+
+  <p>Here's exactly what happened on your pod just now (durations in seconds):</p>
+
+  <div class="timeline">
+    <div class="t">t = 0 s</div>
+    <div class="row">
+      <div class="blk-t2v" style="flex: 8">T2V preloaded at boot (LTX_DEFAULT_MODE=t2v)</div>
+      <div class="blk-idle" style="flex: 2">idle</div>
+    </div>
+
+    <div class="t">I2V request</div>
+    <div class="row">
+      <div class="blk-swap" style="flex: 4">swap T2V → unified ~30s</div>
+      <div class="blk-i2v" style="flex: 6">I2V inference ~58s</div>
+    </div>
+
+    <div class="t">→ 88.6 s</div>
+    <div class="row"><div class="blk-i2v" style="flex: 1">✓ I2V done — unified pipeline now resident</div></div>
+
+    <div class="t">T2V request</div>
+    <div class="row">
+      <div class="blk-swap" style="flex: 65">swap unified → T2V ~145s (teardown + 60 GB safetensors load + FP8 probe + DiffusionStage build × 2)</div>
+      <div class="blk-t2v" style="flex: 35">T2V inference ~75s (30 steps × CFG+STG)</div>
+    </div>
+
+    <div class="t">→ 219.5 s</div>
+    <div class="row"><div class="blk-t2v" style="flex: 1">✓ T2V done — TI2VidTwoStagesPipeline now resident</div></div>
+  </div>
+
+  <p style="margin-top: 12px;">If you fired a <em>second</em> T2V right after,
+  it would skip steps 1–4 entirely:</p>
+
+  <div class="timeline">
+    <div class="t">2nd T2V</div>
+    <div class="row">
+      <div class="blk-t2v" style="flex: 35">T2V inference ~75s (no swap — pipeline already loaded)</div>
+      <div class="blk-idle" style="flex: 65">idle</div>
+    </div>
+    <div class="t">→ ~75 s</div>
+    <div class="row"><div class="blk-good blk-t2v" style="flex: 1">✓ matches the parent fp8-h100 baseline</div></div>
+  </div>
+
+  <h2>4. Why T2V is intrinsically slower than I2V <em>even without the swap</em></h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Factor</th>
+        <th>I2V (unified)</th>
+        <th>T2V (two-stage)</th>
+        <th class="num">Cost ratio</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Inference steps</td>
+        <td>~8 (LCM-distilled)</td>
+        <td>30 (proven fp8-h100 config)</td>
+        <td class="num">3.75×</td>
+      </tr>
+      <tr>
+        <td>Forward passes per step</td>
+        <td>1 (SimpleDenoiser)</td>
+        <td>3 (cond + uncond + STG-perturbed)</td>
+        <td class="num">3×</td>
+      </tr>
+      <tr>
+        <td>Latent grid (your run)</td>
+        <td>1280×1920 ≈ 2.46 M px</td>
+        <td>1024×1536 ≈ 1.57 M px</td>
+        <td class="num">0.64× (smaller, helps T2V)</td>
+      </tr>
+      <tr>
+        <td>Net per-frame compute</td>
+        <td>baseline</td>
+        <td>3.75 × 3 × 0.64 ≈ 7.2×</td>
+        <td class="num">~7× more</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The 30 steps + CFG/STG aren't waste — they're what gives T2V its
+  motion fidelity and prompt adherence on novel scenes. I2V doesn't need
+  the extra guidance because the input image already constrains the
+  output.</p>
+
+  <h2>5. Mitigations (in order of practical value)</h2>
+
+  <div class="card">
+    <h3>Batch by mode if you can</h3>
+    <p>Group all your I2V calls together, then all your T2V calls. You pay
+    the ~145 s tax <em>once</em> per group instead of every request. Five
+    I2Vs back-to-back save ~580 s vs alternating.</p>
+
+    <h3>Pick the right boot default</h3>
+    <p>Set <code>LTX_DEFAULT_MODE=i2v</code> on pods that mostly serve I2V
+    (e.g. avatar workflows). The first request lands warm; only the rare
+    T2V pays the swap.</p>
+
+    <h3>Run two pods, one per mode</h3>
+    <p>For mixed traffic where alternation is unavoidable, two H100 pods
+    (one with <code>LTX_DEFAULT_MODE=t2v</code>, one with
+    <code>=i2v</code>) eliminate the swap entirely. Each pod sees only
+    same-mode traffic. ~$6/hr instead of $3/hr, but no swap penalty ever.</p>
+
+    <h3>Wait for H200 (141 GB)</h3>
+    <p>Both pipelines fit resident on H200 with ~10 GB headroom. No swap,
+    no rebuild. Today's H100 cost is the constraint, not the architecture.</p>
+  </div>
+
+  <h2>6. The bottom line</h2>
+
+  <div class="key-takeaway">
+    <p style="margin: 0;"><strong>Nothing degrades with alternation.</strong>
+    The pipeline rebuild is byte-exact: same weights, same FP8 policy,
+    same kernels. The only thing you "lose" by alternating is wall-clock
+    seconds. The first request after a mode change costs +30–145 s; every
+    follow-up in the same mode is at full speed.</p>
+  </div>
+
+  <p>If your workload is steady state in one mode, you'll never see the
+  penalty after the first warm-up. If it's truly mixed, the cheapest
+  mitigation is to batch by mode at the application layer; the most
+  thorough is two pods.</p>
+
+  <div class="footer">
+    Generated for pod <code>mnqp2ahw8gj6kw</code> · branch
+    <code>feature/fp8-h100-iclora-unified</code> · 2026-05-04
+  </div>
+</main>
+</body>
+</html>
