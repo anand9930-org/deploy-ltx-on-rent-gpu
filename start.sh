@@ -7,9 +7,17 @@ set -e
 # FA3 wheel is unusable.
 export LTX_ATTENTION_TYPE="${LTX_ATTENTION_TYPE:-flash_attention_3}"
 
+# Which upstream pipeline to preload at boot. I2V default (this deployment
+# is I2V-heavy); override to `t2v` for T2V-first pods. Cross-mode requests
+# at runtime trigger a tear-down + rebuild — only one upstream pipeline is
+# resident at a time. `i2v`, `v2v`, and `unified` all preload the same
+# ICLoraPipeline (I2V and V2V share weights).
+export LTX_DEFAULT_MODE="${LTX_DEFAULT_MODE:-i2v}"
+
 echo "=== LTX-2.3 Video Generation Service ==="
 echo "MODEL_DIR=${MODEL_DIR:-/models}"
 echo "LTX_ATTENTION_TYPE=${LTX_ATTENTION_TYPE}"
+echo "LTX_DEFAULT_MODE=${LTX_DEFAULT_MODE}"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'not available')"
 
 # Download models (idempotent — skips if already present)
@@ -19,13 +27,14 @@ python3 -u /app/src/download_models.py
 # Pre-warm Linux page cache for the large weight files. Reads are dropped
 # to /dev/null; the kernel keeps the bytes in page cache so the
 # safetensors load path inside BentoML hits RAM instead of NVMe.
-# One-time boot cost (~60-90s); turns the ~348s first-request cold tax
-# (Gemma 24 GB + dev-fp8 29 GB + distilled-fp8 29 GB of disk reads) into
-# the warm-pod regime (~13s). RunPod H100 80GB pods ship with 128-256 GB
-# host RAM, so the ~80 GB working set fits in page cache.
+# One-time boot cost (~60-90s); turns the cold-disk tax into a warm-pod
+# regime including the lazy mode-swap rebuild path. Working set is the
+# union of T2V (dev-fp8 ~30 GB or dev BF16 ~46 GB on cast) and unified
+# (distilled-1.1 BF16 ~46 GB + IC-LoRA + distilled-fp8 ~30 GB) plus
+# Gemma (~26 GB). RunPod H100 80 GB pods typically ship 200+ GB host RAM.
 #
-# We deliberately skip ltx-2.3-22b-dev.safetensors (BF16 base, 46 GB) —
-# only its VAE / embeddings-processor keys are touched at runtime
+# We deliberately skip ltx-2.3-22b-dev.safetensors (BF16 base, ~46 GB) on
+# scaled_mm pods — only its VAE / embeddings keys are touched at runtime
 # (~5 GB hot bytes), so caching the whole file would evict pages we do
 # need for ~40 GB of bytes we don't.
 echo "=== Pre-warming page cache (~60-90s) ==="
@@ -33,7 +42,9 @@ MODELS="${MODEL_DIR:-/models}"
 PREWARM_FILES=()
 for p in \
     "$MODELS"/ltx-2.3-22b-dev-fp8.safetensors \
-    "$MODELS"/ltx-2.3-22b-distilled-fp8.safetensors ; do
+    "$MODELS"/ltx-2.3-22b-distilled-1.1.safetensors \
+    "$MODELS"/ltx-2.3-22b-distilled-fp8.safetensors \
+    "$MODELS"/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors ; do
     [ -f "$p" ] && PREWARM_FILES+=("$p")
 done
 # Gemma shards: download_models.py uses snapshot_download(local_dir=...)

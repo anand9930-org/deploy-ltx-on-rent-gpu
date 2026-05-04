@@ -148,15 +148,19 @@ RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
 # AsyncContextManagerMixin from 4.9.0) AND verify the full stack in one
 # shot: NGC torch still in place, torchvision's native ops load, and the
 # torchaudio import resolves to our stub. Any failure aborts the build.
-RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' \
+# Pin numpy<2 — NGC torch is built against NumPy 1.x; NumPy 2.x silently
+# breaks `torch.Tensor.numpy()` and crashes encode_video.
+RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' 'numpy<2' \
     && python -c "\
-import importlib.metadata as m, anyio, torch, torchvision, torchaudio, flash_attn_interface; \
+import importlib.metadata as m, anyio, numpy, torch, torchvision, torchaudio, flash_attn_interface; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
+assert numpy.__version__.split('.')[0] == '1', f'numpy must be 1.x for NGC torch ABI; got {numpy.__version__}'; \
 assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
 assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
 assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func'; \
-print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
+torch.zeros(2).numpy(); \
+print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
