@@ -58,8 +58,7 @@ def enable_flash_attention_3() -> None:
     import flash_attn_interface  # noqa: F401 — fail loud if wheel is missing
     fa3_version = getattr(flash_attn_interface, "__version__", "unknown")
 
-    from ltx_core.model.transformer.attention import FlashAttention3
-    from ltx_core.model.transformer import model_configurator as _mc
+    from src.upstream import FlashAttention3, ltx_model_configurator as _mc
 
     _install_mask_fallback(FlashAttention3)
     _install_configurator_patch(_mc)
@@ -87,7 +86,7 @@ def enable_attention_callable_singleton() -> None:
     if _singleton_applied:
         return
 
-    from ltx_core.model.transformer.attention import AttentionFunction
+    from src.upstream import AttentionFunction
 
     _original_to_callable = AttentionFunction.to_callable
     _cache: dict = {}

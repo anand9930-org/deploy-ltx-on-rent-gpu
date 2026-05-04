@@ -71,7 +71,20 @@ RUN sed -i '/^anyio/d' /etc/pip/constraint.txt
 #    audio_vae code path that touches torchaudio APIs is unreachable. A
 #    pure-Python stub is dropped into site-packages further down satisfies
 #    the `import torchaudio` at module load.
-RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2 \
+# Pin upstream LTX-2 to a known-good commit. Bumping is a one-line ARG
+# change — see docs/upstream-bump.md when that runbook lands. Without
+# this pin, every rebuild silently captures whatever upstream pushed to
+# main last; the two sed patches below are also keyed off this SHA, so
+# unpinned upstream is a regex roulette every build.
+#
+# `git init + fetch <SHA>` (instead of `clone --depth 1`) keeps the
+# shallow-clone speed (~5 MB) while letting us check out an arbitrary
+# historical SHA — `clone --depth 1` only ever gives the branch tip.
+ARG LTX2_UPSTREAM_SHA=41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
+RUN git init /app/LTX-2 \
+    && git -C /app/LTX-2 remote add origin https://github.com/Lightricks/LTX-2.git \
+    && git -C /app/LTX-2 fetch --depth 1 origin "${LTX2_UPSTREAM_SHA}" \
+    && git -C /app/LTX-2 checkout FETCH_HEAD \
     && sed -i 's|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=True)|' \
         /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
     && grep -q "use_fast=True" /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
@@ -168,6 +181,13 @@ COPY src/ /app/src/
 COPY service.py /app/service.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
+
+# ---- Upstream contract fail-fast -------------------------------------------
+# `src/upstream.py` is the single chokepoint for every ltx_core / ltx_pipelines
+# symbol the service consumes. Importing it here turns an upstream rename at
+# the pinned SHA into a build failure with the exact missing name, instead of
+# a cryptic AttributeError 30 minutes into a generation on a deployed pod.
+RUN PYTHONPATH=/app python -c "import src.upstream; print('upstream contract OK')"
 
 WORKDIR /app
 EXPOSE 8000

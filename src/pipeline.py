@@ -241,14 +241,15 @@ def _build_scaled_mm_policy(extras: tuple[str, ...]):
        ``_create_transpose_kv_operation`` with local versions that normalize
        ``_orig_mod`` out before the check.
     """
-    from ltx_core.loader.module_ops import ModuleOps
-    from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
-    from ltx_core.model.transformer import LTXModel
-    from ltx_core.quantization import QuantizationPolicy
-    from ltx_core.quantization.fp8_scaled_mm import (
+    from src.upstream import (
         FP8_PREPARE_MODULE_OPS,
         FP8_TRANSPOSE_SD_OPS,
         FP8Linear,
+        KeyValueOperationResult,
+        LTXModel,
+        ModuleOps,
+        QuantizationPolicy,
+        SDOps,
         _linear_to_fp8linear,
     )
 
@@ -560,8 +561,7 @@ class LTXVideoGenerator:
         self._fp8_mode = _select_fp8_mode()
         self._fp8_enabled = self._fp8_mode is not None
 
-        from ltx_pipelines.utils.media_io import encode_video
-        from ltx_pipelines.utils.types import OffloadMode
+        from src.upstream import encode_video, OffloadMode
 
         self._encode_video = encode_video
         self._OffloadMode = OffloadMode
@@ -632,14 +632,9 @@ class LTXVideoGenerator:
             enable_attention_callable_singleton()
 
         # Shared TilingConfig helpers (optional).
-        self._TilingConfig = None
-        self._get_video_chunks_number = None
-        try:
-            from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-            self._TilingConfig = TilingConfig
-            self._get_video_chunks_number = get_video_chunks_number
-        except ImportError:
-            pass
+        from src.upstream import HAS_TILING, TilingConfig, get_video_chunks_number
+        self._TilingConfig = TilingConfig if HAS_TILING else None
+        self._get_video_chunks_number = get_video_chunks_number if HAS_TILING else None
 
         # Per-checkpoint FP8 exclusion cache. Avoids re-probing the same
         # safetensors header on every cross-mode rebuild.
@@ -719,7 +714,7 @@ class LTXVideoGenerator:
         fp8_mode = self._fp8_mode
         torch_compile_enabled = self._torch_compile_enabled
 
-        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+        from src.upstream import TI2VidTwoStagesPipeline
 
         for label, path in (
             ("dev BF16", self._dev_bf16_path),
@@ -741,7 +736,7 @@ class LTXVideoGenerator:
                         "Run download_models.py with LTX_FP8_MODE=scaled_mm."
                     )
 
-        from ltx_core.quantization import QuantizationPolicy
+        from src.upstream import QuantizationPolicy
         if fp8_mode == "scaled_mm":
             extras_dev = self._extras_for(self._dev_fp8_path)
             extras_distilled = self._extras_for(self._distilled_fp8_path)
@@ -780,7 +775,7 @@ class LTXVideoGenerator:
             quantization_dev = None
             quantization_distilled = None
 
-        from ltx_core.loader import (
+        from src.upstream import (
             LTXV_LORA_COMFY_RENAMING_MAP,
             LoraPathStrengthAndSDOps,
             StateDictRegistry,
@@ -834,7 +829,7 @@ class LTXVideoGenerator:
 
         # scaled_mm: rebuild stages to point at FP8 DiT files.
         if fp8_mode == "scaled_mm":
-            from ltx_pipelines.utils.blocks import DiffusionStage
+            from src.upstream import DiffusionStage
             _t1 = time.perf_counter()
             self._pipeline.stage_1 = DiffusionStage(
                 checkpoint_path=self._dev_fp8_path,
@@ -877,12 +872,8 @@ class LTXVideoGenerator:
             _install_stage2_cleanup_hook(self._pipeline)
 
         # Optional MultiModalGuiderParams (T2V uses CFG + STG).
-        self._MultiModalGuiderParams = None
-        try:
-            from ltx_core.components.guiders import MultiModalGuiderParams
-            self._MultiModalGuiderParams = MultiModalGuiderParams
-        except ImportError:
-            pass
+        from src.upstream import HAS_GUIDERS, MultiModalGuiderParams
+        self._MultiModalGuiderParams = MultiModalGuiderParams if HAS_GUIDERS else None
 
         # TeaCache opt-in.
         from src.teacache import enable_teacache, teacache_config_from_env
@@ -922,16 +913,16 @@ class LTXVideoGenerator:
                 f"LTX_FP8_MODE={fp8_mode}."
             )
 
-        from ltx_core.loader import (
+        from src.upstream import (
             LTXV_LORA_COMFY_RENAMING_MAP,
             LoraPathStrengthAndSDOps,
             StateDictRegistry,
         )
-        from ltx_pipelines.ic_lora import ICLoraPipeline
+        from src.upstream import ICLoraPipeline
 
         # Quantization policy.
         if fp8_enabled:
-            from ltx_core.quantization import QuantizationPolicy
+            from src.upstream import QuantizationPolicy
             if fp8_mode == "scaled_mm":
                 extras = self._extras_for(self._distilled_fp8_path)
                 logger.info(
@@ -987,7 +978,7 @@ class LTXVideoGenerator:
 
         # FP8: rebuild both DiffusionStages onto distilled-fp8.
         if fp8_enabled:
-            from ltx_pipelines.utils.blocks import DiffusionStage
+            from src.upstream import DiffusionStage
             _t1 = time.perf_counter()
             self._pipeline.stage_1 = DiffusionStage(
                 checkpoint_path=self._distilled_fp8_path,
@@ -1037,8 +1028,7 @@ class LTXVideoGenerator:
 
     def _log_attention_fingerprint(self) -> None:
         try:
-            from ltx_core.model.transformer import attention as _ltx_attn
-            from ltx_core.model.transformer.attention import AttentionFunction
+            from src.upstream import AttentionFunction, ltx_attention as _ltx_attn
             _has_fa3_live = _ltx_attn.flash_attn_interface is not None
             _default_resolved = type(AttentionFunction.DEFAULT.to_callable()).__name__
             if self._requested_attn == "flash_attention_3":
@@ -1416,7 +1406,7 @@ class LTXVideoGenerator:
         enhance_prompt: bool,
         tiling_config,
     ):
-        from ltx_pipelines.utils.args import ImageConditioningInput
+        from src.upstream import ImageConditioningInput
         kwargs = dict(
             prompt=prompt, seed=seed, height=height, width=width,
             num_frames=num_frames, frame_rate=frame_rate,
@@ -1440,7 +1430,7 @@ class LTXVideoGenerator:
         enhance_prompt: bool,
         tiling_config,
     ):
-        from ltx_pipelines.utils.args import ImageConditioningInput
+        from src.upstream import ImageConditioningInput
         images = (
             [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
             if image_path is not None else []
