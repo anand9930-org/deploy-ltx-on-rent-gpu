@@ -7,11 +7,12 @@ set -e
 # FA3 wheel is unusable.
 export LTX_ATTENTION_TYPE="${LTX_ATTENTION_TYPE:-flash_attention_3}"
 
-# Which upstream pipeline to preload at boot. T2V default; set to `i2v`
-# (or `v2v`/`unified`) on I2V-heavy deployments to skip the first-request
-# ~30-60 s mode-swap penalty. Cross-mode requests at runtime trigger a
-# tear-down + rebuild — only one upstream pipeline is resident at a time.
-export LTX_DEFAULT_MODE="${LTX_DEFAULT_MODE:-t2v}"
+# Which upstream pipeline to preload at boot. I2V default (this deployment
+# is I2V-heavy); override to `t2v` for T2V-first pods. Cross-mode requests
+# at runtime trigger a tear-down + rebuild — only one upstream pipeline is
+# resident at a time. `i2v`, `v2v`, and `unified` all preload the same
+# ICLoraPipeline (I2V and V2V share weights).
+export LTX_DEFAULT_MODE="${LTX_DEFAULT_MODE:-i2v}"
 
 echo "=== LTX-2.3 Video Generation Service ==="
 echo "MODEL_DIR=${MODEL_DIR:-/models}"

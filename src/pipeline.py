@@ -10,7 +10,7 @@ Dispatches across two upstream pipelines based on request shape:
 
 H100 80 GB cannot hold both upstream pipelines resident simultaneously; the
 wrapper keeps at most one alive and lazy-swaps on cross-mode requests
-(~30-60 s build penalty per swap). ``LTX_DEFAULT_MODE`` (``t2v`` default) picks
+(~30-60 s build penalty per swap). ``LTX_DEFAULT_MODE`` (``i2v`` default) picks
 which side preloads at boot.
 """
 
@@ -632,17 +632,19 @@ class LTXVideoGenerator:
         self._unified_meta: dict = {}
         self._teacache_enabled = False  # set by builders
 
-        # Preload the requested mode at boot. Default `t2v`.
-        default_mode_env = os.getenv("LTX_DEFAULT_MODE", _MODE_T2V).strip().lower()
-        if default_mode_env in ("i2v", "v2v", "unified"):
+        # Preload the requested mode at boot. Default `i2v` (most pods are
+        # I2V-heavy; T2V pods set LTX_DEFAULT_MODE=t2v explicitly).
+        default_mode_env = os.getenv("LTX_DEFAULT_MODE", "i2v").strip().lower()
+        if default_mode_env == "t2v":
+            initial_mode = _MODE_T2V
+        elif default_mode_env in ("i2v", "v2v", "unified", ""):
             initial_mode = _MODE_UNIFIED
         else:
-            initial_mode = _MODE_T2V
-        if default_mode_env not in ("t2v", "i2v", "v2v", "unified", ""):
             logger.warning(
-                "Unrecognised LTX_DEFAULT_MODE=%r; falling back to t2v",
+                "Unrecognised LTX_DEFAULT_MODE=%r; falling back to i2v",
                 default_mode_env,
             )
+            initial_mode = _MODE_UNIFIED
         logger.info("Preloading default mode: %s", initial_mode)
         self._ensure_mode(initial_mode)
         logger.info("Pipeline ready.")
