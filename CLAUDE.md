@@ -18,13 +18,20 @@ LTX-2.3 22B BentoML video-generation service. NGC PyTorch 25.06 + FA3 + FP8 scal
 ├── src/                          Application code (≈2.9 kLOC)
 │   ├── __init__.py
 │   ├── upstream.py               ★ ACL — single chokepoint for ltx_core/ltx_pipelines symbols
-│   ├── pipeline.py               LTXVideoGenerator: model load, FP8 rebuild, T2V/I2V/V2V dispatch
+│   ├── pipeline/                 LTXVideoGenerator package — split by scenario
+│   │   ├── __init__.py           re-exports public surface (LTXVideoGenerator, DEFAULT_NEGATIVE_PROMPT, _round_to, _round_frames)
+│   │   ├── core.py               module-level FP8 handoff, shared helpers (probe / scaled_mm policy / audit / stage-2 cleanup), LTXVideoGenerator class (__init__, _ensure_mode, _extras_for, _log_*, generate dispatcher)
+│   │   ├── t2v.py                T2VMixin — _build_t2v + _t2v_generate (TI2VidTwoStagesPipeline path)
+│   │   ├── i2v.py                I2VMixin — _build_unified + _unified_generate + _run_i2v (ICLoraPipeline lifecycle, shared with V2V)
+│   │   ├── v2v.py                V2VMixin — _run_v2v only (build inherited from I2VMixin)
+│   │   └── inputs/               Request-time input materialisers (URL/b64 → tempfile)
+│   │       ├── __init__.py       re-exports materialize_image, derive_dims_from_image, materialize_video
+│   │       ├── image.py          I2V image input (PIL validation, auto-AR dim derivation)
+│   │       └── video.py          V2V reference-video input (lighter validation, ICLora cracks the container)
 │   ├── service.py (../)          (BentoML service, see top-level service.py)
 │   ├── attention_override.py     FA3 enable + AttentionFunction singleton (recompile fix)
 │   ├── compile_override.py       torch.compile config shim for NGC 25.06 (missing flag hasattr-gate)
 │   ├── teacache.py               Opt-in step caching (ENABLE_TEACACHE=1) — DO NOT enable on I2V
-│   ├── image_input.py            I2V conditioning input handler (b64 / URL → tensor)
-│   ├── video_input.py            V2V conditioning input handler
 │   ├── download_models.py        First-boot HF model download (~64 GB)
 │   └── storage.py                Supabase upload + signed URL
 │
@@ -32,7 +39,7 @@ LTX-2.3 22B BentoML video-generation service. NGC PyTorch 25.06 + FA3 + FP8 scal
 │   ├── conftest.py
 │   ├── test_service.py           BentoML endpoints (MockGenerator)
 │   ├── test_pipeline.py
-│   ├── test_image_input.py
+│   ├── test_pipeline_inputs_image.py
 │   ├── test_download_models.py
 │   └── test_storage.py
 │
@@ -177,12 +184,12 @@ GH Actions secrets                  enable_teacache: bool = False
 
 Entrypoints that call `load_dotenv()` (only these two — never library modules):
 
-- `service.py` — top of file, before `from src.pipeline import ...` (load-bearing because `pipeline.py` runs a module-level FP8-mode check at import).
+- `service.py` — top of file, before `from src.pipeline import ...` (load-bearing because `src/pipeline/core.py` runs a module-level FP8-mode check at import).
 - `src/download_models.py` — inside `if __name__ == "__main__":`.
 
 Consumers:
 - 14 fields, all routed through `from src.config import get_settings` (9 `get_settings()` call sites in `src/`, 2 in `service.py`).
-- Only writer to `os.environ` left in the codebase: `pipeline.py:40`'s `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` — that's a torch-allocator handoff, not config reading.
+- Only writer to `os.environ` left in the codebase: `src/pipeline/core.py`'s module-level `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` — that's a torch-allocator handoff, not config reading.
 
 ## Rules
 
@@ -205,13 +212,13 @@ BentoML's `@bentoml.api` and `@bentoml.task` route sync handlers to a thread poo
 
 | Site | Call | Type | Severity | Recommendation |
 |---|---|---|---|---|
-| `src/image_input.py:87` | `httpx.get(image_url, ...)` | sync HTTP, up to 50 MB / 30 s | **High** | switch to `httpx.AsyncClient` + `async def materialize_image` |
-| `src/video_input.py:44` | `httpx.get(reference_video_url, ...)` | sync HTTP, up to 200 MB / 60 s | **High** | switch to `httpx.AsyncClient` + `async def materialize_video` |
+| `src/pipeline/inputs/image.py` (`_fetch_url`) | `httpx.get(image_url, ...)` | sync HTTP, up to 50 MB / 30 s | **High** | switch to `httpx.AsyncClient` + `async def materialize_image` |
+| `src/pipeline/inputs/video.py` (`_fetch_url`) | `httpx.get(reference_video_url, ...)` | sync HTTP, up to 200 MB / 60 s | **High** | switch to `httpx.AsyncClient` + `async def materialize_video` |
 | `src/storage.py:53-58` | `open(...)` + `client.storage.from_(b).upload(f)` | sync file read + sync Supabase SDK | **Medium** | wrap upload in `asyncio.to_thread(...)` (Supabase Python SDK is sync); use `aiofiles` for the read or pass bytes directly |
 | `src/storage.py:66-69` | `client.storage.create_signed_url(...)` | sync Supabase SDK | **Medium** | same — `asyncio.to_thread` |
-| `src/pipeline.py:187` | `safe_open(path, framework="pt")` (model load) | sync, multi-GB | Low (boot-time only) | leave — runs once in `__init__` |
-| `src/image_input.py:65,70,179` | `Image.open(...)` | sync, ms | Low | leave |
-| `src/pipeline.py` (generation) | torch CUDA work | GPU-bound | Low | leave — wrap the whole `generator.generate(...)` call in `asyncio.to_thread` from the handler instead of trying to make CUDA async |
+| `src/pipeline/core.py` (`_probe_fp8_exclusions`) | `safe_open(path, framework="pt")` (model load) | sync, multi-GB | Low (boot-time only) | leave — runs once in `__init__` |
+| `src/pipeline/inputs/image.py` (`_validate_image_bytes`, `derive_dims_from_image`) | `Image.open(...)` | sync, ms | Low | leave |
+| `src/pipeline/{t2v,i2v}.py` (generation) | torch CUDA work | GPU-bound | Low | leave — wrap the whole `generator.generate(...)` call in `asyncio.to_thread` from the handler instead of trying to make CUDA async |
 | `service.py:75, 131` | `def generate(...)`, `def generate_sync(...)` | sync handler | Medium | convert to `async def`, call `result = await asyncio.to_thread(self.generator.generate, **kwargs)` so HTTP downloads + GPU run can interleave with other requests |
 | `service.py:122` | `os.remove(result["output_path"])` | sync, ms | Low | leave |
 
@@ -230,5 +237,5 @@ BentoML's `@bentoml.api` and `@bentoml.task` route sync handlers to a thread poo
 
 0. ✓ **Shipped on `feature/fp8-h100-image-input-support`** — `src/config.py` + `python-dotenv` replaced every `os.getenv` site; `load_dotenv()` lives only in the two entrypoints.
 1. Convert `service.py` handlers to `async def` + `asyncio.to_thread` for `generator.generate(...)` and `storage.upload_video(...)`.
-2. Convert `image_input.py` / `video_input.py` to `httpx.AsyncClient` and `async def materialize_*`. Update callers.
+2. Convert `src/pipeline/inputs/image.py` / `video.py` to `httpx.AsyncClient` and `async def materialize_*`. Update callers.
 3. Re-run pytest (mock the async client) and the Maya I2V end-to-end on a pod. SHA256 should match within transcoder noise.
