@@ -611,6 +611,16 @@ class LTXVideoGenerator:
             from src.attention_override import enable_flash_attention_3
             enable_flash_attention_3()
 
+        # Compatibility shim: upstream `compile_transformer` patches a
+        # PyTorch 2.8+ inductor flag (`unsafe_skip_cache_dynamic_shape_guards`)
+        # that does not exist on the NGC 25.06 PyTorch pin. Without the shim
+        # the first compiled forward crashes before running. Idempotent —
+        # one boot-time install covers `_build_t2v`, `_build_unified`, and
+        # every cross-mode rebuild.
+        if self._torch_compile_enabled:
+            from src.compile_override import enable_compile_config_shim
+            enable_compile_config_shim()
+
         # Shared TilingConfig helpers (optional).
         self._TilingConfig = None
         self._get_video_chunks_number = None
