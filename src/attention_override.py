@@ -1,33 +1,22 @@
-"""FlashAttention 3 enablement + AttentionFunction singleton-cache for LTX-2.3.
+"""FA3 enablement + AttentionFunction singleton-cache.
 
-Two patches live here, both targeting ``ltx_core.model.transformer.attention``:
+Two patches on ``ltx_core.model.transformer.attention``:
 
-1. ``enable_flash_attention_3()`` — patches the model configurator so every
-   ``Attention`` module routes through the FA3 wrapper, plus a defensive SDPA
-   fallback for any non-None mask.
+  * ``enable_flash_attention_3()`` — routes every ``Attention`` module
+    through the FA3 wrapper; falls back to SDPA if a non-None mask appears.
+    Static trace shows masks are always None on T2V/I2V/V2V, so the
+    fallback is insurance — if its log fires, FA3's fast path is silently
+    being skipped and needs investigation.
+  * ``enable_attention_callable_singleton()`` — memoises
+    ``AttentionFunction.to_callable()`` so per-block ``attention_function``
+    is id-stable across transformer rebuilds. Without this, every rebuild
+    builds fresh callables, the Dynamo ``___check_obj_id`` guard fails on
+    every block (47 × 2 × N rebuilds), the default
+    ``accumulated_recompile_limit=256`` blows after ~3 jobs and Dynamo
+    falls back to eager — the 2026-05-01 P3/P4 latency regression.
 
-2. ``enable_attention_callable_singleton()`` — memoises
-   ``AttentionFunction.to_callable()`` so the resolved callable is
-   id-stable across transformer rebuilds. Without this, every per-job
-   rebuild gives every ``Attention`` module a freshly-constructed
-   ``FlashAttention3()`` (or whichever) instance, which makes the Dynamo
-   guard ``___check_obj_id(self._modules['attn1'].attention_function, ...)``
-   fail and forces a full recompile. With 47 blocks × 2 attentions per
-   block × N rebuilds, the ``accumulated_recompile_limit`` (default 256)
-   gets exhausted after ~3 jobs and Dynamo falls back to eager — the
-   smoking gun in the 2026-05-01 P3/P4 latency report.
-
-Both are stateless callables (no instance state held), so sharing one
-instance across every Attention module is semantically identical to
-per-module instantiation.
-
-Static trace of the 22B AV pipeline confirmed every attention call site
-receives ``mask=None`` for normal text-to-video inputs (Gemma's
-attention_mask is produced but immediately discarded in
-``TI2VidTwoStagesPipeline.__call__``, and ``modality_from_latent_state``
-hardcodes ``context_mask=None``). The mask-fallback is insurance against
-future pipeline variants — if the first-call log line fires, FA3's fast
-path is not being taken on every layer and we need to investigate.
+Both callables are stateless, so a single shared instance is equivalent
+to per-module instantiation.
 """
 
 import logging
@@ -71,16 +60,11 @@ def enable_flash_attention_3() -> None:
 
 
 def enable_attention_callable_singleton() -> None:
-    """Memoise ``AttentionFunction.to_callable`` so every Attention module
-    binds the same callable instance per enum value.
+    """Memoise ``AttentionFunction.to_callable`` per enum value. Idempotent.
 
-    Idempotent. Must run BEFORE ``TI2VidTwoStagesPipeline`` lazily builds
-    any transformer (i.e. before the first ``__call__``).
-
-    The fix is the dominant lever against torch.compile recompile thrash
-    on this stack: with id-stable ``attention_function``, the per-block
-    Dynamo guard hits across rebuilds and the compile cache survives the
-    per-job ``gpu_model() -> meta-device`` lifecycle.
+    Must run BEFORE the first transformer build. Dominant lever against
+    torch.compile recompile thrash — id-stable ``attention_function``
+    keeps the Dynamo obj_id guard hitting across per-job rebuilds.
     """
     global _singleton_applied
     if _singleton_applied:

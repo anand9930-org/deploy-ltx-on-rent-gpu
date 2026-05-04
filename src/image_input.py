@@ -1,15 +1,7 @@
-"""Materialize caller-supplied images to a temp-file path for I2V.
-
-The upstream ``ICLoraPipeline`` accepts ``images: list[ImageConditioningInput]``,
-where each entry is ``(path, frame_idx, strength, crf)``. We accept the image
-either as a public URL or as base64-encoded bytes embedded in the JSON body
-and produce a path that upstream's ``decode_image`` can read directly.
-
-Validation is strict: the only way a request reaches the GPU is if the bytes
-parse as a real PIL image in a supported format. Caller mistakes (oversize
-body, wrong content type, truncated bytes, both inputs set, neither set) raise
-``ValueError`` synchronously so the task fails fast at the BentoML layer
-rather than burning GPU time and surfacing as an obscure pipeline crash.
+"""Materialize caller-supplied images (URL or base64) to a tempfile path for
+``ICLoraPipeline``'s ``ImageConditioningInput``. Strict validation — bad
+bytes / oversize / wrong content type raise ``ValueError`` synchronously so
+the task fails at the BentoML layer, not deep in the pipeline.
 """
 
 from __future__ import annotations
@@ -56,11 +48,8 @@ def _round_to_grid(value: int) -> int:
 
 
 def _validate_image_bytes(blob: bytes) -> str:
-    """Return the PIL ``.format`` string after a verify+reopen round-trip.
-
-    ``Image.verify()`` consumes the file object and invalidates the Image
-    instance, so we open twice: first to verify, second to read ``.format``.
-    """
+    """Verify the bytes decode as a supported image and return PIL's
+    ``.format``. Opens twice because ``verify()`` invalidates the Image."""
     try:
         with Image.open(BytesIO(blob)) as probe:
             probe.verify()
@@ -135,14 +124,10 @@ def materialize_image(
     image_url: str | None,
     image_b64: str | None,
 ) -> str:
-    """Resolve caller input to a tempfile path with verified image bytes.
-
-    Exactly one of ``image_url`` or ``image_b64`` must be set. The returned
-    path has a suffix matching the detected format (.jpg/.png/.webp) so
-    upstream's ``decode_image`` (which keys off the extension in some paths)
-    sees the right thing. The caller is responsible for ``os.unlink``-ing the
-    path in a ``finally:`` block once the pipeline has consumed it.
-    """
+    """Return a tempfile path holding verified image bytes. Exactly one of
+    ``image_url`` / ``image_b64`` must be set. Suffix matches detected format
+    (upstream's ``decode_image`` keys off extension). Caller must
+    ``os.unlink`` the path."""
     if image_url is not None and image_b64 is not None:
         raise ValueError("supply at most one of image_url / image_b64, not both")
     if image_url is None and image_b64 is None:
@@ -166,16 +151,10 @@ def materialize_image(
 
 
 def derive_dims_from_image(image_path: str) -> tuple[int, int]:
-    """Return (width, height) for the auto-AR case.
-
-    Scales DOWN so the longest input dimension lands at most MAX_SIDE
-    (1920); never upscales — upscaling a small input only forces the VAE
-    to interpolate the same information into more pixels, producing a
-    blurry first frame and wasting VRAM. Both dims are then floor-rounded
-    to the 64-grid that the LTX latent stride requires (matching
-    ``_round_user_inputs`` so the dim is stable through downstream
-    rounding), and the shorter side is clamped to MIN_SIDE (256).
-    """
+    """Return (width, height) for the auto-AR case. Scales DOWN to fit
+    longest side ≤ MAX_SIDE (never upscales — VAE-interpolating a small
+    input wastes VRAM and blurs frame 1), then floor-rounds to the 64-grid
+    and clamps short side to MIN_SIDE."""
     with Image.open(image_path) as im:
         iw, ih = im.size
     if iw <= 0 or ih <= 0:

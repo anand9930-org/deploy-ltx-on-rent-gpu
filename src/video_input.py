@@ -1,13 +1,7 @@
-"""Materialize caller-supplied reference videos to a tempfile path for V2V.
-
-Upstream's ``ICLoraPipeline`` accepts ``video_conditioning: list[tuple[str, float]]``,
-where the str is a filesystem path. We accept the video as a public URL or as
-base64-encoded bytes embedded in the JSON body and produce a path that
-upstream's ``decode_video_by_frame`` can read directly.
-
-Validation is lighter than ``image_input`` because PIL doesn't decode video;
-we don't crack the container open here. We trust upstream to surface a clean
-error if the bytes aren't a valid video.
+"""Materialize caller-supplied reference videos (URL or base64) to a tempfile
+path for ``ICLoraPipeline``'s ``video_conditioning``. Lighter validation
+than ``image_input`` — we don't crack the container; upstream's
+``decode_video_by_frame`` surfaces format errors.
 """
 
 from __future__ import annotations
@@ -106,12 +100,9 @@ def materialize_video(
     reference_video_url: str | None,
     reference_video_b64: str | None,
 ) -> str:
-    """Resolve caller input to a tempfile path holding the video bytes.
-
-    Exactly one of ``reference_video_url`` or ``reference_video_b64`` must be
-    set. The caller is responsible for ``os.unlink``-ing the returned path
-    in a ``finally:`` block once the pipeline has consumed it.
-    """
+    """Return a tempfile path holding the video bytes. Exactly one of
+    ``reference_video_url`` / ``reference_video_b64`` must be set. Caller
+    must ``os.unlink`` the path."""
     if reference_video_url is not None and reference_video_b64 is not None:
         raise ValueError(
             "supply at most one of reference_video_url / reference_video_b64, not both"

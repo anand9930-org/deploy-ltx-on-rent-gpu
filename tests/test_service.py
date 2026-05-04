@@ -8,10 +8,6 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
-from tests.conftest import MockGenerator
-
 
 def _run_generate(mock_gen, **kwargs):
     """Simulate what LTXVideoService.generate() does, without BentoML."""

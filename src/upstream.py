@@ -1,48 +1,26 @@
-"""Anti-corruption layer for the upstream Lightricks/LTX-2 packages.
+"""Anti-corruption layer for ``ltx_core`` / ``ltx_pipelines``.
 
-This is the ONE file in this codebase that imports directly from
-``ltx_core`` and ``ltx_pipelines``. Everything else in ``src/`` consumes
-upstream symbols via ``from src.upstream import X``.
+The single chokepoint: every upstream symbol in this codebase is imported
+here, then re-exported via ``from src.upstream import X``. When upstream
+renames a path the diff is bounded to this file. The Dockerfile runs
+``python -c "import src.upstream"`` so a rename fails the build, not a
+generation.
 
-Why a single chokepoint:
+Three import styles, each load-bearing:
 
-  * Upstream ``main`` moves often. When a class is renamed or a module
-    path changes, the diff to absorb that rename is bounded to this file
-    instead of fanning out across the codebase.
-  * The pinned ``LTX2_UPSTREAM_SHA`` in ``Dockerfile`` plus this file
-    define our exact contract surface with upstream — what's listed here
-    is what we depend on; anything not listed we're free of.
-
-Three import styles are used, picked deliberately per symbol.
-
-Style 1 — class / constant re-exports
-    ``from upstream.module import Cls`` is fine when consumers either
-    instantiate ``Cls`` or patch one of its METHODS. Patching a class
-    method mutates the class object in place, so every previously-imported
-    reference to that class sees the patched method automatically.
-
-Style 2 — module references (``import upstream.module as ltx_X``)
-    Required when an override module reassigns a MODULE-LEVEL attribute
-    on the upstream module (e.g. ``compile_override`` reassigns
-    ``ltx_core.model.transformer.compiling.compile_transformer`` and
-    ``COMPILE_TRANSFORMER``). With ``from X import Y``, the local name
-    ``Y`` is bound at import time and a later ``X.Y = ...`` reassignment
-    is invisible to it. Going through a module reference (``X.Y``) reads
-    the attribute lazily at call time, so the patch is visible.
-
-Style 3 — optional symbols (try/except + ``HAS_*`` flag)
-    Used for symbols that may legitimately not exist on a given pinned
-    upstream SHA. Importers gate on the ``HAS_*`` flag.
-
-If any Style-1 or Style-2 import fails, this module raises at import
-time. That failure surfaces in the Docker build (see the
-``python -c "import src.upstream"`` line in the Dockerfile) rather than
-30 minutes into a generation as a cryptic ``AttributeError`` deep in a
-pipeline call.
+  Style 1 — direct class/const re-export (``from X import Cls``).
+            Safe when consumers instantiate or method-patch ``Cls``;
+            method patches mutate the class in place.
+  Style 2 — module reference (``import X as ltx_X``). REQUIRED when an
+            override reassigns a module-level attribute (e.g.
+            ``compile_override`` reassigns ``ltx_compiling.compile_transformer``).
+            ``from X import Y`` would bind ``Y`` at import time and miss
+            later reassignments.
+  Style 3 — optional symbol (try/except + ``HAS_*`` flag). For symbols
+            that may legitimately be absent on a given pinned SHA.
 """
 
-# === Style 2 — module references (load-bearing for module-level patches
-# in src/compile_override.py and attribute access in src/pipeline.py) ===
+# === Style 2 — module references (module-level patch targets) ===
 
 from ltx_core.model.transformer import compiling as ltx_compiling
 from ltx_core.model.transformer import attention as ltx_attention
@@ -54,8 +32,7 @@ except ImportError:  # pragma: no cover — defensive; ltx_pipelines should be i
     ltx_blocks = None
 
 
-# === Style 1 — class / constant re-exports (safe under method-level
-# monkey-patching; class objects are mutated in place) ===
+# === Style 1 — class / constant re-exports ===
 
 from ltx_core.model.transformer.attention import AttentionFunction, FlashAttention3
 from ltx_core.model.transformer import LTXModel
@@ -81,7 +58,7 @@ from ltx_pipelines.utils.types import OffloadMode
 from ltx_pipelines.utils.args import ImageConditioningInput
 
 
-# === Style 3 — optional symbols (gated by HAS_* flag) ===
+# === Style 3 — optional symbols (gated by HAS_*) ===
 
 try:
     from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -97,3 +74,23 @@ try:
 except ImportError:
     MultiModalGuiderParams = None
     HAS_GUIDERS = False
+
+
+# Explicit public surface — declares every re-export as intentional so
+# ruff F401 / mypy don't flag them and downstream `from src.upstream import X`
+# is the documented contract.
+__all__ = [
+    # Style 2 — module references
+    "ltx_compiling", "ltx_attention", "ltx_model_configurator", "ltx_blocks",
+    # Style 1 — class / constant re-exports
+    "AttentionFunction", "FlashAttention3", "LTXModel",
+    "LTXV_LORA_COMFY_RENAMING_MAP", "LoraPathStrengthAndSDOps", "StateDictRegistry",
+    "ModuleOps", "KeyValueOperationResult", "SDOps",
+    "QuantizationPolicy",
+    "FP8_PREPARE_MODULE_OPS", "FP8_TRANSPOSE_SD_OPS", "FP8Linear", "_linear_to_fp8linear",
+    "TI2VidTwoStagesPipeline", "ICLoraPipeline", "DiffusionStage",
+    "encode_video", "OffloadMode", "ImageConditioningInput",
+    # Style 3 — optional symbols (gated by HAS_* flags)
+    "TilingConfig", "get_video_chunks_number", "HAS_TILING",
+    "MultiModalGuiderParams", "HAS_GUIDERS",
+]
