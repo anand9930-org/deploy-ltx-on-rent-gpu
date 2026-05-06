@@ -16,9 +16,10 @@ class MockGenerator:
     Records the last call's kwargs on ``last_call`` so tests can assert that
     ``image_url`` / ``image_b64`` / ``reference_video_url`` / dims were
     passed through correctly. Echoes the same ``parameters`` block shape the
-    real generator emits, including the ``mode`` discriminator and
-    IC-LoRA-specific fields (``reference_downscale_factor``,
-    ``reference_video_strength``, ``conditioning_attention_strength``).
+    real generator emits, including the ``mode`` discriminator. IC-LoRA
+    fields (``reference_downscale_factor``, ``reference_video_strength``,
+    ``conditioning_attention_strength``) appear only on the I2V/V2V branch
+    — A2V is vanilla and does not emit them.
     """
 
     def __init__(self) -> None:
@@ -65,9 +66,6 @@ class MockGenerator:
                 "cfg_scale": kwargs.get("cfg_scale", 3.0),
                 "stg_scale": kwargs.get("stg_scale", 1.0),
                 "rescale_scale": kwargs.get("rescale_scale", 0.7),
-                "reference_downscale_factor": 2,
-                "reference_video_strength": kwargs.get("reference_video_strength", 1.0),
-                "conditioning_attention_strength": kwargs.get("conditioning_attention_strength", 1.0),
                 "enhance_prompt": kwargs.get("enhance_prompt", False),
             }
         elif mode == "t2v":

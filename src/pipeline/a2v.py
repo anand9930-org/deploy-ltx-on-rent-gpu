@@ -1,9 +1,19 @@
-"""A2V scenario: build + run for ``A2VidPipelineTwoStage`` with IC-LoRA.
+"""A2V scenario: build + run for vanilla ``A2VidPipelineTwoStage``.
 
-Combines frozen external audio conditioning (consistent voice via TTS,
-natural lipsync) with IC-LoRA ``VideoConditionByReferenceLatent`` (strong
-image fidelity). The two conditioning mechanisms operate on separate
-transformer streams and do not compete for attention budget.
+Frozen external audio conditioning (consistent voice via TTS, natural
+lipsync) + frame-0 image pin via ``VideoConditionByLatentIndex``. Identity
+propagates to subsequent frames through transformer self-attention from
+the pinned frame-0 latent — same mechanism as I2V.
+
+We previously layered IC-LoRA's ``VideoConditionByReferenceLatent`` on
+top of A2V to strengthen identity. An empirical sweep on
+``ref_strength × attn_strength ∈ {(0.5,0.5),(0.3,0.3)}`` confirmed the
+combination kills audio-driven motion at every tested setting (face
+frozen after the first second, PSNR > 42 dB between consecutive seconds);
+LTX-2.3 was not trained on dual conditioning and the reference tokens
+dominate self-attention regardless of how aggressively we tune the dials.
+For stronger identity we will layer a face-restoration post-process on
+top of vanilla A2V instead.
 
 Mixin holds ``_build_a2v`` (boot/rebuild) and ``_a2v_generate`` (per-call
 materialise → denoise → encode). Methods reach into the shared instance
@@ -18,19 +28,7 @@ import uuid
 
 import torch
 
-from safetensors import safe_open
-
 logger = logging.getLogger(__name__)
-
-
-def _read_lora_reference_downscale_factor(lora_path: str) -> int:
-    try:
-        with safe_open(lora_path, framework="pt") as f:
-            metadata = f.metadata() or {}
-            return int(metadata.get("reference_downscale_factor", 1))
-    except Exception as e:
-        logger.warning("Failed to read metadata from LoRA file %r: %s", lora_path, e)
-        return 1
 
 
 class A2VMixin:
@@ -38,9 +36,9 @@ class A2VMixin:
     ``LTXVideoGenerator`` via multiple inheritance."""
 
     def _build_a2v(self) -> None:
-        """Build ``A2VidPipelineTwoStage`` with IC-LoRA: dev checkpoint
-        (audio conditioning calibrated) + IC-LoRA weights (strong image
-        reference). FP8 quantisation follows the T2V/I2V pattern."""
+        """Build vanilla ``A2VidPipelineTwoStage``: dev checkpoint (audio
+        conditioning calibrated) + distilled LoRA on stage 2. FP8
+        quantisation follows the T2V/I2V pattern."""
         from src.pipeline.core import (
             _build_scaled_mm_policy,
             _install_build_transformer_audit,
@@ -57,7 +55,6 @@ class A2VMixin:
         for label, path in (
             ("dev BF16", self._dev_bf16_path),
             ("spatial upsampler", self._spatial_upsampler_path),
-            ("IC-LoRA", self._ic_lora_path),
         ):
             if not os.path.exists(path):
                 raise RuntimeError(
@@ -134,28 +131,12 @@ class A2VMixin:
         else:
             distilled_lora = []
 
-        ic_lora = [
-            LoraPathStrengthAndSDOps(
-                path=self._ic_lora_path,
-                strength=1.0,
-                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
-            ),
-        ]
-
-        reference_downscale_factor = _read_lora_reference_downscale_factor(
-            self._ic_lora_path
-        )
-        logger.info(
-            "A2V IC-LoRA: %s (reference_downscale_factor=%d)",
-            os.path.basename(self._ic_lora_path), reference_downscale_factor,
-        )
-
         pipeline_kwargs = dict(
             checkpoint_path=self._dev_bf16_path,
             distilled_lora=distilled_lora,
             spatial_upsampler_path=self._spatial_upsampler_path,
             gemma_root=self._gemma_root,
-            loras=ic_lora,
+            loras=[],
             offload_mode=offload_mode,
         )
         if quantization is not None:
@@ -180,7 +161,7 @@ class A2VMixin:
                 checkpoint_path=self._dev_fp8_path,
                 dtype=self._pipeline.dtype,
                 device=self._pipeline.device,
-                loras=tuple(ic_lora),
+                loras=(),
                 quantization=quantization_dev,
                 registry=None,
                 torch_compile=pipeline_kwargs.get("torch_compile", False),
@@ -206,7 +187,7 @@ class A2VMixin:
                 time.perf_counter() - _t2,
             )
             logger.info(
-                "A2V scaled_mm: stage_1 → %s (+IC-LoRA), stage_2 → %s",
+                "A2V scaled_mm: stage_1 → %s, stage_2 → %s",
                 os.path.basename(self._dev_fp8_path),
                 os.path.basename(self._distilled_fp8_path),
             )
@@ -215,8 +196,6 @@ class A2VMixin:
 
         if offload_mode != OffloadMode.NONE:
             _install_stage2_cleanup_hook(self._pipeline)
-
-        self._unified_meta["reference_downscale_factor"] = reference_downscale_factor
 
         from src.upstream import HAS_GUIDERS, MultiModalGuiderParams
         self._MultiModalGuiderParams = MultiModalGuiderParams if HAS_GUIDERS else None
@@ -236,28 +215,20 @@ class A2VMixin:
         cfg_scale: float, stg_scale: float, rescale_scale: float,
         audio_path: str,
         image_path: str,
-        reference_video_strength: float,
-        conditioning_attention_strength: float,
         enhance_prompt: bool,
         tiling_config,
     ):
-        """Call the A2Vid pipeline with frozen audio + IC-LoRA image ref.
+        """Call the A2Vid pipeline with frozen audio + frame-0 image pin.
 
-        Uses the same image for both the standard A2Vid frame-0 pin
-        (``VideoConditionByLatentIndex``) and the IC-LoRA reference
-        (``VideoConditionByReferenceLatent``). The IC-LoRA conditioning
-        is injected into Stage 1 only, matching ``ICLoraPipeline``'s
-        pattern.
+        Identity is anchored at frame 0 via ``VideoConditionByLatentIndex``
+        (``combined_image_conditionings`` inside upstream). It propagates
+        to subsequent frames through transformer self-attention — same
+        pattern I2V uses. Audio drives motion via the
+        ``MultiModalGuider`` cross-modal stream.
         """
-        from src.upstream import (
-            A2VidPipelineTwoStage,
-            VideoConditionByReferenceLatent,
-            ConditioningItemAttentionStrengthWrapper,
-            HAS_GUIDERS,
-        )
+        from src.upstream import A2VidPipelineTwoStage
 
         pipeline: A2VidPipelineTwoStage = self._pipeline
-        ref_downscale = self._unified_meta.get("reference_downscale_factor", 1)
 
         video_guider_params = None
         if self._MultiModalGuiderParams is not None:
@@ -276,91 +247,24 @@ class A2VMixin:
         from src.upstream import ImageConditioningInput
         images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
 
-        # --- IC-LoRA injection via image_conditioner wrapper ---
-        #
-        # A2VidPipelineTwoStage.__call__ calls self.image_conditioner(fn)
-        # twice: once for Stage 1, once for Stage 2. We wrap the
-        # image_conditioner to intercept the first call (Stage 1) and
-        # append VideoConditionByReferenceLatent conditionings. Stage 2
-        # gets standard conditionings only (matching ICLoraPipeline).
-        original_ic = pipeline.image_conditioner
-
-        class _ICLoRAConditionerWrapper:
-            """Wraps ImageConditioner to add IC-LoRA reference tokens on
-            the first call (Stage 1) only."""
-
-            def __init__(self, original, img_path, dsf, strength, attn_strength):
-                self._original = original
-                self._img_path = img_path
-                self._dsf = dsf
-                self._strength = strength
-                self._attn_strength = attn_strength
-                self._call_count = 0
-
-            def __call__(self, fn):
-                self._call_count += 1
-                if self._call_count == 1:
-                    img_path = self._img_path
-                    dsf = self._dsf
-                    strength = self._strength
-                    attn_strength = self._attn_strength
-
-                    def enhanced_fn(enc):
-                        conditionings = fn(enc)
-                        from src.upstream import decode_video_by_frame, video_preprocess
-                        frame_gen = decode_video_by_frame(
-                            path=img_path,
-                            frame_cap=num_frames,
-                            device=pipeline.device,
-                        )
-                        ref_h = height // (2 * dsf) if dsf != 1 else height // 2
-                        ref_w = width // (2 * dsf) if dsf != 1 else width // 2
-                        video_tensor = video_preprocess(
-                            frame_gen, ref_h, ref_w,
-                            pipeline.dtype, pipeline.device,
-                        )
-                        encoded_ref = enc(video_tensor)
-                        cond = VideoConditionByReferenceLatent(
-                            latent=encoded_ref,
-                            downscale_factor=dsf,
-                            strength=strength,
-                        )
-                        if attn_strength < 1.0:
-                            cond = ConditioningItemAttentionStrengthWrapper(
-                                cond, attention_mask=attn_strength,
-                            )
-                        conditionings.append(cond)
-                        return conditionings
-
-                    return self._original(enhanced_fn)
-                return self._original(fn)
-
-        pipeline.image_conditioner = _ICLoRAConditionerWrapper(
-            original_ic, image_path, ref_downscale,
-            reference_video_strength, conditioning_attention_strength,
+        call_kwargs = dict(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            video_guider_params=video_guider_params,
+            images=images,
+            audio_path=audio_path,
+            enhance_prompt=enhance_prompt,
+            max_batch_size=1,
         )
-
-        try:
-            call_kwargs = dict(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                seed=seed,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                num_inference_steps=num_inference_steps,
-                video_guider_params=video_guider_params,
-                images=images,
-                audio_path=audio_path,
-                enhance_prompt=enhance_prompt,
-                max_batch_size=1,
-            )
-            if tiling_config is not None:
-                call_kwargs["tiling_config"] = tiling_config
-            return pipeline(**call_kwargs)
-        finally:
-            pipeline.image_conditioner = original_ic
+        if tiling_config is not None:
+            call_kwargs["tiling_config"] = tiling_config
+        return pipeline(**call_kwargs)
 
     # ------------------------------------------------------------------
     # Full generate flow (materialise → denoise → encode → result dict)
@@ -375,8 +279,6 @@ class A2VMixin:
         cfg_scale: float, stg_scale: float, rescale_scale: float,
         audio_url: str | None, audio_b64: str | None,
         image_url: str | None, image_b64: str | None,
-        reference_video_strength: float,
-        conditioning_attention_strength: float,
         enhance_prompt: bool,
     ) -> dict:
         from src.pipeline.core import _round_user_inputs
@@ -408,15 +310,11 @@ class A2VMixin:
 
             audio_src = "audio_url" if audio_url is not None else "audio_b64"
             image_src = "image_url" if image_url is not None else "image_b64"
-            ref_downscale = self._unified_meta.get("reference_downscale_factor")
             logger.info(
                 "Job %s: A2V (audio_src=%s, image_src=%s) "
-                "prompt=%r, %dx%d, %d frames, %d steps, seed=%d, "
-                "ref_strength=%.2f, attn_strength=%.2f, ref_downscale=%s",
+                "prompt=%r, %dx%d, %d frames, %d steps, seed=%d",
                 job_id, audio_src, image_src, prompt[:80],
                 width, height, num_frames, num_inference_steps, seed,
-                reference_video_strength, conditioning_attention_strength,
-                ref_downscale,
             )
 
             tiling_config = None
@@ -446,8 +344,6 @@ class A2VMixin:
                 rescale_scale=rescale_scale,
                 audio_path=audio_path,
                 image_path=image_path,
-                reference_video_strength=reference_video_strength,
-                conditioning_attention_strength=conditioning_attention_strength,
                 enhance_prompt=enhance_prompt,
                 tiling_config=tiling_config,
             )
@@ -488,9 +384,6 @@ class A2VMixin:
                     "frame_rate": frame_rate,
                     "cfg_scale": cfg_scale, "stg_scale": stg_scale,
                     "rescale_scale": rescale_scale,
-                    "reference_downscale_factor": ref_downscale,
-                    "reference_video_strength": reference_video_strength,
-                    "conditioning_attention_strength": conditioning_attention_strength,
                     "enhance_prompt": enhance_prompt,
                 },
             }

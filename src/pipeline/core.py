@@ -475,7 +475,7 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 # Modes that the dispatcher recognises. Internal — do not expose to the wire.
 _MODE_T2V = "t2v"
 _MODE_UNIFIED = "unified"  # serves I2V + V2V via ICLoraPipeline
-_MODE_A2V = "a2v"          # serves A2V via A2VidPipelineTwoStage + IC-LoRA
+_MODE_A2V = "a2v"          # serves A2V via vanilla A2VidPipelineTwoStage
 
 
 class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, A2VMixin):
@@ -738,7 +738,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, A2VMixin):
             if has_ref_video:
                 logger.warning(
                     "A2V mode selected (audio present); reference_video_url/b64 "
-                    "will be ignored. Use image_url for IC-LoRA reference conditioning.",
+                    "will be ignored. A2V uses frame-0 image pin only — "
+                    "supply image_url/image_b64 for the identity anchor.",
                 )
         elif has_image or has_ref_video:
             target_mode = _MODE_UNIFIED
@@ -755,8 +756,6 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, A2VMixin):
                 stg_scale=stg_scale, rescale_scale=rescale_scale,
                 audio_url=audio_url, audio_b64=audio_b64,
                 image_url=image_url, image_b64=image_b64,
-                reference_video_strength=reference_video_strength,
-                conditioning_attention_strength=conditioning_attention_strength,
                 enhance_prompt=enhance_prompt,
             )
         if target_mode == _MODE_T2V:
