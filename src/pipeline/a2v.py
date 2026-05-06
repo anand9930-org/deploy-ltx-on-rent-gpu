@@ -273,7 +273,8 @@ class A2VMixin:
                 "Check upstream SHA compatibility."
             )
 
-        images = [(image_path, 0, 1.0)]
+        from src.upstream import ImageConditioningInput
+        images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
 
         # --- IC-LoRA injection via image_conditioner wrapper ---
         #
