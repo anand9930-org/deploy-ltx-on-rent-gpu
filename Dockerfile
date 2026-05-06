@@ -66,11 +66,9 @@ RUN sed -i '/^anyio/d' /etc/pip/constraint.txt
 #    companion `torch==<exact>` pin that would force uv to replace NGC's
 #    NVIDIA-patched torch 2.8.0a0+...nv25.6 with stock PyPI torch — which
 #    breaks NGC torchvision's ABI (`torchvision::nms` op fails to register,
-#    bombing `transformers.AutoImageProcessor` at import). Our service is
-#    video-only (audio_guider_params is None on every request), so the
-#    audio_vae code path that touches torchaudio APIs is unreachable. A
-#    pure-Python stub is dropped into site-packages further down satisfies
-#    the `import torchaudio` at module load.
+#    bombing `transformers.AutoImageProcessor` at import). We DO need real
+#    torchaudio for A2V audio encoding (MelSpectrogram + resample), so it's
+#    installed separately with `--no-deps` further down to sidestep the pin.
 # Pin upstream LTX-2 to a known-good commit. Bumping is a one-line ARG
 # change — see docs/upstream-bump.md when that runbook lands. Without
 # this pin, every rebuild silently captures whatever upstream pushed to
@@ -125,43 +123,82 @@ RUN if [ "${FA3_WHEEL_URL}" = "__SET_BY_BUILD_FA3_WHEEL_SH__" ] \
         print('FA3 wheel installed OK:', v)" \
     && rm -f "${FA3_WHEEL_FILE}"
 
-# ---- Pure-Python torchaudio stub -------------------------------------------
-# ltx-core's audio_vae module does `import torchaudio` at module load time
-# (ops.py:2) even though the class instantiation (`MelSpectrogram(...)`) and
-# function calls (`torchaudio.functional.resample`) are lazy and only fire
-# when an audio generation is requested. Since our service never passes
-# `audio_guider_params`, those APIs are never hit — but the top-level import
-# still needs to succeed or every pipeline load fails.
+# ---- Real torchaudio (--no-deps + C++ ext bypass) --------------------------
+# ltx-core's audio_vae needs torchaudio.transforms.MelSpectrogram and
+# torchaudio.functional.resample for the A2V audio encoding path. Two
+# obstacles, both keyed off NGC's torch fork (2.8.0a0+nv25.6):
 #
-# We don't install the real torchaudio (see rationale in the two-sed block
-# above). Instead, write a minimal pure-Python package that has the right
-# import surface. If anything ever reaches the NotImplementedError, we want
-# a loud failure rather than a silent wrong-result.
-RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
-    && mkdir -p "$SITE/torchaudio" \
+# 1. uv resolution: every PyPI torchaudio release declares a strict
+#    `torch==<exact>` pin that would replace NGC's NVIDIA-patched torch
+#    (see the two-sed rationale above). `--no-deps` sidesteps this.
+#
+# 2. C++ extension ABI: PyPI torchaudio's `libtorchaudio.so` links the
+#    two-arg `c10::cuda::SetDevice(int8_t, bool)` symbol that NGC's torch
+#    lacks (same root cause as FA3 — see docs/fa3-wheel-process.md). At
+#    `import torchaudio`, `_extension/__init__.py` calls
+#    `_load_lib("libtorchaudio")` and crashes with
+#    `OSError: undefined symbol: _ZN3c104cuda9SetDeviceEab`.
+#
+#    Both APIs we need (MelSpectrogram, resample) are pure-PyTorch on top
+#    of `torch.stft` / `torch.nn.functional.conv1d` and don't touch
+#    `torch.ops.torchaudio.*`. We bypass the load by overwriting
+#    `_extension/__init__.py` with a stub that exports the names other
+#    submodules import (`_IS_TORCHAUDIO_EXT_AVAILABLE=False` is
+#    load-bearing — `functional/filtering.py` branches on it to pick the
+#    pure-Python path; `lazy_import_sox_ext` etc. are imported at module
+#    load by `_backend/utils.py`, `sox_effects/sox_effects.py`,
+#    `functional/_alignment.py`).
+#
+#    `torio/_extension/__init__.py` (a sibling package torchaudio depends
+#    on for streaming I/O — `libtorio_ffmpeg{N}.so`) hits the same symbol
+#    and gets the same stub treatment.
+#
+#    The next RUN block actually exercises MelSpectrogram + resample at
+#    build time so any other ABI surprise aborts the build, not the pod.
+RUN uv pip install --system --break-system-packages --no-cache --no-deps 'torchaudio>=2.8,<2.9' \
+    && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
     && printf '%s\n' \
-        'from . import functional, transforms  # noqa: F401' \
-        '__version__ = "0.0.0-stub"' \
-        > "$SITE/torchaudio/__init__.py" \
-    && printf '%s\n' \
-        'class MelSpectrogram:' \
-        '    def __init__(self, *a, **kw):' \
-        '        raise NotImplementedError(' \
-        '            "torchaudio stub: audio path disabled on this deployment"' \
-        '        )' \
-        > "$SITE/torchaudio/transforms.py" \
-    && printf '%s\n' \
-        'def resample(*a, **kw):' \
-        '    raise NotImplementedError(' \
-        '        "torchaudio stub: audio path disabled on this deployment"' \
-        '    )' \
-        > "$SITE/torchaudio/functional.py"
+        '"""Stubbed for NGC torch ABI compatibility — see Dockerfile."""' \
+        'import logging' \
+        '_LG = logging.getLogger(__name__)' \
+        '_IS_TORCHAUDIO_EXT_AVAILABLE = False' \
+        '_IS_RIR_AVAILABLE = False' \
+        '_IS_ALIGN_AVAILABLE = False' \
+        'def _check_cuda_version(): return None' \
+        'class _UnavailableExt:' \
+        '    def is_available(self): return False' \
+        '    def __getattr__(self, name):' \
+        '        raise RuntimeError(f"torchaudio C++ ext disabled: {name}")' \
+        '_unavailable_singleton = _UnavailableExt()' \
+        'def lazy_import_sox_ext(): return _unavailable_singleton' \
+        'def lazy_import_ffmpeg_ext(): return _unavailable_singleton' \
+        'def fail_if_no_rir(fn):' \
+        '    def _stub(*a, **k):' \
+        '        raise RuntimeError("torchaudio RIR not built")' \
+        '    return _stub' \
+        'def fail_if_no_align(fn):' \
+        '    def _stub(*a, **k):' \
+        '        raise RuntimeError("torchaudio align not built")' \
+        '    return _stub' \
+        '__all__ = ["_check_cuda_version", "_IS_TORCHAUDIO_EXT_AVAILABLE", "_IS_RIR_AVAILABLE", "lazy_import_sox_ext"]' \
+        > "$SITE/torchaudio/_extension/__init__.py" \
+    && if [ -d "$SITE/torio/_extension" ]; then \
+        printf '%s\n' \
+            '"""Stubbed for NGC torch ABI compatibility — see Dockerfile."""' \
+            'class _UnavailableExt:' \
+            '    def is_available(self): return False' \
+            '    def __getattr__(self, name):' \
+            '        raise RuntimeError(f"torio C++ ext disabled: {name}")' \
+            '_unavailable_singleton = _UnavailableExt()' \
+            'def lazy_import_ffmpeg_ext(): return _unavailable_singleton' \
+            > "$SITE/torio/_extension/__init__.py"; \
+    fi
 
 # ---- Consolidated boot-blocker assertions ----------------------------------
 # Upgrade anyio past NGC's pre-installed 4.8.x (httpx_ws needs
 # AsyncContextManagerMixin from 4.9.0) AND verify the full stack in one
-# shot: NGC torch still in place, torchvision's native ops load, and the
-# torchaudio import resolves to our stub. Any failure aborts the build.
+# shot: NGC torch still in place, torchvision's native ops load, torchaudio
+# has the A2V-required APIs (MelSpectrogram, resample), and FA3 is present.
 # Pin numpy<2 — NGC torch is built against NumPy 1.x; NumPy 2.x silently
 # breaks `torch.Tensor.numpy()` and crashes encode_video.
 RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' 'numpy<2' \
@@ -171,10 +208,15 @@ assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\
 assert numpy.__version__.split('.')[0] == '1', f'numpy must be 1.x for NGC torch ABI; got {numpy.__version__}'; \
 assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
-assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
+assert torchaudio.__version__ != '0.0.0-stub', 'torchaudio is still the stub — real package required for A2V'; \
+assert torchaudio._extension._IS_TORCHAUDIO_EXT_AVAILABLE is False, 'torchaudio C++ ext bypass not in effect'; \
+mel = torchaudio.transforms.MelSpectrogram(sample_rate=22050, n_fft=1024, win_length=1024, hop_length=256, f_min=0.0, f_max=11025.0, n_mels=80, window_fn=torch.hann_window, center=True, pad_mode='reflect', power=1.0, mel_scale='slaney', norm='slaney')(torch.randn(1, 22050)); \
+assert mel.shape[-2] == 80, f'MelSpectrogram broken: shape={mel.shape}'; \
+rs = torchaudio.functional.resample(torch.randn(1, 22050), 22050, 16000); \
+assert rs.shape[-1] == 16000, f'resample broken: shape={rs.shape}'; \
 assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func'; \
 torch.zeros(2).numpy(); \
-print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
+print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio', torchaudio.__version__, '(C++ ext bypassed) / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
