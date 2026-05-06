@@ -1,6 +1,10 @@
 """Materialize caller-supplied audio (URL or base64) to a tempfile path for
 ``A2VidPipelineTwoStage``'s ``audio_path``. Lighter validation than image
 input — upstream's ``decode_audio_from_file`` surfaces format errors.
+Normalises every payload to 2-channel PCM WAV via ffmpeg because LTX-2.3's
+audio VAE ``conv_in`` was trained on stereo (weight=[128, 2, 3, 3]) and a
+mono input crashes with a channel-mismatch ``RuntimeError`` on the first
+denoising step.
 """
 
 from __future__ import annotations
@@ -8,7 +12,9 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import os
 import re
+import subprocess
 import tempfile
 
 import httpx
@@ -81,6 +87,44 @@ def _decode_b64(s: str) -> bytes:
     return body
 
 
+def _normalize_to_stereo(input_path: str) -> str:
+    """Convert any audio file to 2-channel PCM WAV via ffmpeg. Returns the
+    new path and deletes the source. ``-ac 2`` upmixes mono by duplicating
+    the single channel and downmixes ≥3-ch sources via ffmpeg's standard
+    L/R recipe; for already-stereo input it's a near-noop reencode.
+    Required because LTX-2.3's audio VAE ``conv_in`` rejects 1-channel
+    input — see the module docstring."""
+    out_path = input_path + ".stereo.wav"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", input_path,
+                "-ac", "2", "-c:a", "pcm_s16le", out_path,
+            ],
+            check=True, capture_output=True, timeout=60,
+        )
+    except subprocess.CalledProcessError as e:
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass
+        stderr = e.stderr.decode("utf-8", errors="replace")[:500] if e.stderr else ""
+        raise ValueError(
+            f"ffmpeg failed to normalise audio to stereo PCM WAV: {stderr}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass
+        raise ValueError("ffmpeg stereo-normalisation timed out (>60 s)") from e
+    try:
+        os.unlink(input_path)
+    except OSError:
+        pass
+    return out_path
+
+
 def _suffix_from_ctype(ctype: str | None) -> str:
     if not ctype:
         return ".wav"
@@ -125,8 +169,9 @@ def materialize_audio(
         tmp.flush()
     finally:
         tmp.close()
+    final_path = _normalize_to_stereo(tmp.name)
     logger.info(
-        "A2V audio materialized: ctype=%s, %d bytes -> %s",
-        ctype, len(blob), tmp.name,
+        "A2V audio materialized: ctype=%s, %d bytes -> %s (normalised to stereo PCM WAV)",
+        ctype, len(blob), final_path,
     )
-    return tmp.name
+    return final_path

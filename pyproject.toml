@@ -43,6 +43,11 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 
+[tool.pytest.ini_options]
+markers = [
+    "no_fake_ffmpeg: opt out of the autouse ffmpeg subprocess mock in test_pipeline_inputs_audio.py — used by the few tests that need to assert against real ffmpeg failure modes",
+]
+
 # Code quality. Run locally with `ruff check` (or `ruff check --fix` to
 # auto-apply the simple fixes). Ruff is intentionally NOT a runtime dep — it
 # runs in dev/CI only. Install on demand: `uvx ruff check`.
