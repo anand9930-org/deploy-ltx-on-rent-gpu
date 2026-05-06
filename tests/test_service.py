@@ -24,6 +24,7 @@ def _run_generate(mock_gen, **kwargs):
         reference_video_strength=1.0,
         conditioning_attention_strength=1.0,
         enhance_prompt=False,
+        audio_url=None, audio_b64=None,
     )
     defaults.update(kwargs)
     upload_to_supabase = defaults.pop("upload_to_supabase", False)
@@ -62,6 +63,7 @@ def _run_generate_sync(mock_gen, **kwargs):
         reference_video_strength=1.0,
         conditioning_attention_strength=1.0,
         enhance_prompt=False,
+        audio_url=None, audio_b64=None,
     )
     defaults.update(kwargs)
     result = mock_gen.generate(**defaults)
@@ -180,6 +182,30 @@ class TestModeRouting:
         )
         assert result["parameters"]["mode"] == "v2v"
 
+    def test_a2v_when_audio_url_set(self, mock_generator):
+        result = _run_generate(
+            mock_generator,
+            audio_url="https://example.com/voice.wav",
+            image_url="https://example.com/face.png",
+        )
+        assert result["parameters"]["mode"] == "a2v"
+
+    def test_a2v_when_audio_b64_set(self, mock_generator):
+        result = _run_generate(
+            mock_generator,
+            audio_b64="YXVkaW8=",
+            image_url="https://example.com/face.png",
+        )
+        assert result["parameters"]["mode"] == "a2v"
+
+    def test_a2v_takes_precedence_over_image_only(self, mock_generator):
+        result = _run_generate(
+            mock_generator,
+            audio_url="https://example.com/voice.wav",
+            image_url="https://example.com/face.png",
+        )
+        assert result["parameters"]["mode"] == "a2v"
+
 
 class TestT2VForwarding:
     """T2V scheduler args must reach the generator unchanged — these pin the
@@ -247,3 +273,30 @@ class TestReferenceVideoForwarding:
         _run_generate(mock_generator, image_url="https://example.com/cat.png")
         assert mock_generator.last_call["reference_video_strength"] == 1.0
         assert mock_generator.last_call["conditioning_attention_strength"] == 1.0
+
+
+class TestAudioInputForwarding:
+    """A2V wire fields — service forwards audio_url / audio_b64 verbatim."""
+
+    def test_audio_url_reaches_generator(self, mock_generator):
+        _run_generate(
+            mock_generator,
+            audio_url="https://example.com/voice.wav",
+            image_url="https://example.com/face.png",
+        )
+        assert mock_generator.last_call["audio_url"] == "https://example.com/voice.wav"
+        assert mock_generator.last_call["audio_b64"] is None
+
+    def test_audio_b64_reaches_generator(self, mock_generator):
+        _run_generate(
+            mock_generator,
+            audio_b64="YXVkaW8=",
+            image_url="https://example.com/face.png",
+        )
+        assert mock_generator.last_call["audio_b64"] == "YXVkaW8="
+        assert mock_generator.last_call["audio_url"] is None
+
+    def test_t2v_passes_none_for_audio(self, mock_generator):
+        _run_generate(mock_generator)
+        assert mock_generator.last_call["audio_url"] is None
+        assert mock_generator.last_call["audio_b64"] is None

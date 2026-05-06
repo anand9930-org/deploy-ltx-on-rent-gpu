@@ -32,6 +32,10 @@ class MockGenerator:
 
         _write_dummy_mp4(output_path)
 
+        has_audio = (
+            kwargs.get("audio_url") is not None
+            or kwargs.get("audio_b64") is not None
+        )
         has_image = (
             kwargs.get("image_url") is not None
             or kwargs.get("image_b64") is not None
@@ -40,14 +44,33 @@ class MockGenerator:
             kwargs.get("reference_video_url") is not None
             or kwargs.get("reference_video_b64") is not None
         )
-        if has_ref_video:
+        if has_audio:
+            mode = "a2v"
+        elif has_ref_video:
             mode = "v2v"
         elif has_image:
             mode = "i2v"
         else:
             mode = "t2v"
 
-        if mode == "t2v":
+        if mode == "a2v":
+            parameters = {
+                "mode": mode,
+                "width": kwargs.get("width", 1024),
+                "height": kwargs.get("height", 1536),
+                "num_frames": kwargs.get("num_frames", 121),
+                "num_inference_steps": kwargs.get("num_inference_steps", 30),
+                "seed": kwargs.get("seed", 42),
+                "frame_rate": kwargs.get("frame_rate", 24.0),
+                "cfg_scale": kwargs.get("cfg_scale", 3.0),
+                "stg_scale": kwargs.get("stg_scale", 1.0),
+                "rescale_scale": kwargs.get("rescale_scale", 0.7),
+                "reference_downscale_factor": 2,
+                "reference_video_strength": kwargs.get("reference_video_strength", 1.0),
+                "conditioning_attention_strength": kwargs.get("conditioning_attention_strength", 1.0),
+                "enhance_prompt": kwargs.get("enhance_prompt", False),
+            }
+        elif mode == "t2v":
             parameters = {
                 "mode": mode,
                 "width": kwargs.get("width", 1024),

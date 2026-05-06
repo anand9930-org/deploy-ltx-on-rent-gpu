@@ -18,6 +18,7 @@ import time
 import torch
 
 from src.config import get_settings
+from src.pipeline.a2v import A2VMixin
 from src.pipeline.i2v import I2VMixin
 from src.pipeline.t2v import T2VMixin
 from src.pipeline.v2v import V2VMixin
@@ -474,9 +475,10 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 # Modes that the dispatcher recognises. Internal — do not expose to the wire.
 _MODE_T2V = "t2v"
 _MODE_UNIFIED = "unified"  # serves I2V + V2V via ICLoraPipeline
+_MODE_A2V = "a2v"          # serves A2V via A2VidPipelineTwoStage + IC-LoRA
 
 
-class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
+class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, A2VMixin):
     """Wrapper around T2V (``TI2VidTwoStagesPipeline``) and unified I2V/V2V
     (``ICLoraPipeline``). Only one upstream pipeline is resident at a time;
     cross-mode requests tear down + rebuild.
@@ -610,6 +612,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
         default_mode_env = _settings.ltx_default_mode.strip().lower()
         if default_mode_env == "t2v":
             initial_mode = _MODE_T2V
+        elif default_mode_env == "a2v":
+            initial_mode = _MODE_A2V
         elif default_mode_env in ("i2v", "v2v", "unified", ""):
             initial_mode = _MODE_UNIFIED
         else:
@@ -648,6 +652,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
             self._build_t2v()
         elif mode == _MODE_UNIFIED:
             self._build_unified()
+        elif mode == _MODE_A2V:
+            self._build_a2v()
         else:
             raise ValueError(f"Unknown pipeline mode: {mode!r}")
         self._active_mode = mode
@@ -713,23 +719,46 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
         reference_video_strength: float = 1.0,
         conditioning_attention_strength: float = 1.0,
         enhance_prompt: bool = False,
+        audio_url: str | None = None,
+        audio_b64: str | None = None,
     ) -> dict:
         """Run inference, encode MP4, return result dict.
 
-        Mode is decided by inputs (prompt-only → T2V; +image → I2V;
-        +reference_video → V2V). T2V scheduler args (``cfg_scale``,
-        ``stg_scale``, ``rescale_scale``, ``negative_prompt``,
-        ``num_inference_steps``) are ignored on the unified path
-        (SimpleDenoiser, no CFG/STG). Cross-mode requests pay a ~30-60 s
-        rebuild.
+        Mode is decided by inputs: +audio → A2V; +image/+ref_video → I2V/V2V;
+        prompt-only → T2V. Cross-mode requests pay a ~30-60 s rebuild.
         """
+        has_audio = audio_url is not None or audio_b64 is not None
         has_image = image_url is not None or image_b64 is not None
         has_ref_video = (
             reference_video_url is not None or reference_video_b64 is not None
         )
-        target_mode = _MODE_UNIFIED if (has_image or has_ref_video) else _MODE_T2V
+
+        if has_audio:
+            target_mode = _MODE_A2V
+            if has_ref_video:
+                logger.warning(
+                    "A2V mode selected (audio present); reference_video_url/b64 "
+                    "will be ignored. Use image_url for IC-LoRA reference conditioning.",
+                )
+        elif has_image or has_ref_video:
+            target_mode = _MODE_UNIFIED
+        else:
+            target_mode = _MODE_T2V
         self._ensure_mode(target_mode)
 
+        if target_mode == _MODE_A2V:
+            return self._a2v_generate(
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=width, height=height, num_frames=num_frames,
+                num_inference_steps=num_inference_steps, seed=seed,
+                frame_rate=frame_rate, cfg_scale=cfg_scale,
+                stg_scale=stg_scale, rescale_scale=rescale_scale,
+                audio_url=audio_url, audio_b64=audio_b64,
+                image_url=image_url, image_b64=image_b64,
+                reference_video_strength=reference_video_strength,
+                conditioning_attention_strength=conditioning_attention_strength,
+                enhance_prompt=enhance_prompt,
+            )
         if target_mode == _MODE_T2V:
             if width is None:
                 width = 1024

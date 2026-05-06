@@ -10,10 +10,12 @@ from src.pipeline.inputs.image import (
     derive_dims_from_image,
     materialize_image,
 )
+from src.pipeline.inputs.audio import materialize_audio
 from src.pipeline.inputs.video import materialize_video
 
 __all__ = [
     "derive_dims_from_image",
+    "materialize_audio",
     "materialize_image",
     "materialize_video",
 ]

@@ -52,10 +52,15 @@ from ltx_core.quantization.fp8_scaled_mm import (
 )
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_pipelines.ic_lora import ICLoraPipeline
+from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
 from ltx_pipelines.utils.blocks import DiffusionStage
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
 from ltx_pipelines.utils.types import OffloadMode
 from ltx_pipelines.utils.args import ImageConditioningInput
+from ltx_core.conditioning import (
+    VideoConditionByReferenceLatent,
+    ConditioningItemAttentionStrengthWrapper,
+)
 
 
 # === Style 3 — optional symbols (gated by HAS_*) ===
@@ -88,8 +93,11 @@ __all__ = [
     "ModuleOps", "KeyValueOperationResult", "SDOps",
     "QuantizationPolicy",
     "FP8_PREPARE_MODULE_OPS", "FP8_TRANSPOSE_SD_OPS", "FP8Linear", "_linear_to_fp8linear",
-    "TI2VidTwoStagesPipeline", "ICLoraPipeline", "DiffusionStage",
-    "encode_video", "OffloadMode", "ImageConditioningInput",
+    "TI2VidTwoStagesPipeline", "ICLoraPipeline", "A2VidPipelineTwoStage",
+    "DiffusionStage",
+    "decode_video_by_frame", "encode_video", "video_preprocess",
+    "OffloadMode", "ImageConditioningInput",
+    "VideoConditionByReferenceLatent", "ConditioningItemAttentionStrengthWrapper",
     # Style 3 — optional symbols (gated by HAS_* flags)
     "TilingConfig", "get_video_chunks_number", "HAS_TILING",
     "MultiModalGuiderParams", "HAS_GUIDERS",

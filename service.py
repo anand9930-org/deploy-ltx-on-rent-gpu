@@ -1,9 +1,10 @@
-"""BentoML service for LTX-2.3 unified video generation (T2V / I2V / V2V).
+"""BentoML service for LTX-2.3 unified video generation (T2V / I2V / V2V / A2V).
 
-Mode is selected Veo-style by which inputs the caller supplies (prompt-only
-→ T2V; +image → I2V; +reference_video → V2V). Cross-mode requests pay a
-~30-60 s pipeline rebuild — H100 80 GB can't hold both upstream pipelines
-resident; ``LTX_DEFAULT_MODE`` picks the boot-preloaded side.
+Mode is selected Veo-style by which inputs the caller supplies (+audio → A2V;
++image → I2V; +reference_video → V2V; prompt-only → T2V). Cross-mode
+requests pay a ~30-60 s pipeline rebuild — H100 80 GB can't hold both
+upstream pipelines resident; ``LTX_DEFAULT_MODE`` picks the boot-preloaded
+side.
 
 Endpoints: ``generate`` (async task), ``generate_sync`` (returns MP4).
 """
@@ -78,6 +79,8 @@ class LTXVideoService:
         reference_video_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
         conditioning_attention_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
         enhance_prompt: bool = False,
+        audio_url: Annotated[str | None, Field(max_length=2048)] = None,
+        audio_b64: Annotated[str | None, Field(max_length=300_000_000)] = None,
         upload_to_supabase: bool = True,
     ) -> dict:
         result = self.generator.generate(
@@ -93,6 +96,7 @@ class LTXVideoService:
             reference_video_strength=reference_video_strength,
             conditioning_attention_strength=conditioning_attention_strength,
             enhance_prompt=enhance_prompt,
+            audio_url=audio_url, audio_b64=audio_b64,
         )
 
         response = {
@@ -134,6 +138,8 @@ class LTXVideoService:
         reference_video_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
         conditioning_attention_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
         enhance_prompt: bool = False,
+        audio_url: Annotated[str | None, Field(max_length=2048)] = None,
+        audio_b64: Annotated[str | None, Field(max_length=300_000_000)] = None,
     ) -> Annotated[Path, bentoml.validators.ContentType("video/*")]:
         result = self.generator.generate(
             prompt=prompt, negative_prompt=negative_prompt,
@@ -148,5 +154,6 @@ class LTXVideoService:
             reference_video_strength=reference_video_strength,
             conditioning_attention_strength=conditioning_attention_strength,
             enhance_prompt=enhance_prompt,
+            audio_url=audio_url, audio_b64=audio_b64,
         )
         return Path(result["output_path"])
