@@ -78,8 +78,15 @@ except ImportError:
 # Vendored triple-stages pipeline (see src/vendor/README.md for provenance).
 # Requires guiders; if the upstream pin lacks them the vendored module's
 # eager `from ltx_core.components.guiders import ...` would fail at import.
+#
+# Pre-import patches MUST run before the vendored module imports its free
+# helpers via `from ltx_pipelines.utils.helpers import assert_resolution,
+# combined_image_conditionings`. `from X import Y` binds Y at vendored-
+# import time, so a later module patch would not propagate.
 if HAS_GUIDERS:
     try:
+        from src.prompt_encoder_override import enable_triple_stages_helper_kwarg_filter
+        enable_triple_stages_helper_kwarg_filter()
         from src.vendor.ti2vid_triple_stages import TI2VidTripleStagesPipeline
         HAS_TRIPLE_STAGES = True
     except ImportError:
