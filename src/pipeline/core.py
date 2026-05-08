@@ -20,6 +20,7 @@ import torch
 from src.config import get_settings
 from src.pipeline.i2v import I2VMixin
 from src.pipeline.t2v import T2VMixin
+from src.pipeline.ti2v import Ti2vMixin
 from src.pipeline.v2v import V2VMixin
 
 logger = logging.getLogger(__name__)
@@ -474,19 +475,22 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 # Modes that the dispatcher recognises. Internal — do not expose to the wire.
 _MODE_T2V = "t2v"
 _MODE_UNIFIED = "unified"  # serves I2V + V2V via ICLoraPipeline
+_MODE_TI2V = "ti2v"  # full-DiT TI2VidTwoStagesPipeline + IC-LoRA on stage 1
 
 
-class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
-    """Wrapper around T2V (``TI2VidTwoStagesPipeline``) and unified I2V/V2V
-    (``ICLoraPipeline``). Only one upstream pipeline is resident at a time;
-    cross-mode requests tear down + rebuild.
+class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, Ti2vMixin):
+    """Wrapper around T2V (``TI2VidTwoStagesPipeline``), TI2V (same pipeline
+    + IC-LoRA on stage 1), and unified I2V/V2V (``ICLoraPipeline``). Only
+    one upstream pipeline is resident at a time; cross-mode requests tear
+    down + rebuild.
 
     Per-scenario builders + generate bodies are mixed in: ``T2VMixin`` owns
-    ``_build_t2v`` / ``_t2v_generate``; ``I2VMixin`` owns the unified
-    lifecycle (``_build_unified``, ``_unified_generate``) plus ``_run_i2v``;
-    ``V2VMixin`` owns ``_run_v2v``. V2V piggybacks on the unified pipeline
-    that I2V already builds — the only V2V-specific code is the per-call
-    pipeline kwargs in ``_run_v2v``.
+    ``_build_t2v`` / ``_t2v_generate``; ``Ti2vMixin`` owns ``_build_ti2v``
+    / ``_ti2v_generate`` (opt-in via ``LTX_DEFAULT_MODE=ti2v``);
+    ``I2VMixin`` owns the unified lifecycle (``_build_unified``,
+    ``_unified_generate``) plus ``_run_i2v``; ``V2VMixin`` owns ``_run_v2v``.
+    V2V piggybacks on the unified pipeline that I2V already builds — the
+    only V2V-specific code is the per-call pipeline kwargs in ``_run_v2v``.
     """
 
     def __init__(self, model_dir: str = "/models") -> None:
@@ -606,10 +610,17 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
         self._teacache_enabled = False  # set by builders
 
         # Preload the requested mode at boot. Default `i2v` (most pods are
-        # I2V-heavy; T2V pods set LTX_DEFAULT_MODE=t2v explicitly).
+        # I2V-heavy; T2V/TI2V pods set LTX_DEFAULT_MODE explicitly).
         default_mode_env = _settings.ltx_default_mode.strip().lower()
+        # ti2v is a pod-level opt-in: when set, prompt-only AND prompt+image
+        # both route to the TI2V pipeline (full DiT + IC-LoRA on stage 1).
+        # ref_video still routes to UNIFIED regardless. ICLora-only I2V is
+        # not reachable from a TI2V pod — switch pods to use it.
+        self._is_ti2v_pod = default_mode_env == "ti2v"
         if default_mode_env == "t2v":
             initial_mode = _MODE_T2V
+        elif default_mode_env == "ti2v":
+            initial_mode = _MODE_TI2V
         elif default_mode_env in ("i2v", "v2v", "unified", ""):
             initial_mode = _MODE_UNIFIED
         else:
@@ -646,6 +657,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
             )
         if mode == _MODE_T2V:
             self._build_t2v()
+        elif mode == _MODE_TI2V:
+            self._build_ti2v()
         elif mode == _MODE_UNIFIED:
             self._build_unified()
         else:
@@ -716,18 +729,28 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
     ) -> dict:
         """Run inference, encode MP4, return result dict.
 
-        Mode is decided by inputs (prompt-only → T2V; +image → I2V;
-        +reference_video → V2V). T2V scheduler args (``cfg_scale``,
-        ``stg_scale``, ``rescale_scale``, ``negative_prompt``,
-        ``num_inference_steps``) are ignored on the unified path
-        (SimpleDenoiser, no CFG/STG). Cross-mode requests pay a ~30-60 s
-        rebuild.
+        Routing:
+        - ``+reference_video`` → UNIFIED (V2V via ICLoraPipeline) regardless
+          of pod default.
+        - ``+image`` → TI2V on a ``LTX_DEFAULT_MODE=ti2v`` pod; UNIFIED (I2V
+          via ICLoraPipeline) otherwise.
+        - prompt-only → TI2V on a ti2v pod; T2V otherwise.
+
+        T2V/TI2V scheduler args (``cfg_scale``, ``stg_scale``,
+        ``rescale_scale``, ``negative_prompt``, ``num_inference_steps``)
+        are ignored on the unified path (SimpleDenoiser, no CFG/STG).
+        Cross-mode requests pay a ~30-60 s rebuild.
         """
         has_image = image_url is not None or image_b64 is not None
         has_ref_video = (
             reference_video_url is not None or reference_video_b64 is not None
         )
-        target_mode = _MODE_UNIFIED if (has_image or has_ref_video) else _MODE_T2V
+        if has_ref_video:
+            target_mode = _MODE_UNIFIED
+        elif has_image:
+            target_mode = _MODE_TI2V if self._is_ti2v_pod else _MODE_UNIFIED
+        else:
+            target_mode = _MODE_TI2V if self._is_ti2v_pod else _MODE_T2V
         self._ensure_mode(target_mode)
 
         if target_mode == _MODE_T2V:
@@ -741,6 +764,16 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
                 num_inference_steps=num_inference_steps, seed=seed,
                 frame_rate=frame_rate, cfg_scale=cfg_scale,
                 stg_scale=stg_scale, rescale_scale=rescale_scale,
+            )
+        if target_mode == _MODE_TI2V:
+            return self._ti2v_generate(
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=width, height=height, num_frames=num_frames,
+                num_inference_steps=num_inference_steps, seed=seed,
+                frame_rate=frame_rate, cfg_scale=cfg_scale,
+                stg_scale=stg_scale, rescale_scale=rescale_scale,
+                image_url=image_url, image_b64=image_b64,
+                enhance_prompt=enhance_prompt,
             )
         return self._unified_generate(
             prompt=prompt, width=width, height=height,
