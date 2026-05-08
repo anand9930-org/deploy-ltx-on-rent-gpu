@@ -194,3 +194,61 @@ class LTXVideoService:
             image_strength=image_strength, image_frame_idx=image_frame_idx,
         )
         return Path(result["output_path"])
+
+    @bentoml.task
+    def generate_triple_stages(
+        self,
+        prompt: Annotated[str, Field(max_length=2000)],
+        negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
+        seed: int = 42,
+        frame_rate: float = 24.0,
+        cfg_scale: Annotated[float, Field(ge=0.0, le=20.0)] = 1.0,
+        stg_scale: Annotated[float, Field(ge=0.0, le=10.0)] = 0.0,
+        rescale_scale: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        image_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        image_frame_idx: Annotated[int, Field(ge=0)] = 0,
+        stage1_steps: Annotated[int, Field(ge=1, le=64)] = 16,
+        stage2_steps: Annotated[int, Field(ge=1, le=32)] = 8,
+        enhance_prompt: bool = False,
+        upload_to_supabase: bool = True,
+    ) -> dict:
+        """Async task variant of ``generate_triple_stages_sync`` — runs the
+        vendored ``TI2VidTripleStagesPipeline`` and (when configured) uploads
+        the MP4 to Supabase, returning a signed URL. Mirrors the existing
+        ``generate(...)`` task contract: poll ``/generate_triple_stages/status``
+        and fetch via ``/generate_triple_stages/get`` once ``status=success``.
+        """
+        result = self.generator.generate(
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, num_frames=num_frames,
+            seed=seed, frame_rate=frame_rate,
+            cfg_scale=cfg_scale, stg_scale=stg_scale, rescale_scale=rescale_scale,
+            image_url=image_url, image_b64=image_b64,
+            enhance_prompt=enhance_prompt,
+            pipeline_variant="triple_stages",
+            stage1_steps=stage1_steps, stage2_steps=stage2_steps,
+            image_strength=image_strength, image_frame_idx=image_frame_idx,
+        )
+
+        response = {
+            "generation_time_seconds": result["generation_time_seconds"],
+            "parameters": result["parameters"],
+        }
+
+        if upload_to_supabase and storage.is_configured():
+            response["video_url"] = storage.upload_video(
+                result["output_path"], result["output_filename"]
+            )
+            try:
+                os.remove(result["output_path"])
+            except OSError:
+                pass
+        else:
+            response["video_path"] = result["output_path"]
+
+        return response
