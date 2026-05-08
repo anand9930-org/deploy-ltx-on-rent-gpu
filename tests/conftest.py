@@ -40,6 +40,42 @@ class MockGenerator:
             kwargs.get("reference_video_url") is not None
             or kwargs.get("reference_video_b64") is not None
         )
+        variant = kwargs.get("pipeline_variant", "default")
+
+        if variant == "triple_stages":
+            if has_ref_video:
+                raise ValueError(
+                    "pipeline_variant='triple_stages' does not support "
+                    "reference_video_* inputs"
+                )
+            mode = "triple_i2v" if has_image else "triple_t2v"
+            parameters = {
+                "mode": mode,
+                "width": kwargs.get("width", 1536),
+                "height": kwargs.get("height", 1024),
+                "num_frames": kwargs.get("num_frames", 121),
+                "stage1_steps": kwargs.get("stage1_steps", 16),
+                "stage2_steps": kwargs.get("stage2_steps", 8),
+                "seed": kwargs.get("seed", 42),
+                "frame_rate": kwargs.get("frame_rate", 24.0),
+                "cfg_scale": kwargs.get("cfg_scale", 1.0),
+                "stg_scale": kwargs.get("stg_scale", 0.0),
+                "rescale_scale": kwargs.get("rescale_scale", 0.0),
+                "image_strength": (
+                    kwargs.get("image_strength", 1.0) if has_image else None
+                ),
+                "image_frame_idx": (
+                    kwargs.get("image_frame_idx", 0) if has_image else None
+                ),
+                "enhance_prompt": kwargs.get("enhance_prompt", False),
+            }
+            return {
+                "output_path": output_path,
+                "output_filename": output_filename,
+                "generation_time_seconds": 0.01,
+                "parameters": parameters,
+            }
+
         if has_ref_video:
             mode = "v2v"
         elif has_image:

@@ -20,6 +20,7 @@ import torch
 from src.config import get_settings
 from src.pipeline.i2v import I2VMixin
 from src.pipeline.t2v import T2VMixin
+from src.pipeline.triple_stages import TripleStagesMixin
 from src.pipeline.v2v import V2VMixin
 
 logger = logging.getLogger(__name__)
@@ -474,19 +475,27 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 # Modes that the dispatcher recognises. Internal — do not expose to the wire.
 _MODE_T2V = "t2v"
 _MODE_UNIFIED = "unified"  # serves I2V + V2V via ICLoraPipeline
+_MODE_TRIPLE_STAGES = "triple_stages"  # vendored TI2VidTripleStagesPipeline (T2V + I2V)
+
+# Pipeline variant — wire-level opt-in. Default routes via input-driven mode
+# detection (T2V/Unified). "triple_stages" forces the vendored class.
+_VARIANT_DEFAULT = "default"
+_VARIANT_TRIPLE_STAGES = "triple_stages"
 
 
-class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
-    """Wrapper around T2V (``TI2VidTwoStagesPipeline``) and unified I2V/V2V
-    (``ICLoraPipeline``). Only one upstream pipeline is resident at a time;
-    cross-mode requests tear down + rebuild.
+class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
+    """Wrapper around T2V (``TI2VidTwoStagesPipeline``), unified I2V/V2V
+    (``ICLoraPipeline``), and the vendored triple-stages pipeline. Only one
+    upstream pipeline is resident at a time; cross-mode requests tear down +
+    rebuild.
 
     Per-scenario builders + generate bodies are mixed in: ``T2VMixin`` owns
     ``_build_t2v`` / ``_t2v_generate``; ``I2VMixin`` owns the unified
     lifecycle (``_build_unified``, ``_unified_generate``) plus ``_run_i2v``;
-    ``V2VMixin`` owns ``_run_v2v``. V2V piggybacks on the unified pipeline
-    that I2V already builds — the only V2V-specific code is the per-call
-    pipeline kwargs in ``_run_v2v``.
+    ``V2VMixin`` owns ``_run_v2v``; ``TripleStagesMixin`` owns
+    ``_build_triple_stages`` / ``_triple_stages_generate``. V2V piggybacks on
+    the unified pipeline that I2V already builds — the only V2V-specific code
+    is the per-call pipeline kwargs in ``_run_v2v``.
     """
 
     def __init__(self, model_dir: str = "/models") -> None:
@@ -648,6 +657,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
             self._build_t2v()
         elif mode == _MODE_UNIFIED:
             self._build_unified()
+        elif mode == _MODE_TRIPLE_STAGES:
+            self._build_triple_stages()
         else:
             raise ValueError(f"Unknown pipeline mode: {mode!r}")
         self._active_mode = mode
@@ -713,20 +724,60 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin):
         reference_video_strength: float = 1.0,
         conditioning_attention_strength: float = 1.0,
         enhance_prompt: bool = False,
+        pipeline_variant: str = _VARIANT_DEFAULT,
+        stage1_steps: int = 16,
+        stage2_steps: int = 8,
+        image_strength: float = 1.0,
+        image_frame_idx: int = 0,
     ) -> dict:
         """Run inference, encode MP4, return result dict.
 
-        Mode is decided by inputs (prompt-only → T2V; +image → I2V;
-        +reference_video → V2V). T2V scheduler args (``cfg_scale``,
-        ``stg_scale``, ``rescale_scale``, ``negative_prompt``,
-        ``num_inference_steps``) are ignored on the unified path
-        (SimpleDenoiser, no CFG/STG). Cross-mode requests pay a ~30-60 s
-        rebuild.
+        Default variant: mode is decided by inputs (prompt-only → T2V;
+        +image → I2V; +reference_video → V2V). T2V scheduler args
+        (``cfg_scale``, ``stg_scale``, ``rescale_scale``,
+        ``negative_prompt``, ``num_inference_steps``) are ignored on the
+        unified path (SimpleDenoiser, no CFG/STG).
+
+        ``pipeline_variant="triple_stages"``: route to the vendored
+        ``TI2VidTripleStagesPipeline`` (T2V if no image, I2V if image
+        supplied — ``reference_video_*`` is rejected, the variant doesn't
+        support video conditioning). Uses ``stage1_steps`` /
+        ``stage2_steps`` instead of ``num_inference_steps``;
+        ``image_strength`` and ``image_frame_idx`` control I2V conditioning.
+
+        Cross-mode requests pay a ~30-60 s rebuild.
         """
         has_image = image_url is not None or image_b64 is not None
         has_ref_video = (
             reference_video_url is not None or reference_video_b64 is not None
         )
+
+        if pipeline_variant == _VARIANT_TRIPLE_STAGES:
+            if has_ref_video:
+                raise ValueError(
+                    "pipeline_variant='triple_stages' does not support "
+                    "reference_video_* inputs (the vendored class has no "
+                    "video conditioning path)."
+                )
+            self._ensure_mode(_MODE_TRIPLE_STAGES)
+            return self._triple_stages_generate(
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=width, height=height, num_frames=num_frames,
+                seed=seed, frame_rate=frame_rate,
+                cfg_scale=cfg_scale, stg_scale=stg_scale,
+                rescale_scale=rescale_scale,
+                image_url=image_url, image_b64=image_b64,
+                image_strength=image_strength,
+                image_frame_idx=image_frame_idx,
+                stage1_steps=stage1_steps, stage2_steps=stage2_steps,
+                enhance_prompt=enhance_prompt,
+            )
+        if pipeline_variant != _VARIANT_DEFAULT:
+            raise ValueError(
+                f"Unknown pipeline_variant={pipeline_variant!r}. "
+                f"Valid: {_VARIANT_DEFAULT!r}, {_VARIANT_TRIPLE_STAGES!r}."
+            )
+
         target_mode = _MODE_UNIFIED if (has_image or has_ref_video) else _MODE_T2V
         self._ensure_mode(target_mode)
 

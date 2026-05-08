@@ -5,7 +5,8 @@ Mode is selected Veo-style by which inputs the caller supplies (prompt-only
 ~30-60 s pipeline rebuild — H100 80 GB can't hold both upstream pipelines
 resident; ``LTX_DEFAULT_MODE`` picks the boot-preloaded side.
 
-Endpoints: ``generate`` (async task), ``generate_sync`` (returns MP4).
+Endpoints: ``generate`` (async task), ``generate_sync`` (returns MP4),
+``generate_triple_stages_sync`` (vendored 3-stage pipeline; T2V or I2V).
 """
 
 import logging
@@ -148,5 +149,48 @@ class LTXVideoService:
             reference_video_strength=reference_video_strength,
             conditioning_attention_strength=conditioning_attention_strength,
             enhance_prompt=enhance_prompt,
+        )
+        return Path(result["output_path"])
+
+    @bentoml.api
+    def generate_triple_stages_sync(
+        self,
+        prompt: Annotated[str, Field(max_length=2000)],
+        negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        num_frames: Annotated[int, Field(ge=9, le=257)] = 121,
+        seed: int = 42,
+        frame_rate: float = 24.0,
+        cfg_scale: Annotated[float, Field(ge=0.0, le=20.0)] = 1.0,
+        stg_scale: Annotated[float, Field(ge=0.0, le=10.0)] = 0.0,
+        rescale_scale: Annotated[float, Field(ge=0.0, le=1.0)] = 0.0,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        image_strength: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0,
+        image_frame_idx: Annotated[int, Field(ge=0)] = 0,
+        stage1_steps: Annotated[int, Field(ge=1, le=64)] = 16,
+        stage2_steps: Annotated[int, Field(ge=1, le=32)] = 8,
+        enhance_prompt: bool = False,
+    ) -> Annotated[Path, bentoml.validators.ContentType("video/*")]:
+        """Run the vendored ``TI2VidTripleStagesPipeline`` (T2V if no image,
+        I2V if ``image_url``/``image_b64`` supplied). Pays a pipeline rebuild
+        on first call if the boot-preloaded mode is different.
+
+        Defaults match the vendored class: stage1=16 / stage2=8 sigma steps,
+        cfg=1.0 / stg=0.0 / rescale=0.0 (image conditioning drives output;
+        the file's docstring notes "cfg=1, minimal CFG"). For T2V the caller
+        usually wants higher cfg (e.g. 3.0); image_url is required for I2V.
+        """
+        result = self.generator.generate(
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, num_frames=num_frames,
+            seed=seed, frame_rate=frame_rate,
+            cfg_scale=cfg_scale, stg_scale=stg_scale, rescale_scale=rescale_scale,
+            image_url=image_url, image_b64=image_b64,
+            enhance_prompt=enhance_prompt,
+            pipeline_variant="triple_stages",
+            stage1_steps=stage1_steps, stage2_steps=stage2_steps,
+            image_strength=image_strength, image_frame_idx=image_frame_idx,
         )
         return Path(result["output_path"])

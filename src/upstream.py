@@ -75,6 +75,20 @@ except ImportError:
     MultiModalGuiderParams = None
     HAS_GUIDERS = False
 
+# Vendored triple-stages pipeline (see src/vendor/README.md for provenance).
+# Requires guiders; if the upstream pin lacks them the vendored module's
+# eager `from ltx_core.components.guiders import ...` would fail at import.
+if HAS_GUIDERS:
+    try:
+        from src.vendor.ti2vid_triple_stages import TI2VidTripleStagesPipeline
+        HAS_TRIPLE_STAGES = True
+    except ImportError:
+        TI2VidTripleStagesPipeline = None
+        HAS_TRIPLE_STAGES = False
+else:
+    TI2VidTripleStagesPipeline = None
+    HAS_TRIPLE_STAGES = False
+
 
 # Explicit public surface — declares every re-export as intentional so
 # ruff F401 / mypy don't flag them and downstream `from src.upstream import X`
@@ -93,4 +107,5 @@ __all__ = [
     # Style 3 — optional symbols (gated by HAS_* flags)
     "TilingConfig", "get_video_chunks_number", "HAS_TILING",
     "MultiModalGuiderParams", "HAS_GUIDERS",
+    "TI2VidTripleStagesPipeline", "HAS_TRIPLE_STAGES",
 ]
