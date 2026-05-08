@@ -598,6 +598,15 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
             from src.attention_override import enable_attention_callable_singleton
             enable_attention_callable_singleton()
 
+        # Vendored triple-stages skew filter — wraps PromptEncoder and
+        # DiffusionStage __call__ to swallow newer-API kwargs (e.g.
+        # streaming_prefetch_count) the eisneim fork passes that our pinned
+        # upstream signature doesn't accept. No-op on T2V/I2V/V2V (those
+        # paths never pass the offending kwargs); load-bearing for
+        # triple-stages. Idempotent + sig-aware.
+        from src.prompt_encoder_override import enable_triple_stages_kwarg_filter
+        enable_triple_stages_kwarg_filter()
+
         # Shared TilingConfig helpers (optional).
         from src.upstream import HAS_TILING, TilingConfig, get_video_chunks_number
         self._TilingConfig = TilingConfig if HAS_TILING else None
