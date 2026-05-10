@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 DEV_CHECKPOINT_FILENAME = "ltx-2.3-22b-dev.safetensors"
 DEV_CHECKPOINT_REPO = "Lightricks/LTX-2.3"
 
-# Distilled LoRA used on T2V cast/bf16 path (stage 2 fuses it on top of dev
-# BF16 to recover distilled quality without the FP8 quantisation step).
-# Skipped on the scaled_mm path — the pre-quantised distilled-fp8 file
-# already ships the LoRA fused inside.
+# Distilled LoRA. Required on every FP8 mode:
+#   - T2V cast/bf16: stage 2 fuses on top of dev BF16.
+#   - Triple-stages-ComfyUI scaled_mm: fused at runtime into each rebuilt
+#     stage on top of dev-fp8 (see src/pipeline/triple_stages_comfyui.py).
+#   - Triple-stages-ComfyUI cast/bf16: stacked on every stage by the
+#     vendored class.
 DISTILLED_LORA_FILENAME = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
 DISTILLED_LORA_REPO = "Lightricks/LTX-2.3"
 
@@ -58,10 +60,9 @@ def _hf_get(repo_id: str, filename: str, model_dir: str, hf_token: str, label: s
 
 def ensure_models_downloaded(model_dir: str) -> None:
     """Download every checkpoint both upstream pipelines need into
-    ``model_dir``. Required regardless of mode: dev-BF16, distilled-1.1 BF16,
-    spatial upsampler, IC-LoRA, Gemma 3 12B. FP8-mode-gated: dev-fp8
-    (scaled_mm only), distilled-LoRA (cast/bf16 only), distilled-fp8
-    (scaled_mm + cast).
+    ``model_dir``. Required regardless of mode: dev-BF16, distilled-LoRA,
+    distilled-1.1 BF16, spatial upsampler, IC-LoRA, Gemma 3 12B.
+    FP8-mode-gated: dev-fp8 (scaled_mm only), distilled-fp8 (scaled_mm + cast).
     """
     os.makedirs(model_dir, exist_ok=True)
     settings = get_settings()
@@ -80,13 +81,13 @@ def ensure_models_downloaded(model_dir: str) -> None:
         "LTX-2.3 dev BF16 checkpoint (~46 GB)",
     )
 
-    # 2. distilled-LoRA — T2V stage 2 LoRA on cast/bf16. Skip on scaled_mm
-    # (LoRA is already fused inside the pre-quantised distilled-fp8 file).
-    if fp8_mode != "scaled_mm":
-        _hf_get(
-            DISTILLED_LORA_REPO, DISTILLED_LORA_FILENAME, model_dir, hf_token,
-            "T2V distilled LoRA (~7.6 GB)",
-        )
+    # 2. distilled-LoRA — required on every FP8 mode (T2V cast/bf16 stage 2,
+    # triple-stages-ComfyUI runtime fusion on scaled_mm + cast/bf16). See the
+    # docstring on DISTILLED_LORA_FILENAME for per-pipeline detail.
+    _hf_get(
+        DISTILLED_LORA_REPO, DISTILLED_LORA_FILENAME, model_dir, hf_token,
+        "Distilled LoRA (~7.6 GB)",
+    )
 
     # 3. dev-fp8 — T2V stage 1 quantised. scaled_mm only.
     if fp8_mode == "scaled_mm":

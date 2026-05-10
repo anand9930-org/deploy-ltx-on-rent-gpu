@@ -22,16 +22,16 @@ class TestEnsureModelsDownloaded:
         """
         from src.download_models import ensure_models_downloaded
 
-        # Always-present files (T2V dev BF16 base + unified base + IC-LoRA +
-        # spatial upscaler).
+        # Always-present files (T2V dev BF16 base + distilled LoRA + unified
+        # base + IC-LoRA + spatial upscaler). Distilled LoRA is now required
+        # on every FP8 mode (triple-stages-ComfyUI scaled_mm fuses it at
+        # runtime on top of dev-fp8; cast/bf16 stacks it via the vendored
+        # class — see src/pipeline/triple_stages_comfyui.py).
         (tmp_path / "ltx-2.3-22b-dev.safetensors").touch()
+        (tmp_path / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors").touch()
         (tmp_path / "ltx-2.3-22b-distilled-1.1.safetensors").touch()
         (tmp_path / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors").touch()
         (tmp_path / "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors").touch()
-
-        # cast/no-FP8 path also pulls the T2V distilled-LoRA.
-        if fp8_mode != "scaled_mm":
-            (tmp_path / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors").touch()
 
         # scaled_mm pulls the dev FP8 DiT in addition.
         if fp8_mode == "scaled_mm":
@@ -68,8 +68,11 @@ class TestEnsureModelsDownloaded:
 
         assert model_dir.exists()
 
-    def test_scaled_mm_pulls_dev_fp8(self, tmp_path):
-        """scaled_mm mode must trigger dev-fp8 download but skip distilled-LoRA."""
+    def test_scaled_mm_pulls_dev_fp8_and_distilled_lora(self, tmp_path):
+        """scaled_mm mode must trigger dev-fp8 + distilled-LoRA + distilled-fp8
+        downloads. The distilled LoRA is fused at runtime into each rebuilt
+        stage of the triple-stages-ComfyUI pipeline (see
+        src/pipeline/triple_stages_comfyui.py)."""
         from src.download_models import ensure_models_downloaded
 
         with patch.dict(
@@ -84,8 +87,7 @@ class TestEnsureModelsDownloaded:
         called_files = [c.kwargs.get("filename") for c in mock_dl.call_args_list]
         assert "ltx-2.3-22b-dev-fp8.safetensors" in called_files
         assert "ltx-2.3-22b-distilled-fp8.safetensors" in called_files
-        # Distilled LoRA only needed on the cast/bf16 path.
-        assert "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" not in called_files
+        assert "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" in called_files
 
     def test_cast_pulls_distilled_lora_not_dev_fp8(self, tmp_path):
         """cast mode pulls the distilled LoRA + distilled-fp8 but no dev-fp8."""
