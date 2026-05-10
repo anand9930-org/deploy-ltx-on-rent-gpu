@@ -76,6 +76,32 @@ class MockGenerator:
                 "parameters": parameters,
             }
 
+        if variant == "triple_stages_comfyui":
+            if has_ref_video:
+                raise ValueError(
+                    "pipeline_variant='triple_stages_comfyui' does not support "
+                    "reference_video_* inputs"
+                )
+            mode = "triple_comfyui_i2v" if has_image else "triple_comfyui_t2v"
+            parameters = {
+                "mode": mode,
+                "width": kwargs.get("width", 896),
+                "height": kwargs.get("height", 1280),
+                "num_frames": kwargs.get("num_frames", 241),
+                "seed": kwargs.get("seed", 42),
+                "frame_rate": kwargs.get("frame_rate", 24.0),
+                "image_frame_idx": (
+                    kwargs.get("image_frame_idx", 0) if has_image else None
+                ),
+                "enhance_prompt": kwargs.get("enhance_prompt", False),
+            }
+            return {
+                "output_path": output_path,
+                "output_filename": output_filename,
+                "generation_time_seconds": 0.01,
+                "parameters": parameters,
+            }
+
         if has_ref_video:
             mode = "v2v"
         elif has_image:

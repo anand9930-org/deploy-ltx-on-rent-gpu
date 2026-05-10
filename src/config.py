@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # var must compare unequal to both, which "" does.
     ltx_fp8_mode: str = ""              # "", "scaled_mm", "cast"
     ltx_attention_type: str = ""        # "", "flash_attention_3", "sdpa"
-    ltx_default_mode: str = "i2v"       # "t2v" or "i2v"
+    ltx_default_mode: str = "i2v"       # "t2v", "i2v", "triple_stages", "triple_stages_comfyui"
     enable_torch_compile: bool = True
 
     # ── TeaCache ────────────────────────────────────────────────────────
