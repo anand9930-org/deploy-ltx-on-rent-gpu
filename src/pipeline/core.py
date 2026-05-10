@@ -21,6 +21,7 @@ from src.config import get_settings
 from src.pipeline.i2v import I2VMixin
 from src.pipeline.t2v import T2VMixin
 from src.pipeline.triple_stages import TripleStagesMixin
+from src.pipeline.triple_stages_comfyui import TripleStagesComfyUIMixin
 from src.pipeline.v2v import V2VMixin
 
 logger = logging.getLogger(__name__)
@@ -476,14 +477,19 @@ def _install_build_transformer_audit(stage, label: str) -> None:
 _MODE_T2V = "t2v"
 _MODE_UNIFIED = "unified"  # serves I2V + V2V via ICLoraPipeline
 _MODE_TRIPLE_STAGES = "triple_stages"  # vendored TI2VidTripleStagesPipeline (T2V + I2V)
+_MODE_TRIPLE_STAGES_COMFYUI = "triple_stages_comfyui"  # vendored ComfyUI workflow port
 
 # Pipeline variant — wire-level opt-in. Default routes via input-driven mode
-# detection (T2V/Unified). "triple_stages" forces the vendored class.
+# detection (T2V/Unified). "triple_stages" forces the vendored class;
+# "triple_stages_comfyui" forces the ComfyUI workflow port.
 _VARIANT_DEFAULT = "default"
 _VARIANT_TRIPLE_STAGES = "triple_stages"
+_VARIANT_TRIPLE_STAGES_COMFYUI = "triple_stages_comfyui"
 
 
-class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
+class LTXVideoGenerator(
+    T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin, TripleStagesComfyUIMixin,
+):
     """Wrapper around T2V (``TI2VidTwoStagesPipeline``), unified I2V/V2V
     (``ICLoraPipeline``), and the vendored triple-stages pipeline. Only one
     upstream pipeline is resident at a time; cross-mode requests tear down +
@@ -625,11 +631,18 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
 
         # Preload the requested mode at boot. Default `i2v` (most pods are
         # I2V-heavy; T2V pods set LTX_DEFAULT_MODE=t2v explicitly).
+        # triple_stages / triple_stages_comfyui are accepted for pods that
+        # serve those endpoints exclusively — avoids the ~30-60s rebuild on
+        # the first request.
         default_mode_env = _settings.ltx_default_mode.strip().lower()
         if default_mode_env == "t2v":
             initial_mode = _MODE_T2V
         elif default_mode_env in ("i2v", "v2v", "unified", ""):
             initial_mode = _MODE_UNIFIED
+        elif default_mode_env == "triple_stages":
+            initial_mode = _MODE_TRIPLE_STAGES
+        elif default_mode_env == "triple_stages_comfyui":
+            initial_mode = _MODE_TRIPLE_STAGES_COMFYUI
         else:
             logger.warning(
                 "Unrecognised LTX_DEFAULT_MODE=%r; falling back to i2v",
@@ -668,6 +681,8 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
             self._build_unified()
         elif mode == _MODE_TRIPLE_STAGES:
             self._build_triple_stages()
+        elif mode == _MODE_TRIPLE_STAGES_COMFYUI:
+            self._build_triple_stages_comfyui()
         else:
             raise ValueError(f"Unknown pipeline mode: {mode!r}")
         self._active_mode = mode
@@ -754,6 +769,13 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
         ``stage2_steps`` instead of ``num_inference_steps``;
         ``image_strength`` and ``image_frame_idx`` control I2V conditioning.
 
+        ``pipeline_variant="triple_stages_comfyui"``: route to the vendored
+        ``TI2VidTripleStagesComfyUIPipeline`` (workflow port of
+        ``scripts/workflow_3mljpp.py``). Sigmas + cfg are baked in, so
+        ``cfg_scale``/``stg_scale``/``rescale_scale``/``stage1_steps``/
+        ``stage2_steps``/``num_inference_steps``/``image_strength`` are
+        ignored. Resolution must be /128.
+
         Cross-mode requests pay a ~30-60 s rebuild.
         """
         has_image = image_url is not None or image_b64 is not None
@@ -781,10 +803,27 @@ class LTXVideoGenerator(T2VMixin, I2VMixin, V2VMixin, TripleStagesMixin):
                 stage1_steps=stage1_steps, stage2_steps=stage2_steps,
                 enhance_prompt=enhance_prompt,
             )
+        if pipeline_variant == _VARIANT_TRIPLE_STAGES_COMFYUI:
+            if has_ref_video:
+                raise ValueError(
+                    "pipeline_variant='triple_stages_comfyui' does not support "
+                    "reference_video_* inputs (the vendored class has no "
+                    "video conditioning path)."
+                )
+            self._ensure_mode(_MODE_TRIPLE_STAGES_COMFYUI)
+            return self._triple_stages_comfyui_generate(
+                prompt=prompt, negative_prompt=negative_prompt,
+                width=width, height=height, num_frames=num_frames,
+                seed=seed, frame_rate=frame_rate,
+                image_url=image_url, image_b64=image_b64,
+                image_frame_idx=image_frame_idx,
+                enhance_prompt=enhance_prompt,
+            )
         if pipeline_variant != _VARIANT_DEFAULT:
             raise ValueError(
-                f"Unknown pipeline_variant={pipeline_variant!r}. "
-                f"Valid: {_VARIANT_DEFAULT!r}, {_VARIANT_TRIPLE_STAGES!r}."
+                f"Unknown pipeline_variant={pipeline_variant!r}. Valid: "
+                f"{_VARIANT_DEFAULT!r}, {_VARIANT_TRIPLE_STAGES!r}, "
+                f"{_VARIANT_TRIPLE_STAGES_COMFYUI!r}."
             )
 
         target_mode = _MODE_UNIFIED if (has_image or has_ref_video) else _MODE_T2V

@@ -30,6 +30,7 @@ from pydantic import Field
 from src import storage
 from src.config import get_settings
 from src.pipeline import DEFAULT_NEGATIVE_PROMPT, LTXVideoGenerator
+from src.vendor.ti2vid_triple_stages_comfyui import COMFY_DEFAULT_NEGATIVE_PROMPT
 
 _settings = get_settings()
 
@@ -233,6 +234,102 @@ class LTXVideoService:
             pipeline_variant="triple_stages",
             stage1_steps=stage1_steps, stage2_steps=stage2_steps,
             image_strength=image_strength, image_frame_idx=image_frame_idx,
+        )
+
+        response = {
+            "generation_time_seconds": result["generation_time_seconds"],
+            "parameters": result["parameters"],
+        }
+
+        if upload_to_supabase and storage.is_configured():
+            response["video_url"] = storage.upload_video(
+                result["output_path"], result["output_filename"]
+            )
+            try:
+                os.remove(result["output_path"])
+            except OSError:
+                pass
+        else:
+            response["video_path"] = result["output_path"]
+
+        return response
+
+    @bentoml.api
+    def generate_triple_stages_comfyui_sync(
+        self,
+        prompt: Annotated[str, Field(max_length=2000)],
+        negative_prompt: str = COMFY_DEFAULT_NEGATIVE_PROMPT,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        num_frames: Annotated[int, Field(ge=9, le=257)] = 241,
+        seed: int = 42,
+        frame_rate: float = 24.0,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        image_frame_idx: Annotated[int, Field(ge=0)] = 0,
+        enhance_prompt: bool = False,
+    ) -> Annotated[Path, bentoml.validators.ContentType("video/*")]:
+        """Run the vendored ``TI2VidTripleStagesComfyUIPipeline`` (workflow
+        port of ``scripts/workflow_3mljpp.py``). T2V if no image, I2V if
+        ``image_url``/``image_b64`` supplied. Pays a pipeline rebuild on
+        first call if the boot-preloaded mode is different.
+
+        Sigmas + cfg are baked into the vendored class (cfg=1 →
+        SimpleDenoiser; manual sigma schedules at 9/4/4 steps), so this
+        endpoint deliberately does not expose ``cfg_scale``/``stg_scale``/
+        ``rescale_scale``/``stage1_steps``/``stage2_steps``. Resolution
+        must be divisible by 128 (the 4× downscale chain enforces this);
+        callers that supply mismatched dims will see them rounded down at
+        the dispatcher.
+
+        Defaults mirror the workflow: ``num_frames=241`` (matches the
+        workflow's ``LTXVAddGuide(num_frames=241)``), ``frame_rate=24.0``,
+        and width/height derived from the image (or 896×1280 fallback for
+        T2V — the workflow's hardcoded ``EmptyLTXVLatentVideo(224×320)``
+        × 4× chain).
+        """
+        result = self.generator.generate(
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, num_frames=num_frames,
+            seed=seed, frame_rate=frame_rate,
+            image_url=image_url, image_b64=image_b64,
+            enhance_prompt=enhance_prompt,
+            pipeline_variant="triple_stages_comfyui",
+            image_frame_idx=image_frame_idx,
+        )
+        return Path(result["output_path"])
+
+    @bentoml.task
+    def generate_triple_stages_comfyui(
+        self,
+        prompt: Annotated[str, Field(max_length=2000)],
+        negative_prompt: str = COMFY_DEFAULT_NEGATIVE_PROMPT,
+        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        num_frames: Annotated[int, Field(ge=9, le=257)] = 241,
+        seed: int = 42,
+        frame_rate: float = 24.0,
+        image_url: Annotated[str | None, Field(max_length=2048)] = None,
+        image_b64: Annotated[str | None, Field(max_length=70_000_000)] = None,
+        image_frame_idx: Annotated[int, Field(ge=0)] = 0,
+        enhance_prompt: bool = False,
+        upload_to_supabase: bool = True,
+    ) -> dict:
+        """Async task variant of ``generate_triple_stages_comfyui_sync`` —
+        runs the vendored ``TI2VidTripleStagesComfyUIPipeline`` and (when
+        configured) uploads the MP4 to Supabase, returning a signed URL.
+        Mirrors the existing ``generate(...)`` task contract: poll
+        ``/generate_triple_stages_comfyui/status`` and fetch via
+        ``/generate_triple_stages_comfyui/get`` once ``status=success``.
+        """
+        result = self.generator.generate(
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, num_frames=num_frames,
+            seed=seed, frame_rate=frame_rate,
+            image_url=image_url, image_b64=image_b64,
+            enhance_prompt=enhance_prompt,
+            pipeline_variant="triple_stages_comfyui",
+            image_frame_idx=image_frame_idx,
         )
 
         response = {

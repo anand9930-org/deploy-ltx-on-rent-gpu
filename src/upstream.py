@@ -96,6 +96,23 @@ else:
     TI2VidTripleStagesPipeline = None
     HAS_TRIPLE_STAGES = False
 
+# Vendored ComfyUI-workflow port — behaviorally mirrors
+# scripts/workflow_3mljpp.py. Distinct class from the standard fork above:
+# hardcoded sigmas, cfg=1 collapse, distilled LoRA on all three stages.
+# The ComfyUI variant does NOT pass `is_two_stage` to assert_resolution or
+# `preprocessed_images` to combined_image_conditionings, so it does not
+# depend on enable_triple_stages_helper_kwarg_filter() being installed
+# (that filter is already wired above for the standard fork; double-calling
+# it is idempotent).
+try:
+    from src.vendor.ti2vid_triple_stages_comfyui import (
+        TI2VidTripleStagesComfyUIPipeline,
+    )
+    HAS_TRIPLE_STAGES_COMFYUI = True
+except ImportError:
+    TI2VidTripleStagesComfyUIPipeline = None
+    HAS_TRIPLE_STAGES_COMFYUI = False
+
 
 # Explicit public surface — declares every re-export as intentional so
 # ruff F401 / mypy don't flag them and downstream `from src.upstream import X`
@@ -115,4 +132,5 @@ __all__ = [
     "TilingConfig", "get_video_chunks_number", "HAS_TILING",
     "MultiModalGuiderParams", "HAS_GUIDERS",
     "TI2VidTripleStagesPipeline", "HAS_TRIPLE_STAGES",
+    "TI2VidTripleStagesComfyUIPipeline", "HAS_TRIPLE_STAGES_COMFYUI",
 ]
