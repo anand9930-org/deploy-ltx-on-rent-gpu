@@ -67,8 +67,8 @@ Note: `ltx-core[xformers]` and `ltx-core[fp8-trtllm]` are declared as **conflict
 ### 1. `src/download_models.py`
 - Added a helper `_fp8_mode()` that reads `LTX_FP8_MODE` (`cast` | `scaled_mm`, default `cast`). The env flag is used at download time because the GPU isn't queryable during pod-image warm-up.
 - BF16 dev checkpoint and spatial upscaler are always downloaded.
-- `scaled_mm` additionally downloads `ltx-2.3-22b-dev-fp8.safetensors` and `ltx-2.3-22b-distilled-fp8.safetensors` from `Lightricks/LTX-2.3-fp8`, and skips the 7.6 GB distilled LoRA (the pre-fused distilled-fp8 checkpoint supersedes it).
-- `cast` keeps the existing BF16 + distilled-LoRA download set unchanged.
+- `scaled_mm` additionally downloads `ltx-2.3-22b-dev-fp8.safetensors` and `ltx-2.3-22b-distilled-fp8.safetensors` from `Lightricks/LTX-2.3-fp8`. The 7.6 GB distilled LoRA is also pulled (triple-stages-ComfyUI fuses it into each stage at runtime on top of dev-fp8; T2V stage 2 still uses the pre-fused distilled-fp8 file).
+- `cast` keeps the BF16 + distilled-LoRA + distilled-fp8 download set unchanged.
 
 ### 2. `src/pipeline.py`
 - New `_select_fp8_mode()` picks the path in this order: `LTX_FP8_MODE` env override → `torch.cuda.get_device_capability() == (9, 0)` → `cast` fallback.

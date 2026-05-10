@@ -12,12 +12,13 @@ Key differences from ``TripleStagesMixin`` (the standard fork):
 * Distilled LoRA at strength **0.5** (vs 0.8) is stacked on **all three**
   stages by the vendored class — the workflow's single
   ``LoraLoaderModelOnly`` feeds every CFGGuider.
-* ``scaled_mm`` rebuilds **all three** stages onto distilled-fp8 (LoRA
-  pre-fused at upstream's chosen strength) — the standard fork uses dev-fp8
-  for stages 1+2 and distilled-fp8 only for stage 3, but the workflow has
-  the LoRA on every stage so the ComfyUI variant must too. Operational
-  caveat: the LoRA strength baked into distilled-fp8 may not equal 0.5;
-  this is the accepted reality of pre-fused FP8 checkpoints.
+* ``scaled_mm`` rebuilds **all three** stages onto **dev-fp8** with the
+  standalone distilled LoRA fused at runtime at the same strength constant
+  (``COMFY_DISTILLED_LORA_STRENGTH``). Diverges from the standard fork
+  (which keeps stages 1+2 on dev-fp8 with no LoRA and uses pre-fused
+  distilled-fp8 for stage 3) because the workflow has the LoRA on every
+  stage. We use the standalone LoRA file rather than pre-fused
+  distilled-fp8 so the strength stays explicit and tunable.
 * No ``MultiModalGuiderParams`` — the vendored ``__call__`` doesn't accept
   ``video_guider_params``/``audio_guider_params``. Every stage runs cfg=1
   → ``SimpleDenoiser``.
@@ -71,8 +72,9 @@ class TripleStagesComfyUIMixin:
 
     def _build_triple_stages_comfyui(self) -> None:
         """Build ``TI2VidTripleStagesComfyUIPipeline``. Distilled LoRA goes on
-        all three stages (cast/bf16) at strength 0.5; scaled_mm rebuilds
-        all three stages onto distilled-fp8 (LoRA pre-fused)."""
+        all three stages at strength 0.5 on every FP8 mode (cast/bf16 via the
+        vendored class's ``distilled_lora`` arg; scaled_mm via runtime LoRA
+        fusion on top of dev-fp8 during the per-stage rebuild)."""
         from src.pipeline.core import (
             _build_scaled_mm_policy,
             _install_build_transformer_audit,
@@ -112,46 +114,49 @@ class TripleStagesComfyUIMixin:
                     f"at {path}. Run download_models.py before pipeline init."
                 )
         if fp8_mode == "scaled_mm":
-            if not os.path.exists(self._distilled_fp8_path):
+            if not os.path.exists(self._dev_fp8_path):
                 raise RuntimeError(
-                    f"Triple-stages-ComfyUI scaled_mm requires distilled FP8 "
-                    f"DiT at {self._distilled_fp8_path}. Run "
-                    "download_models.py with LTX_FP8_MODE=scaled_mm."
+                    f"Triple-stages-ComfyUI scaled_mm requires dev FP8 DiT at "
+                    f"{self._dev_fp8_path}. Run download_models.py with "
+                    "LTX_FP8_MODE=scaled_mm."
                 )
 
-        from src.upstream import QuantizationPolicy
+        from src.upstream import (
+            LTXV_LORA_COMFY_RENAMING_MAP,
+            LoraPathStrengthAndSDOps,
+            QuantizationPolicy,
+            StateDictRegistry,
+        )
+        from src.vendor.ti2vid_triple_stages_comfyui import (
+            COMFY_DISTILLED_LORA_STRENGTH,
+        )
+
         if fp8_mode == "scaled_mm":
-            extras_distilled = self._extras_for(self._distilled_fp8_path)
+            extras_dev = self._extras_for(self._dev_fp8_path)
             logger.info(
-                "FP8 checkpoint probe (triple-stages-comfyui): distilled=%d "
+                "FP8 checkpoint probe (triple-stages-comfyui): dev=%d "
                 "non-FP8 weight modules",
-                len(extras_distilled),
+                len(extras_dev),
             )
-            quantization_distilled = _build_scaled_mm_policy(extras_distilled)
-            quantization = quantization_distilled  # placeholder; rebuilt per-stage below
+            quantization_dev = _build_scaled_mm_policy(extras_dev)
+            quantization = quantization_dev  # placeholder; rebuilt per-stage below
             logger.info(
                 "Triple-stages-ComfyUI FP8 mode: scaled_mm (W8A8, TRT-LLM "
-                "cublas_scaled_mm) — distilled-fp8 on all three stages"
+                "cublas_scaled_mm) — dev-fp8 base + standalone distilled LoRA "
+                "(strength=%.2f) fused at runtime on all three stages",
+                COMFY_DISTILLED_LORA_STRENGTH,
             )
         elif fp8_mode == "cast":
             quantization = QuantizationPolicy.fp8_cast()
-            quantization_distilled = None
+            quantization_dev = None
             logger.info(
                 "Triple-stages-ComfyUI FP8 mode: cast (W8A16, weights FP8 / "
                 "activations BF16)"
             )
         else:
             quantization = None
-            quantization_distilled = None
+            quantization_dev = None
 
-        from src.upstream import (
-            LTXV_LORA_COMFY_RENAMING_MAP,
-            LoraPathStrengthAndSDOps,
-            StateDictRegistry,
-        )
-        from src.vendor.ti2vid_triple_stages_comfyui import (
-            COMFY_DISTILLED_LORA_STRENGTH,
-        )
         registry: StateDictRegistry | None = None
         try:
             registry = StateDictRegistry()
@@ -161,24 +166,24 @@ class TripleStagesComfyUIMixin:
         except Exception:
             logger.warning("StateDictRegistry not available", exc_info=True)
 
-        # Distilled LoRA — cast/bf16 only at workflow strength 0.5. The
-        # vendored class stacks `distilled_lora` on every stage. scaled_mm
-        # uses pre-fused distilled-fp8 instead and passes [] here.
-        if fp8_mode != "scaled_mm":
-            if not os.path.exists(self._distilled_lora_path):
-                raise RuntimeError(
-                    f"Triple-stages-ComfyUI (cast/bf16) requires distilled LoRA "
-                    f"at {self._distilled_lora_path}. Run download_models.py."
-                )
-            distilled_lora = [
-                LoraPathStrengthAndSDOps(
-                    path=self._distilled_lora_path,
-                    strength=COMFY_DISTILLED_LORA_STRENGTH,
-                    sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
-                )
-            ]
-        else:
-            distilled_lora = []
+        # Standalone distilled LoRA at workflow strength 0.5, applied on
+        # every FP8 mode. The vendored class stacks `distilled_lora` on every
+        # stage at construction (used on cast/bf16). On scaled_mm the same
+        # list is also re-fused into each rebuilt stage below — see the
+        # rebuild loop where loras=tuple(distilled_lora) is passed to
+        # DiffusionStage.
+        if not os.path.exists(self._distilled_lora_path):
+            raise RuntimeError(
+                f"Triple-stages-ComfyUI requires distilled LoRA at "
+                f"{self._distilled_lora_path}. Run download_models.py."
+            )
+        distilled_lora = [
+            LoraPathStrengthAndSDOps(
+                path=self._distilled_lora_path,
+                strength=COMFY_DISTILLED_LORA_STRENGTH,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+        ]
 
         pipeline_kwargs = dict(
             checkpoint_path=self._dev_bf16_path,
@@ -203,9 +208,12 @@ class TripleStagesComfyUIMixin:
         )
         self._log_vram("Triple-stages-ComfyUI after pipeline init")
 
-        # scaled_mm: rebuild all three stages onto distilled-fp8 (LoRA pre-fused
-        # at upstream's chosen strength). Diverges from the standard fork,
-        # which keeps stages 1+2 on dev-fp8.
+        # scaled_mm: rebuild all three stages onto dev-fp8 with the standalone
+        # distilled LoRA fused at runtime (strength=COMFY_DISTILLED_LORA_STRENGTH).
+        # Diverges from the standard fork (stages 1+2 dev-fp8 + no LoRA, stage 3
+        # pre-fused distilled-fp8) — the ComfyUI workflow has the LoRA on every
+        # stage. We fuse the standalone LoRA at runtime instead of using
+        # pre-fused distilled-fp8 so the strength stays explicit and tunable.
         if fp8_mode == "scaled_mm":
             from src.upstream import DiffusionStage
             for stage_attr in ("stage_1", "stage_2", "stage_3"):
@@ -213,20 +221,21 @@ class TripleStagesComfyUIMixin:
                 setattr(
                     self._pipeline, stage_attr,
                     DiffusionStage(
-                        checkpoint_path=self._distilled_fp8_path,
+                        checkpoint_path=self._dev_fp8_path,
                         dtype=self._pipeline.dtype,
                         device=self._pipeline.device,
-                        loras=(),
-                        quantization=quantization_distilled,
+                        loras=tuple(distilled_lora),
+                        quantization=quantization_dev,
                         registry=None,
                         torch_compile=pipeline_kwargs.get("torch_compile", False),
                     ),
                 )
                 logger.info(
                     "Triple-stages-ComfyUI init: DiffusionStage(%s) constructor "
-                    "took %.3fs (%s)",
+                    "took %.3fs (%s + distilled LoRA strength=%.2f)",
                     stage_attr, time.perf_counter() - _t1,
-                    os.path.basename(self._distilled_fp8_path),
+                    os.path.basename(self._dev_fp8_path),
+                    COMFY_DISTILLED_LORA_STRENGTH,
                 )
                 _install_build_transformer_audit(
                     getattr(self._pipeline, stage_attr),
