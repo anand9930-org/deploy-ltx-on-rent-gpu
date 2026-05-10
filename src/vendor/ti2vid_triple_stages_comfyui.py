@@ -13,7 +13,7 @@ Stage layout (same as the JSON workflow):
            │  manual sigma schedule "1.0, 0.99375, 0.9875, 0.98125,
            │   0.975, 0.909375, 0.725, 0.421875, 0.0"
            │  RF-correct ancestral Euler (eta=1.0, s_noise=1.0)
-           │  image conditioning preprocessed at H.264 CRF=8 with strength=0.7
+           │  image conditioning preprocessed at H.264 CRF=18
            ▼
            LTXVLatentUpsampler (×2 spatial)
            │
@@ -42,10 +42,10 @@ Key differences from ``ti2vid_triple_stages.py``:
   the JSON), not just the final stage.
 * ``SimpleDenoiser`` everywhere — every CFGGuider in the workflow has
   ``cfg=1`` which is the no-op CFG case, so guidance machinery is bypassed.
-* Stage 1 image conditioning runs through ``LTXVPreprocess(img_compression=8)``
-  (CRF=8 H.264 round-trip) at ``strength=0.7``; Stages 2 and 3 use the resized
-  image directly (CRF=0 → ``preprocess()`` becomes the identity) at
-  ``strength=1.0``.
+* Stage 1 image conditioning runs through ``LTXVPreprocess(img_compression=18)``
+  (CRF=18 H.264 round-trip); Stages 2 and 3 use the resized image directly
+  (CRF=0 → ``preprocess()`` becomes the identity). All three stages use
+  ``strength=1.0`` (the ``ImageConditioningInput`` default).
 * Stage 1 uses an RF-correct ancestral Euler loop (port of ComfyUI's
   ``sample_euler_ancestral_RF``, ``eta=1.0``, ``s_noise=1.0``); Stages 2/3
   fall through to the default non-ancestral Euler in ``DiffusionStage``.
@@ -138,16 +138,10 @@ COMFY_STAGE_2_SIGMAS = (0.85, 0.7250, 0.4219, 0.0)
 # ManualSigmas "5012:5006" — Stage 3 schedule (identical to Stage 2).
 COMFY_STAGE_3_SIGMAS = (0.85, 0.7250, 0.4219, 0.0)
 
-# LTXVPreprocess("5013:3336") — img_compression=8 → H.264 CRF=8 on Stage 1
+# LTXVPreprocess("5013:3336") — img_compression=18 → H.264 CRF=18 on Stage 1
 # image only. Stages 2/3 take the resized image without preprocessing
 # (modeled here as CRF=0 → ltx_pipelines.media_io.preprocess() short-circuits).
-COMFY_STAGE_1_IMAGE_CRF = 8
-
-# LTXVImgToVideoConditionOnly("5013:3159") — strength=0.7 on Stage 1.
-# Stages 2/3 use strength=1.0 (LTXVImgToVideoConditionOnly "5001:4970" and
-# "5012:5008" in the JSON), which is the ImageConditioningInput default and
-# therefore needs no override at those stages.
-COMFY_STAGE_1_IMAGE_STRENGTH = 0.7
+COMFY_STAGE_1_IMAGE_CRF = 18
 
 # ResizeImageMaskNode("5016:4990") — scale longer dimension to 1536 with
 # Lanczos. The workflow runs this once and feeds the result to BOTH
@@ -433,12 +427,9 @@ class TI2VidTripleStagesComfyUIPipeline:
             stage_1_height = height // 4
             stage_1_width = width // 4
 
-            # LTXVPreprocess(img_compression=8) + LTXVImgToVideoConditionOnly(strength=0.7)
-            # → applies only to Stage 1 inputs. Stages 2/3 use strength=1.0 (default).
-            stage_1_images = [
-                img._replace(crf=COMFY_STAGE_1_IMAGE_CRF, strength=COMFY_STAGE_1_IMAGE_STRENGTH)
-                for img in images
-            ]
+            # LTXVPreprocess(img_compression=18) → applies only to Stage 1 inputs.
+            # Strength stays at the ImageConditioningInput default (1.0) for all stages.
+            stage_1_images = [img._replace(crf=COMFY_STAGE_1_IMAGE_CRF) for img in images]
             stage_1_conditionings = self.image_conditioner(
                 lambda enc: combined_image_conditionings(
                     images=stage_1_images,
