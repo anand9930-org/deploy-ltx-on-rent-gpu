@@ -61,7 +61,7 @@ class TestWorkflowLiterals:
         assert COMFY_STAGE_1_IMAGE_CRF == 18
         assert COMFY_DISTILLED_LORA_STRENGTH == 0.5
         assert COMFY_IMG_COND_STRENGTH == 1.0
-        assert COMFY_CFG == 1
+        assert COMFY_CFG == 1.0 and isinstance(COMFY_CFG, float)
         assert COMFY_DEFAULT_NUM_FRAMES == 241
         assert COMFY_DEFAULT_FRAME_RATE == 24.0
         assert COMFY_LATENT_DOWNSCALE == 4
