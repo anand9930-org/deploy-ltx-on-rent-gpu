@@ -122,6 +122,8 @@ from ltx_pipelines.utils.helpers import (
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import Denoiser, ModalitySpec
 
+logger = logging.getLogger(__name__)
+
 
 # ── ComfyUI workflow constants — pinned to the JSON literals ────────────────
 # Each block below is a 1:1 mirror of a ComfyUI node from
@@ -295,11 +297,20 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
     ``stepper`` is unused (kept for the ``loop=`` callable signature accepted
     by ``DiffusionStage.run_denoising``).
 
-    Mask handling: ``post_process_latent`` is applied to BOTH the conditional
-    and unconditional ``denoised`` outputs before stepping, so LTX
-    image-conditioning frames stay pinned to ``clean_latent`` at sampling time
-    — matching ComfyUI's ``KSamplerX0Inpaint``, which wraps the model *before*
-    the CFG combine and thus inpaints both passes.
+    Mask handling (image conditioning): at the TOP of each step the conditioned
+    region of the working latent (``video_state.latent`` / ``audio_state.latent``)
+    is re-pinned to ``clean_latent`` via ``post_process_latent`` (``denoise_mask``
+    is 0 there, so it's a no-op everywhere else). The cfg++ ancestral renoise term
+    touches every token — including the conditioned frame 0 — so without this the
+    transformer would see a noisy reference frame from step 1 on and stop
+    propagating the image conditioning (the I2V output would keep only frame 0 and
+    drift to a different subject after that). This mirrors the upstream euler
+    loop's ``_step_state`` (which ``post_process_latent``'s the latent fed into
+    each step) and ComfyUI's masked sampling (``noise_mask=0`` at the conditioned
+    frame ⇒ it is kept clean throughout, never renoised). The model OUTPUTS (both
+    ``denoised`` and ``uncond_denoised``) are also ``post_process_latent``'d before
+    the cfg++ step — ComfyUI inpaints the model output *before* the CFG combine, so
+    both passes get the pin.
 
     Both noise samplers share this loop's ``generator`` (renoise stream
     advances across video then audio per step). Each stage gets its own
@@ -321,6 +332,26 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
     audio_noise_sampler = make_noise_sampler(audio_state.latent) if audio_state is not None else None
 
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        # Re-pin the conditioned region of the working latent to clean_latent
+        # before the model forwards (see "Mask handling" in the docstring).
+        # denoise_mask is 0 only at the conditioned tokens ⇒ no-op elsewhere.
+        if video_state is not None:
+            if logger.isEnabledFor(logging.DEBUG):
+                drift = (
+                    (video_state.latent.float() - video_state.clean_latent.float())
+                    * (1.0 - video_state.denoise_mask)
+                ).norm().item()
+                logger.debug("cfgpp loop step %d: ||video x[cond] - clean|| before re-pin = %.6f", step_idx, drift)
+            video_state = replace(
+                video_state,
+                latent=post_process_latent(video_state.latent, video_state.denoise_mask, video_state.clean_latent),
+            )
+        if audio_state is not None:
+            audio_state = replace(
+                audio_state,
+                latent=post_process_latent(audio_state.latent, audio_state.denoise_mask, audio_state.clean_latent),
+            )
+
         # Conditional (positive/empty prompt) → x0 estimate; unconditional
         # (negative prompt) → uncond_denoised used by the cfg++ derivative.
         # Mirrors ComfyUI's calc_cond_batch with disable_cfg1_optimization=True.

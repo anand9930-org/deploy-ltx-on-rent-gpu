@@ -137,6 +137,13 @@ def cfgpp_denoising_step(
     to each modality independently (the step is element-wise); see
     ``ti2vid_triple_stages_comfyui._cfgpp_denoising_loop``.
 
+    Note: this step does NOT maintain an image-conditioning mask — the ancestral
+    renoise term ``x + alpha_t·noise_sampler()·s_noise·sigma_up`` adds noise to
+    *every* token, including any conditioned frame. ComfyUI handles that in its
+    masked-sampling wrapper (``noise_mask=0`` at the conditioned frame ⇒ it is kept
+    clean across steps); a caller using this function for I2V must re-pin the
+    conditioned region of ``x`` between steps (``_cfgpp_denoising_loop`` does).
+
     Returns the post-step ``x`` (matches upstream's ``x = ...`` assignments).
     """
     if sigma_next == 0:
