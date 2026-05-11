@@ -46,26 +46,24 @@ Key differences from ``ti2vid_triple_stages.py``:
   (CRF=18 H.264 round-trip); Stages 2 and 3 use the resized image directly
   (CRF=0 → ``preprocess()`` becomes the identity). All three stages use
   ``strength=1.0`` (the ``ImageConditioningInput`` default).
-* Stage 1 uses an RF-correct ancestral Euler loop (port of ComfyUI's
-  ``sample_euler_ancestral_RF``, ``eta=1.0``, ``s_noise=1.0``); Stages 2/3
-  fall through to the default non-ancestral Euler in ``DiffusionStage``.
+* Samplers come from vendored ComfyUI (``src/vendor/comfy_sampling.py``).
+  Stage 1 calls ``sample_euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0);
+  Stages 2/3 call ``sample_euler_cfg_pp`` (eta=0.0, s_noise=0.0). The
+  per-step math is shared via ``cfgpp_denoising_step``; we apply it in a
+  joint AV loop so the denoiser runs once per step (matching the workflow's
+  ``LTXVConcatAVLatent → SamplerCustomAdvanced → LTXVSeparateAVLatent``
+  pattern in compute terms, though we keep modalities split tensor-wise).
 * Stage 3 ``ModalitySpec`` carries the upscaled latent through as
   ``initial_latent`` (the original variant dropped this and restarted Stage 3
   from pure noise).
 
 Non-behavioral divergences (unavoidable framework gaps, listed for honesty):
 
-* ComfyUI uses ``euler_ancestral_cfg_pp`` for Stage 1 and ``euler_cfg_pp`` for
-  Stages 2+3. The ``cfg_pp`` (post-projection guidance) hook is a no-op when
-  ``cfg=1`` (every CFGGuider in the workflow), so ``euler_ancestral_cfg_pp``
-  collapses to ``euler_ancestral`` for our inputs. We port that — the RF
-  branch — verbatim in ``_ancestral_euler_denoising_loop``. Stages 2/3
-  collapse to plain Euler likewise.
 * ComfyUI ``VAEDecodeTiled(temporal_overlap=4)`` — ltx-pipelines requires
   ``tile_overlap_in_frames`` divisible by 8. We use 8. The default 241-frame
   request fits in a single 512-frame temporal tile so overlap is moot.
 * ComfyUI uses three independent ``RandomNoise`` seeds (one per stage); we
-  thread one ``torch.Generator`` through the noiser AND the Stage 1
+  thread one ``torch.Generator`` through the noiser AND each stage's
   ancestral renoise. Random draws still differ per stage because the
   generator's state advances between calls.
 """
@@ -223,52 +221,64 @@ def _resize_images_to_longer_dim(
     return out
 
 
-def _ancestral_euler_denoising_loop(  # noqa: PLR0913
+def _cfgpp_denoising_loop(  # noqa: PLR0913
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: DiffusionStepProtocol,
+    stepper: DiffusionStepProtocol,  # noqa: ARG001 — accepted for loop= signature; unused
     transformer: X0Model,
     denoiser: Denoiser,
     *,
     generator: torch.Generator,
+    eta: float,
+    s_noise: float,
 ) -> tuple[LatentState | None, LatentState | None]:
-    """Rectified-flow ancestral Euler — verbatim port of ComfyUI's
-    ``sample_euler_ancestral_RF`` (``comfy/k_diffusion/sampling.py``)
-    with ``eta=1.0`` and ``s_noise=1.0`` hardcoded to match the workflow's
-    ``KSamplerSelect(sampler_name="euler_ancestral_cfg_pp")`` defaults.
+    """Joint audio-video denoising loop using ComfyUI's CFG++ ancestral Euler.
 
-    LTX is a rectified-flow model (``x_t = (1-σ)·x_data + σ·noise``); ComfyUI
-    dispatches ``sample_euler_ancestral`` → ``sample_euler_ancestral_RF`` for
-    ``model_sampling.CONST`` checkpoints. The RF variant differs from the
-    plain k-diffusion (variance-exploding) form in two load-bearing places:
+    Per-step math is delegated to ``src.vendor.comfy_sampling.cfgpp_denoising_step``,
+    which is lifted verbatim from the else-branch of
+    ``comfy.k_diffusion.sampling.sample_euler_ancestral_cfg_pp`` (see that
+    module's docstring for the two stubs we apply for our cfg=1 + RF model).
 
-      * ``sigma_down`` is a fraction of ``sigma_next`` (controlled by ``eta``),
-        not derived from a ``sigma**2 - sigma_next**2`` variance budget.
-      * After the deterministic Euler step lands at ``sigma_down``, the
-        latent is rescaled by ``alpha_ip1 / alpha_down`` (i.e.
-        ``(1-σ_next) / (1-σ_down)``). This pulls the signal coefficient
-        back to ``1 - σ_next``. Without that rescale, the signal coefficient
-        compounds across steps (≈ 1.99×, 1.50×, 1.33× ... against the
-        Stage-1 schedule, ~14× over 7 steps) → saturated output.
+    Choice of ``eta``/``s_noise``:
 
-    The deterministic step is delegated to the existing
-    ``EulerDiffusionStep``: passing ``[sigma, sigma_down]`` and
-    ``step_idx=0`` produces ``(σ_down/σ)·x + (1 − σ_down/σ)·denoised'``,
-    exactly the linear-interp form ComfyUI uses inline.
+    * ``(1.0, 1.0)`` reproduces ComfyUI's ``euler_ancestral_cfg_pp`` (Stage 1).
+    * ``(0.0, 0.0)`` reproduces ComfyUI's ``euler_cfg_pp`` (Stages 2/3).
 
-    Mask handling matches ``_step_state`` in upstream
-    ``ltx_pipelines/utils/samplers.py``: ``post_process_latent`` is applied
-    to ``denoised`` (collapsing it onto the clean conditioning latent
-    weighted by ``denoise_mask``); the renoise term is added uniformly.
-    The algebra closes — at conditioned tokens the post-step latent is
-    ``(1 − σ_next)·clean + σ_next·noise`` for any mask value.
+    Why a custom loop instead of two ``sample_euler_ancestral_cfg_pp``
+    calls (one per modality): each step needs ONE joint forward of the
+    transformer producing both denoised tensors at once. Running ComfyUI's
+    sampler twice would double the transformer work. We invoke ``denoiser``
+    once per step here and apply ``cfgpp_denoising_step`` to each modality
+    independently — the math is identical to ComfyUI's single-tensor
+    sampler applied per-modality because the cfg_pp step is element-wise.
 
-    Audio runs alongside video by symmetry, sharing the per-pipeline
-    ``generator`` so the noise-stream advances deterministically.
+    The ``stepper`` argument is unused (kept for the ``loop=`` callable
+    signature accepted by ``DiffusionStage.run_denoising``); the CFG++
+    math has no use for upstream's ``EulerDiffusionStep``.
+
+    Mask handling: ``post_process_latent`` is applied to each modality's
+    ``denoised`` output before stepping, so LTX image-conditioning frames
+    stay pinned to ``clean_latent`` at sampling time (matches the
+    pre-refactor loop's lines and ComfyUI's ``KSamplerX0Inpaint`` mask
+    handling, which happens inside the model wrapper rather than the
+    sampler).
     """
-    eta = 1.0
-    s_noise = 1.0
+    from src.vendor.comfy_sampling import cfgpp_denoising_step
+
+    # Per-modality noise sampler. Both share the same generator so the noise
+    # stream advances deterministically across video then audio per step —
+    # mirroring the pre-refactor behaviour. (The workflow uses three
+    # independent RandomNoise seeds, one per stage; that's a separate
+    # follow-up.) torch.randn in fp32 matches the pre-refactor renoise dtype.
+    def make_noise_sampler(latent_template: torch.Tensor):
+        return lambda sigma, sigma_next: torch.randn(
+            latent_template.shape, dtype=torch.float32,
+            device=latent_template.device, generator=generator,
+        )
+
+    video_noise_sampler = make_noise_sampler(video_state.latent) if video_state is not None else None
+    audio_noise_sampler = make_noise_sampler(audio_state.latent) if audio_state is not None else None
 
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
@@ -276,46 +286,33 @@ def _ancestral_euler_denoising_loop(  # noqa: PLR0913
         sigma = sigmas[step_idx].to(torch.float32)
         sigma_next = sigmas[step_idx + 1].to(torch.float32)
 
-        if sigma_next.item() == 0.0:
-            # Final step: collapse to the (post-processed) clean prediction.
-            # ComfyUI's RF loop branches with ``if sigmas[i+1] == 0: x = denoised``.
-            if video_state is not None and denoised_video is not None:
-                pp = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
-                video_state = replace(video_state, latent=pp.to(video_state.latent.dtype))
-            if audio_state is not None and denoised_audio is not None:
-                pp = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
-                audio_state = replace(audio_state, latent=pp.to(audio_state.latent.dtype))
-            continue
-
-        downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * eta
-        sigma_down = sigma_next * downstep_ratio
-        alpha_ip1 = 1.0 - sigma_next
-        alpha_down = 1.0 - sigma_down
-        renoise_coeff = (sigma_next**2 - sigma_down**2 * alpha_ip1**2 / alpha_down**2).clamp_min(0.0).sqrt()
-        alpha_ratio = alpha_ip1 / alpha_down
-
-        # 2-element sigma slice → linear-interp Euler step to sigma_down.
-        step_sigmas = torch.stack([sigma, sigma_down])
-
         if video_state is not None and denoised_video is not None:
             v_dtype = video_state.latent.dtype
             v_pp = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
-            v_step = stepper.step(video_state.latent, v_pp, step_sigmas, 0)
-            v_noise = torch.randn(
-                v_step.shape, dtype=torch.float32, device=v_step.device, generator=generator,
+            # cfg=1 → uncond_denoised == denoised; pass the post-processed
+            # tensor for both (matches ComfyUI's CFGGuider behavior at cfg=1).
+            v_new = cfgpp_denoising_step(
+                video_state.latent.to(torch.float32),
+                v_pp.to(torch.float32),
+                v_pp.to(torch.float32),
+                sigma, sigma_next,
+                eta=eta, s_noise=s_noise,
+                noise_sampler=video_noise_sampler,
             )
-            v_renoised = alpha_ratio * v_step.to(torch.float32) + v_noise * (s_noise * renoise_coeff)
-            video_state = replace(video_state, latent=v_renoised.to(v_dtype))
+            video_state = replace(video_state, latent=v_new.to(v_dtype))
 
         if audio_state is not None and denoised_audio is not None:
             a_dtype = audio_state.latent.dtype
             a_pp = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
-            a_step = stepper.step(audio_state.latent, a_pp, step_sigmas, 0)
-            a_noise = torch.randn(
-                a_step.shape, dtype=torch.float32, device=a_step.device, generator=generator,
+            a_new = cfgpp_denoising_step(
+                audio_state.latent.to(torch.float32),
+                a_pp.to(torch.float32),
+                a_pp.to(torch.float32),
+                sigma, sigma_next,
+                eta=eta, s_noise=s_noise,
+                noise_sampler=audio_noise_sampler,
             )
-            a_renoised = alpha_ratio * a_step.to(torch.float32) + a_noise * (s_noise * renoise_coeff)
-            audio_state = replace(audio_state, latent=a_renoised.to(a_dtype))
+            audio_state = replace(audio_state, latent=a_new.to(a_dtype))
 
     return video_state, audio_state
 
@@ -458,9 +455,10 @@ class TI2VidTripleStagesComfyUIPipeline:
                     context=a_context_p,
                     noise_scale=stage_1_sigmas[0].item(),
                 ),
-                # ComfyUI uses ``euler_ancestral_cfg_pp`` for Stage 1 only;
-                # Stages 2/3 use the default non-ancestral Euler.
-                loop=functools.partial(_ancestral_euler_denoising_loop, generator=generator),
+                # ComfyUI's ``euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0).
+                loop=functools.partial(
+                    _cfgpp_denoising_loop, generator=generator, eta=1.0, s_noise=1.0,
+                ),
                 max_batch_size=max_batch_size,
             )
 
@@ -504,6 +502,10 @@ class TI2VidTripleStagesComfyUIPipeline:
                     noise_scale=stage_2_sigmas[0].item(),
                     initial_latent=audio_state.latent,
                 ),
+                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0).
+                loop=functools.partial(
+                    _cfgpp_denoising_loop, generator=generator, eta=0.0, s_noise=0.0,
+                ),
                 max_batch_size=max_batch_size,
             )
 
@@ -540,6 +542,10 @@ class TI2VidTripleStagesComfyUIPipeline:
                     context=a_context_p,
                     noise_scale=stage_3_sigmas[0].item(),
                     initial_latent=audio_state.latent,
+                ),
+                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0).
+                loop=functools.partial(
+                    _cfgpp_denoising_loop, generator=generator, eta=0.0, s_noise=0.0,
                 ),
                 max_batch_size=max_batch_size,
             )
