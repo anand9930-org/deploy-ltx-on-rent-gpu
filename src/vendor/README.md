@@ -13,6 +13,7 @@ bump the SHA below.
 | File | Source | Commit |
 |---|---|---|
 | `ti2vid_triple_stages.py` | https://github.com/eisneim/LTX-2_3_stage_sampling_i2v/blob/main/packages/ltx-pipelines/src/ltx_pipelines/ti2vid_triple_stages.py | `190d474564e78589fd1b7b7109103ded3fab8adb` (main, 2026-04-08) |
+| `comfy_sampling.py` | https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/k_diffusion/sampling.py | `f505cb4070d197f8fc783938319cf49015548e80` (master, 2026-05-11) |
 
 ## How to refresh a file
 
