@@ -22,23 +22,9 @@ dependencies = [
     # with a build-time assertion; this floor is kept as documentation so the
     # requirement survives a resolver replay (e.g. regenerating uv.lock).
     "anyio>=4.9",
-    # torchaudio is intentionally NOT listed here. ltx-core declares it as a
-    # transitive dep, but: (1) every PyPI torchaudio release declares a
-    # strict companion `torch==<exact>` pin which would force uv to replace
-    # NGC's NVIDIA-patched torch 2.8.0a0+...nv25.6 with stock PyPI torch,
-    # breaking NGC torchvision's ABI (`torchvision::nms` op fails to
-    # register); (2) our service is video-only — `audio_guider_params` is
-    # None on every request — so the audio_vae code path that touches
-    # torchaudio APIs is unreachable. The Dockerfile strips torchaudio from
-    # upstream ltx-core's pyproject and installs a pure-Python stub.
-    # FlashAttention 3 is installed separately in the Dockerfile from a
-    # self-built wheel cached on this repo's GitHub Releases. The wheel
-    # MUST be built inside the NGC pytorch:25.06-py3 base image because
-    # NGC's torch fork (`2.8.0a0+nv25.6`) lacks the two-arg
-    # `c10::cuda::SetDevice(int8_t, bool)` symbol that every stock-PyPI
-    # torch-2.8 wheel links — community/PyPI wheels fail to load.
-    # Kept out of pyproject because no PyPI wheel works for our base
-    # image. Build/cache flow + bump runbook: docs/fa3-wheel-process.md.
+    # torch, torchvision, numpy are provided by the NGC base image and
+    # must NOT be listed here — PyPI versions would clobber the NVIDIA ABI.
+    # ComfyUI's requirements are also stripped of these in the Dockerfile.
 ]
 
 [project.optional-dependencies]

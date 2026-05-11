@@ -1,6 +1,6 @@
 """Tests for pipeline helper functions (no GPU needed)."""
 
-from src.pipeline import _round_to, _round_frames, DEFAULT_NEGATIVE_PROMPT
+from src.pipeline import DEFAULT_NEGATIVE_PROMPT, _round_frames, _round_to
 
 
 class TestRoundTo:
@@ -22,13 +22,13 @@ class TestRoundFrames:
         assert _round_frames(121) == 121  # (121-1)/8 = 15 → 15*8+1 = 121
 
     def test_rounds_to_8k_plus_1(self):
-        assert _round_frames(100) == 97   # (100-1)/8 = 12 → 12*8+1 = 97
+        assert _round_frames(100) == 97  # (100-1)/8 = 12 → 12*8+1 = 97
 
     def test_minimum(self):
-        assert _round_frames(9) == 9      # (9-1)/8 = 1 → 1*8+1 = 9
+        assert _round_frames(9) == 9  # (9-1)/8 = 1 → 1*8+1 = 9
 
     def test_not_8k_plus_1(self):
-        assert _round_frames(10) == 9     # (10-1)/8 = 1 → 1*8+1 = 9
+        assert _round_frames(10) == 9  # (10-1)/8 = 1 → 1*8+1 = 9
 
     def test_large(self):
         assert _round_frames(257) == 257  # (257-1)/8 = 32 → 32*8+1 = 257

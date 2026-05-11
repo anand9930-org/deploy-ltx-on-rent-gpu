@@ -1,194 +1,51 @@
 # ============================================================================
-# LTX-2.3 22B — BentoML video generation service
+# LTX-2.3 22B — BentoML video generation service (ComfyUI graph pipeline)
 # ============================================================================
 # Models are expected at $MODEL_DIR (default /models), typically mounted
-# as a volume.  Downloaded on first boot if not already present (~64 GB).
+# as a volume.  Downloaded on first boot if not already present (~63 GB).
 # ============================================================================
 
-# Base image matches the one TensorRT-LLM v1.0.0 itself is built against
-# (nvidia/TensorRT-LLM@v1.0.0 docker/Dockerfile.multi). Ships Python 3.12,
-# torch 2.8.0a0, CUDA 12.9.1 on Ubuntu 24.04 — cp312 is required because
-# `tensorrt-llm==1.0.0` only publishes cp310/cp312 wheels (no cp311).
 FROM nvcr.io/nvidia/pytorch:25.06-py3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HF_HOME=/models/huggingface \
-    LTX_FP8_MODE=scaled_mm \
     TORCH_LOGS=recompiles_verbose
 
 # ---- System dependencies + uv ----------------------------------------------
-# libopenmpi-dev provides the MPI headers/libraries that tensorrt-llm's
-# openmpi wheel dlopens at import time. Without them the
-# `import tensorrt_llm` probe inside QuantizationPolicy.fp8_scaled_mm()
-# fails with a bare `ImportError` and we silently fall back to BF16.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg git-lfs gcc libopenmpi-dev \
+        ffmpeg git-lfs gcc \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- NGC pip-constraint hygiene --------------------------------------------
-# NGC ships /etc/pip/constraint.txt pinning every pre-installed Python
-# package to the versions NVIDIA tested. The documented way to override a
-# pin (NGC PyTorch 25.06 release notes) is to strip the package's line
-# from this file before installing your own version. We strip `anyio`
-# because NGC pins it below 4.9 and httpx_ws (pulled by bentoml) needs
-# anyio.AsyncContextManagerMixin, added in 4.9.0.
-#
-# Note: `uv pip install` does NOT read this file — uv only honors
-# UV_CONSTRAINT / --constraint. We still strip the line as hygiene for
-# any downstream pip invocation (e.g. `pip install` inside a subprocess
-# or future migration to `uv --constraint /etc/pip/constraint.txt`).
-# The actual uv-side upgrade is performed explicitly further below.
 RUN sed -i '/^anyio/d' /etc/pip/constraint.txt
-
-# ---- Clone LTX-2 and install its packages ----------------------------------
-# The `[fp8-trtllm]` extra pulls tensorrt-llm==1.0.0 + onnx + openmpi from
-# pypi.nvidia.com and registers the `torch.ops.tensorrt_llm.*` +
-# `torch.ops.trtllm.*` ops used by FP8Linear.forward on the scaled_mm
-# (H100 W8A8) path. This extra is mutex with `[xformers]` in upstream
-# pyproject.toml — that's fine here because LTX-2-ref's attention
-# dispatcher falls back to torch SDPA and FA3 is installed separately
-# below.
-#
-# In-place patches (both targeted seds with grep-based verification so the
-# build fails loudly if upstream refactors):
-#
-# 1. force use_fast=True on the Gemma image processor so the Rust-backed
-#    tokenizer runs instead of the slow Python fallback. Default in
-#    transformers >=4.52 anyway; forcing it eliminates the "Using a slow
-#    image processor" warning and shaves a second or two off text encoding.
-#
-# 2. strip the unconstrained `"torchaudio",` dep from ltx-core's pyproject
-#    BEFORE uv resolves it. Every PyPI torchaudio release declares a strict
-#    companion `torch==<exact>` pin that would force uv to replace NGC's
-#    NVIDIA-patched torch 2.8.0a0+...nv25.6 with stock PyPI torch — which
-#    breaks NGC torchvision's ABI (`torchvision::nms` op fails to register,
-#    bombing `transformers.AutoImageProcessor` at import). Our service is
-#    video-only (audio_guider_params is None on every request), so the
-#    audio_vae code path that touches torchaudio APIs is unreachable. A
-#    pure-Python stub is dropped into site-packages further down satisfies
-#    the `import torchaudio` at module load.
-# Pin upstream LTX-2 to a known-good commit. Bumping is a one-line ARG
-# change — see docs/upstream-bump.md when that runbook lands. Without
-# this pin, every rebuild silently captures whatever upstream pushed to
-# main last; the two sed patches below are also keyed off this SHA, so
-# unpinned upstream is a regex roulette every build.
-#
-# `git init + fetch <SHA>` (instead of `clone --depth 1`) keeps the
-# shallow-clone speed (~5 MB) while letting us check out an arbitrary
-# historical SHA — `clone --depth 1` only ever gives the branch tip.
-ARG LTX2_UPSTREAM_SHA=41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
-RUN git init /app/LTX-2 \
-    && git -C /app/LTX-2 remote add origin https://github.com/Lightricks/LTX-2.git \
-    && git -C /app/LTX-2 fetch --depth 1 origin "${LTX2_UPSTREAM_SHA}" \
-    && git -C /app/LTX-2 checkout FETCH_HEAD \
-    && sed -i 's|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)|AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=True)|' \
-        /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
-    && grep -q "use_fast=True" /app/LTX-2/packages/ltx-core/src/ltx_core/text_encoders/gemma/encoders/base_encoder.py \
-    && sed -i '/"torchaudio",/d' /app/LTX-2/packages/ltx-core/pyproject.toml \
-    && ! grep -q '^\s*"torchaudio"' /app/LTX-2/packages/ltx-core/pyproject.toml \
-    && uv pip install --system --break-system-packages --no-cache \
-        --extra-index-url https://pypi.nvidia.com \
-        -e "/app/LTX-2/packages/ltx-core[fp8-trtllm]" \
-        -e /app/LTX-2/packages/ltx-pipelines
 
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --break-system-packages --no-cache /app
 
-# ---- FlashAttention 3 (sm_90 only) -----------------------------------------
-# Self-built wheel cached as a GitHub Release asset, keyed by
-# (FA3 commit SHA, NGC base tag). See docs/fa3-wheel-process.md for the
-# ABI rationale and the build/bump runbook. sm_90 only — non-Hopper pods
-# must launch with `LTX_ATTENTION_TYPE=` (see start.sh) for SDPA fallback.
-ARG FA3_WHEEL_URL=https://github.com/anand9930-org/deploy-ltx-on-rent-gpu/releases/download/fa3-ngc25.06-6c73fb50/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl
-ARG FA3_WHEEL_SHA256=1f1598465ea9ea3ba51084050358f90b08d2d5b5435ef205b8265fd3d59aff9c
-# Decode `%2B` → `+` so uv reads the on-disk filename per PEP 427.
-RUN if [ "${FA3_WHEEL_URL}" = "__SET_BY_BUILD_FA3_WHEEL_SH__" ] \
-        || [ "${FA3_WHEEL_SHA256}" = "__SET_BY_BUILD_FA3_WHEEL_SH__" ]; then \
-        echo "ERROR: FA3_WHEEL_URL/SHA256 are unset placeholders." >&2; \
-        echo "       Run scripts/runpod_build_fa3_wheel.sh, then paste the" >&2; \
-        echo "       printed values into the ARG defaults above." >&2; \
-        echo "       See docs/fa3-wheel-process.md for the full runbook." >&2; \
-        exit 1; \
-    fi \
-    && FA3_WHEEL_FILE="/tmp/$(basename "${FA3_WHEEL_URL}" | sed 's/%2B/+/g')" \
-    && curl -fsSL --retry 3 -o "${FA3_WHEEL_FILE}" "${FA3_WHEEL_URL}" \
-    && echo "${FA3_WHEEL_SHA256}  ${FA3_WHEEL_FILE}" | sha256sum -c - \
-    && uv pip install --system --break-system-packages --no-cache --no-deps "${FA3_WHEEL_FILE}" \
-    && python -c "import flash_attn_interface; \
-        v = getattr(flash_attn_interface, '__version__', 'unknown'); \
-        assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func API'; \
-        print('FA3 wheel installed OK:', v)" \
-    && rm -f "${FA3_WHEEL_FILE}"
-
-# ---- Pure-Python torchaudio stub -------------------------------------------
-# ltx-core's audio_vae module does `import torchaudio` at module load time
-# (ops.py:2) even though the class instantiation (`MelSpectrogram(...)`) and
-# function calls (`torchaudio.functional.resample`) are lazy and only fire
-# when an audio generation is requested. Since our service never passes
-# `audio_guider_params`, those APIs are never hit — but the top-level import
-# still needs to succeed or every pipeline load fails.
-#
-# We don't install the real torchaudio (see rationale in the two-sed block
-# above). Instead, write a minimal pure-Python package that has the right
-# import surface. If anything ever reaches the NotImplementedError, we want
-# a loud failure rather than a silent wrong-result.
-RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
-    && mkdir -p "$SITE/torchaudio" \
-    && printf '%s\n' \
-        'from . import functional, transforms  # noqa: F401' \
-        '__version__ = "0.0.0-stub"' \
-        > "$SITE/torchaudio/__init__.py" \
-    && printf '%s\n' \
-        'class MelSpectrogram:' \
-        '    def __init__(self, *a, **kw):' \
-        '        raise NotImplementedError(' \
-        '            "torchaudio stub: audio path disabled on this deployment"' \
-        '        )' \
-        > "$SITE/torchaudio/transforms.py" \
-    && printf '%s\n' \
-        'def resample(*a, **kw):' \
-        '    raise NotImplementedError(' \
-        '        "torchaudio stub: audio path disabled on this deployment"' \
-        '    )' \
-        > "$SITE/torchaudio/functional.py"
-
-# ---- Consolidated boot-blocker assertions ----------------------------------
+# ---- Boot-blocker assertions -----------------------------------------------
 # Upgrade anyio past NGC's pre-installed 4.8.x (httpx_ws needs
-# AsyncContextManagerMixin from 4.9.0) AND verify the full stack in one
-# shot: NGC torch still in place, torchvision's native ops load, and the
-# torchaudio import resolves to our stub. Any failure aborts the build.
-# Pin numpy<2 — NGC torch is built against NumPy 1.x; NumPy 2.x silently
-# breaks `torch.Tensor.numpy()` and crashes encode_video.
+# AsyncContextManagerMixin from 4.9.0) AND verify the stack in one shot.
+# Pin numpy<2 — NGC torch is built against NumPy 1.x.
 RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' 'numpy<2' \
     && python -c "\
-import importlib.metadata as m, anyio, numpy, torch, torchvision, torchaudio, flash_attn_interface; \
+import importlib.metadata as m, anyio, numpy, torch, torchvision; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
 assert numpy.__version__.split('.')[0] == '1', f'numpy must be 1.x for NGC torch ABI; got {numpy.__version__}'; \
 assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
 torchvision.ops.nms; \
-assert torchaudio.__version__ == '0.0.0-stub', f'real torchaudio leaked: {torchaudio.__version__}'; \
-assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flash_attn_func'; \
 torch.zeros(2).numpy(); \
-print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
+print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__)"
 
-# ---- ComfyUI (triple_stages_comfyui pipeline only) -------------------------
-# That pipeline runs the real ComfyUI **core** node classes — no ComfyUI-LTXVideo
-# (its modules use relative imports that need the full nodes.init_extra_nodes()
-# runtime; the two nodes the workflow uses from it — LTXVImgToVideoConditionOnly,
-# LTXFloatToInt — have core equivalents: LTXVImgToVideoInplace and round(),
-# see src/pipeline/triple_stages_comfyui_graph.py). We clone (not pip-install) so
-# the SHA is pinnable like LTX2_UPSTREAM_SHA above. Strip torch / torchvision /
+# ---- ComfyUI ----------------------------------------------------------------
+# The pipeline runs real ComfyUI **core** node classes — no ComfyUI-LTXVideo.
+# Clone (not pip-install) so the SHA is pinnable. Strip torch / torchvision /
 # torchaudio / numpy / transformers / diffusers / Pillow from ComfyUI's
-# requirements so the NGC torch ABI pins (+ our torchaudio stub + numpy<2)
-# survive — then re-assert the NGC stack is intact. The legacy ltx_pipelines
-# triple-stages-comfyui path is still reachable via COMFYUI_GRAPH_MODE=0 and does
-# NOT need ComfyUI; this block is the only thing the new path adds, so the other
-# pipelines are untouched.
+# requirements so the NGC torch ABI pins survive.
 ARG COMFYUI_SHA=64b8457f55cd7fb54ca7a956d9c73b505e903e0c
 RUN git init /app/ComfyUI \
     && git -C /app/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
@@ -199,10 +56,9 @@ RUN git init /app/ComfyUI \
     && uv pip install --system --break-system-packages --no-cache \
         -r /app/ComfyUI/requirements.txt \
     && python -c "\
-import torch, numpy, torchaudio, torchvision; \
+import torch, numpy, torchvision; \
 assert numpy.__version__.split('.')[0] == '1', f'numpy clobbered by ComfyUI install: {numpy.__version__}'; \
 assert '.nv' in torch.__version__, f'NGC torch clobbered by ComfyUI install: {torch.__version__}'; \
-assert torchaudio.__version__ == '0.0.0-stub', f'torchaudio stub clobbered by ComfyUI install: {torchaudio.__version__}'; \
 torchvision.ops.nms; torch.zeros(2).numpy(); \
 print('NGC stack intact after ComfyUI install — torch', torch.__version__, '/ numpy', numpy.__version__, '/ torchvision', torchvision.__version__)"
 ENV COMFYUI_PATH=/app/ComfyUI
@@ -213,24 +69,10 @@ COPY service.py /app/service.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-# ---- Upstream contract fail-fast -------------------------------------------
-# `src/upstream.py` is the single chokepoint for every ltx_core / ltx_pipelines
-# symbol the service consumes. Importing it here turns an upstream rename at
-# the pinned SHA into a build failure with the exact missing name, instead of
-# a cryptic AttributeError 30 minutes into a generation on a deployed pod.
-RUN PYTHONPATH=/app python -c "import src.upstream; print('upstream contract OK')"
-
-# ---- ComfyUI node-contract fail-fast (triple_stages_comfyui-graph path) ----
-# Analog of the `import src.upstream` check above, for the ComfyUI side: bootstrap
-# the minimal ComfyUI runtime and import every ComfyUI core node class the cascade
-# in src/pipeline/triple_stages_comfyui_graph.py uses, so a node rename / wrong
-# COMFYUI_SHA fails the build instead of a request 5 minutes in. (No ComfyUI-LTXVideo
-# import — that pipeline uses only ComfyUI core nodes; see the graph module.)
-# cpu_only=True: this builder has no NVIDIA driver, and `import nodes` pulls in
-# comfy.model_management which probes torch.cuda at import time unless args.cpu is
-# set — bootstrap_once(cpu_only=True) sets it before the node imports. /models is
-# empty at build time — fine (bootstrap only *registers* the model dirs; node
-# imports don't scan them).
+# ---- ComfyUI node-contract fail-fast ----------------------------------------
+# Bootstrap the minimal ComfyUI runtime and import every core node class the
+# cascade uses, so a node rename / wrong COMFYUI_SHA fails the build instead
+# of a request 5 minutes in.
 RUN PYTHONPATH=/app python -c "\
 import os; \
 from src import comfyui_runtime; \

@@ -14,53 +14,23 @@ class TestEnsureModelsDownloaded:
             with pytest.raises(RuntimeError, match="HF_TOKEN"):
                 ensure_models_downloaded(str(tmp_path))
 
-    @pytest.mark.parametrize("fp8_mode", ["", "cast", "scaled_mm"])
-    def test_skips_existing_files(self, tmp_path, fp8_mode):
-        """If all model files for the given LTX_FP8_MODE exist, no downloads
-        happen. Parametrized over the three boot modes the wrapper supports —
-        each mode pulls a different union of T2V + unified files.
-        """
+    def test_skips_existing_files(self, tmp_path):
+        """If all model files exist, no downloads happen."""
         from src.download_models import ensure_models_downloaded
 
-        # Always-present files (T2V dev BF16 base + distilled LoRA + unified
-        # base + IC-LoRA + spatial upscaler). Distilled LoRA is now required
-        # on every FP8 mode (triple-stages-ComfyUI scaled_mm fuses it at
-        # runtime on top of dev-fp8; cast/bf16 stacks it via the vendored
-        # class — see src/pipeline/triple_stages_comfyui.py).
-        (tmp_path / "ltx-2.3-22b-dev.safetensors").touch()
+        (tmp_path / "ltx-2.3-22b-dev-fp8.safetensors").touch()
         (tmp_path / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors").touch()
-        (tmp_path / "ltx-2.3-22b-distilled-1.1.safetensors").touch()
         (tmp_path / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors").touch()
-        (tmp_path / "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors").touch()
 
-        # scaled_mm pulls the dev FP8 DiT in addition.
-        if fp8_mode == "scaled_mm":
-            (tmp_path / "ltx-2.3-22b-dev-fp8.safetensors").touch()
-
-        # Both FP8 paths share the distilled FP8 DiT.
-        if fp8_mode in ("scaled_mm", "cast"):
-            (tmp_path / "ltx-2.3-22b-distilled-fp8.safetensors").touch()
-
-        gemma_dir = tmp_path / "gemma-3-12b-it-qat-q4_0-unquantized"
-        gemma_dir.mkdir()
-        (gemma_dir / "model.safetensors").touch()
-
-        # Consolidated single-file Gemma for the ComfyUI-graph triple-stages
-        # pipeline (Comfy-Org/ltx-2 → split_files/text_encoders/...).
         comfy_te_dir = tmp_path / "split_files" / "text_encoders"
         comfy_te_dir.mkdir(parents=True)
         (comfy_te_dir / "gemma_3_12B_it.safetensors").touch()
 
-        env = {"HF_TOKEN": "hf_test"}
-        if fp8_mode:
-            env["LTX_FP8_MODE"] = fp8_mode
-        with patch.dict(os.environ, env, clear=True):
-            with patch("src.download_models.hf_hub_download") as mock_dl, \
-                 patch("src.download_models.snapshot_download") as mock_snap:
+        with patch.dict(os.environ, {"HF_TOKEN": "hf_test"}, clear=True):
+            with patch("src.download_models.hf_hub_download") as mock_dl:
                 ensure_models_downloaded(str(tmp_path))
 
         mock_dl.assert_not_called()
-        mock_snap.assert_not_called()
 
     def test_creates_model_dir(self, tmp_path):
         """Should create the model directory if it doesn't exist."""
@@ -68,47 +38,21 @@ class TestEnsureModelsDownloaded:
 
         model_dir = tmp_path / "subdir" / "models"
         with patch.dict(os.environ, {"HF_TOKEN": "hf_test"}):
-            with patch("src.download_models.hf_hub_download"), \
-                 patch("src.download_models.snapshot_download"):
+            with patch("src.download_models.hf_hub_download"):
                 ensure_models_downloaded(str(model_dir))
 
         assert model_dir.exists()
 
-    def test_scaled_mm_pulls_dev_fp8_and_distilled_lora(self, tmp_path):
-        """scaled_mm mode must trigger dev-fp8 + distilled-LoRA + distilled-fp8
-        downloads. The distilled LoRA is fused at runtime into each rebuilt
-        stage of the triple-stages-ComfyUI pipeline (see
-        src/pipeline/triple_stages_comfyui.py)."""
+    def test_downloads_all_four_models(self, tmp_path):
+        """All four model files should be downloaded when none are cached."""
         from src.download_models import ensure_models_downloaded
 
-        with patch.dict(
-            os.environ,
-            {"HF_TOKEN": "hf_test", "LTX_FP8_MODE": "scaled_mm"},
-            clear=True,
-        ):
-            with patch("src.download_models.hf_hub_download") as mock_dl, \
-                 patch("src.download_models.snapshot_download"):
+        with patch.dict(os.environ, {"HF_TOKEN": "hf_test"}, clear=True):
+            with patch("src.download_models.hf_hub_download") as mock_dl:
                 ensure_models_downloaded(str(tmp_path))
 
         called_files = [c.kwargs.get("filename") for c in mock_dl.call_args_list]
         assert "ltx-2.3-22b-dev-fp8.safetensors" in called_files
-        assert "ltx-2.3-22b-distilled-fp8.safetensors" in called_files
         assert "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" in called_files
-
-    def test_cast_pulls_distilled_lora_not_dev_fp8(self, tmp_path):
-        """cast mode pulls the distilled LoRA + distilled-fp8 but no dev-fp8."""
-        from src.download_models import ensure_models_downloaded
-
-        with patch.dict(
-            os.environ,
-            {"HF_TOKEN": "hf_test", "LTX_FP8_MODE": "cast"},
-            clear=True,
-        ):
-            with patch("src.download_models.hf_hub_download") as mock_dl, \
-                 patch("src.download_models.snapshot_download"):
-                ensure_models_downloaded(str(tmp_path))
-
-        called_files = [c.kwargs.get("filename") for c in mock_dl.call_args_list]
-        assert "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" in called_files
-        assert "ltx-2.3-22b-distilled-fp8.safetensors" in called_files
-        assert "ltx-2.3-22b-dev-fp8.safetensors" not in called_files
+        assert "ltx-2.3-spatial-upscaler-x2-1.1.safetensors" in called_files
+        assert "split_files/text_encoders/gemma_3_12B_it.safetensors" in called_files

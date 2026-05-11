@@ -1,49 +1,19 @@
-import os
 import logging
+import os
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-
-# T2V (TI2VidTwoStagesPipeline) baseline. Required regardless of FP8 mode —
-# stage 1 uses dev BF16 directly (cast path) and the BF16 file also packs
-# every non-DiT block (VAE, audio decoder, vocoder, image encoder, embeddings
-# processor) loaded by other pipeline blocks via *_COMFY_KEYS_FILTER, so
-# scaled_mm still needs it for non-DiT subcomponents.
-DEV_CHECKPOINT_FILENAME = "ltx-2.3-22b-dev.safetensors"
-DEV_CHECKPOINT_REPO = "Lightricks/LTX-2.3"
-
-# Distilled LoRA. Required on every FP8 mode:
-#   - T2V cast/bf16: stage 2 fuses on top of dev BF16.
-#   - Triple-stages-ComfyUI scaled_mm: fused at runtime into each rebuilt
-#     stage on top of dev-fp8 (see src/pipeline/triple_stages_comfyui.py).
-#   - Triple-stages-ComfyUI cast/bf16: stacked on every stage by the
-#     vendored class.
-DISTILLED_LORA_FILENAME = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-DISTILLED_LORA_REPO = "Lightricks/LTX-2.3"
-
-# Pre-quantized dev FP8 DiT (~30 GB). Stage 1 of the T2V scaled_mm path.
+# Dev FP8 checkpoint (~30 GB). ComfyUI handles FP8 natively.
 DEV_FP8_FILENAME = "ltx-2.3-22b-dev-fp8.safetensors"
 DEV_FP8_REPO = "Lightricks/LTX-2.3-fp8"
 
-# Lightricks-official distilled-1.1 BF16 baseline. IC-LoRA Union-Control was
-# trained against this exact distilled checkpoint, so applying the IC-LoRA at
-# runtime on top of distilled-1.1 reproduces the trained configuration. Used
-# by the unified (I2V/V2V) pipeline only.
-DISTILLED_CHECKPOINT_FILENAME = "ltx-2.3-22b-distilled-1.1.safetensors"
-DISTILLED_CHECKPOINT_REPO = "Lightricks/LTX-2.3"
-
-IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
-IC_LORA_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
-
-# Pre-quantized distilled FP8 DiT (~30 GB). Shared between T2V stage 2 and
-# unified stages 1+2 in scaled_mm mode. DiT-only — non-DiT blocks still
-# load from the BF16 files via *_COMFY_KEYS_FILTER.
-DISTILLED_FP8_FILENAME = "ltx-2.3-22b-distilled-fp8.safetensors"
-DISTILLED_FP8_REPO = "Lightricks/LTX-2.3-fp8"
+# Distilled LoRA — fused at strength 0.5 on all three stages by the workflow.
+DISTILLED_LORA_FILENAME = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+DISTILLED_LORA_REPO = "Lightricks/LTX-2.3"
 
 
 def _hf_get(repo_id: str, filename: str, model_dir: str, hf_token: str, label: str) -> None:
@@ -53,17 +23,15 @@ def _hf_get(repo_id: str, filename: str, model_dir: str, hf_token: str, label: s
         return
     logger.info("Downloading %s ...", label)
     hf_hub_download(
-        repo_id=repo_id, filename=filename,
-        local_dir=model_dir, token=hf_token,
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=model_dir,
+        token=hf_token,
     )
 
 
 def ensure_models_downloaded(model_dir: str) -> None:
-    """Download every checkpoint both upstream pipelines need into
-    ``model_dir``. Required regardless of mode: dev-BF16, distilled-LoRA,
-    distilled-1.1 BF16, spatial upsampler, IC-LoRA, Gemma 3 12B.
-    FP8-mode-gated: dev-fp8 (scaled_mm only), distilled-fp8 (scaled_mm + cast).
-    """
+    """Download every checkpoint the ComfyUI graph pipeline needs."""
     os.makedirs(model_dir, exist_ok=True)
     settings = get_settings()
     hf_token = settings.hf_token
@@ -73,102 +41,46 @@ def ensure_models_downloaded(model_dir: str) -> None:
             "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized"
         )
 
-    fp8_mode = settings.ltx_fp8_mode.strip().lower()
-
-    # 1. dev BF16 — T2V stage 1 base (cast) + non-DiT blocks for both pipelines.
+    # 1. Dev FP8 checkpoint (~30 GB).
     _hf_get(
-        DEV_CHECKPOINT_REPO, DEV_CHECKPOINT_FILENAME, model_dir, hf_token,
-        "LTX-2.3 dev BF16 checkpoint (~46 GB)",
+        DEV_FP8_REPO,
+        DEV_FP8_FILENAME,
+        model_dir,
+        hf_token,
+        "LTX-2.3 dev FP8 checkpoint (~30 GB)",
     )
 
-    # 2. distilled-LoRA — required on every FP8 mode (T2V cast/bf16 stage 2,
-    # triple-stages-ComfyUI runtime fusion on scaled_mm + cast/bf16). See the
-    # docstring on DISTILLED_LORA_FILENAME for per-pipeline detail.
+    # 2. Distilled LoRA (~7.6 GB).
     _hf_get(
-        DISTILLED_LORA_REPO, DISTILLED_LORA_FILENAME, model_dir, hf_token,
+        DISTILLED_LORA_REPO,
+        DISTILLED_LORA_FILENAME,
+        model_dir,
+        hf_token,
         "Distilled LoRA (~7.6 GB)",
     )
 
-    # 3. dev-fp8 — T2V stage 1 quantised. scaled_mm only.
-    if fp8_mode == "scaled_mm":
-        _hf_get(
-            DEV_FP8_REPO, DEV_FP8_FILENAME, model_dir, hf_token,
-            "LTX-2.3 dev FP8 DiT (~30 GB)",
-        )
-
-    # 4. distilled-1.1 BF16 — unified pipeline base (IC-LoRA was trained
-    # against this exact checkpoint).
+    # 3. Spatial upscaler 2x (~1 GB).
     _hf_get(
-        DISTILLED_CHECKPOINT_REPO, DISTILLED_CHECKPOINT_FILENAME, model_dir, hf_token,
-        "LTX-2.3 distilled-1.1 BF16 checkpoint (~46 GB)",
+        "Lightricks/LTX-2.3",
+        "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+        model_dir,
+        hf_token,
+        "Spatial upscaler (~1 GB)",
     )
 
-    # 5. Spatial upscaler 2x (~1 GB).
+    # 4. Gemma single-file text encoder for ComfyUI (~24 GB).
     _hf_get(
-        "Lightricks/LTX-2.3", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-        model_dir, hf_token, "Spatial upscaler (~1 GB)",
-    )
-
-    # 6. IC-LoRA Union-Control — unified pipeline stage 1 LoRA (I2V/V2V).
-    _hf_get(
-        IC_LORA_REPO, IC_LORA_FILENAME, model_dir, hf_token,
-        "IC-LoRA Union-Control",
-    )
-
-    # 7. Distilled FP8 DiT — shared by T2V stage 2 and unified stages on FP8.
-    if fp8_mode in ("scaled_mm", "cast"):
-        _hf_get(
-            DISTILLED_FP8_REPO, DISTILLED_FP8_FILENAME, model_dir, hf_token,
-            f"LTX-2.3 distilled FP8 DiT (~30 GB) for LTX_FP8_MODE={fp8_mode}",
-        )
-
-    # 8. Gemma 3 12B text encoder (~26 GB, full snapshot).
-    gemma_dir = os.path.join(model_dir, "gemma-3-12b-it-qat-q4_0-unquantized")
-    gemma_has_weights = os.path.isdir(gemma_dir) and any(
-        f.endswith(".safetensors")
-        for f in os.listdir(gemma_dir)
-        if os.path.isfile(os.path.join(gemma_dir, f))
-    )
-    if not gemma_has_weights:
-        logger.info("Downloading Gemma 3 12B text encoder (~26 GB) ...")
-        try:
-            snapshot_download(
-                repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
-                local_dir=gemma_dir,
-                token=hf_token,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to download Gemma 3: %s. "
-                "You may need to accept the license at "
-                "https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized "
-                "and wait for approval.",
-                e,
-            )
-            raise
-    else:
-        logger.info("Gemma 3 text encoder already cached.")
-
-    # 9. Gemma single-file text encoder for the ComfyUI-graph triple-stages pipeline.
-    # Comfy-Org/ltx-2 packages a consolidated gemma_3_12B_it.safetensors (~24 GB) —
-    # the exact filename the 3mljpp workflow's LTXAVTextEncoderLoader uses — under
-    # split_files/text_encoders/. hf_hub_download lands it at
-    # <model_dir>/split_files/text_encoders/gemma_3_12B_it.safetensors; comfyui_runtime
-    # registers that dir as a "text_encoders" folder so ComfyUI's loader finds it.
-    # (Distinct from the google/gemma-3-12b-it-qat-q4_0-unquantized shard dir above —
-    # that one stays for the ltx_pipelines paths via self._gemma_root.)
-    _hf_get(
-        "Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it.safetensors",
-        model_dir, hf_token, "Gemma 3 12B text encoder for ComfyUI (~24 GB)",
+        "Comfy-Org/ltx-2",
+        "split_files/text_encoders/gemma_3_12B_it.safetensors",
+        model_dir,
+        hf_token,
+        "Gemma 3 12B text encoder for ComfyUI (~24 GB)",
     )
 
     logger.info("All models verified / downloaded to %s", model_dir)
 
 
 if __name__ == "__main__":
-    # python-dotenv populates os.environ from .env (if present) before
-    # Settings reads it. In production .env is absent and load_dotenv()
-    # is a silent no-op; env vars come from the orchestrator.
     from dotenv import load_dotenv
 
     load_dotenv()
