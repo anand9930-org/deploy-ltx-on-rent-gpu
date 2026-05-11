@@ -54,13 +54,20 @@ _input_dir: str | None = None
 _MODEL_FOLDERS_AT_ROOT = ("checkpoints", "loras", "latent_upscale_models")
 
 
-def bootstrap_once(comfyui_path: str, model_dir: str) -> None:
+def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) -> None:
     """Make the cloned ComfyUI checkout importable and point ``folder_paths``
     at the model dir + temp input/output dirs. Idempotent.
 
     The triple-stages-comfyui-graph pipeline uses only ComfyUI **core** nodes
     (``comfy_extras.nodes_lt*`` etc., absolute imports), so this is all the
     "runtime" needed — no ``nodes.init_extra_nodes()`` / ``PromptServer`` / asyncio.
+
+    ``cpu_only``: force ComfyUI into CPU mode (``comfy.cli_args.args.cpu = True``)
+    before anything imports ``comfy.model_management`` — which, at *import* time,
+    runs ``torch.cuda.current_device()`` and raises on a GPU-less box unless
+    ``args.cpu`` is set. Only the build-time node-contract check in the Dockerfile
+    passes ``cpu_only=True`` (the GHCR builder has no GPU); at pod boot we want the
+    GPU, so the default is ``False``.
     """
     global _bootstrapped, _input_dir
     if _bootstrapped:
@@ -84,6 +91,14 @@ def bootstrap_once(comfyui_path: str, model_dir: str) -> None:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
         comfy.options.enable_args_parsing()
+
+        if cpu_only:
+            # Set the parsed flag programmatically *before* folder_paths / any
+            # node module pulls in comfy.model_management (which probes the GPU
+            # at import time via torch.cuda.current_device() unless args.cpu).
+            import comfy.cli_args
+
+            comfy.cli_args.args.cpu = True
 
         import folder_paths
 
@@ -112,8 +127,8 @@ def bootstrap_once(comfyui_path: str, model_dir: str) -> None:
 
     _bootstrapped = True
     logger.info(
-        "ComfyUI runtime bootstrapped: path=%s, models=%s, input_dir=%s",
-        comfyui_path, model_dir, _input_dir,
+        "ComfyUI runtime bootstrapped: path=%s, models=%s, input_dir=%s, cpu_only=%s",
+        comfyui_path, model_dir, _input_dir, cpu_only,
     )
 
 
