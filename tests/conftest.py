@@ -14,11 +14,7 @@ class MockGenerator:
     Returns a tiny valid MP4 file so the full serving flow
     (BentoML endpoint → generate → encode → response) can be tested locally.
     Records the last call's kwargs on ``last_call`` so tests can assert that
-    ``image_url`` / ``image_b64`` / ``reference_video_url`` / dims were
-    passed through correctly. Echoes the same ``parameters`` block shape the
-    real generator emits, including the ``mode`` discriminator and
-    IC-LoRA-specific fields (``reference_downscale_factor``,
-    ``reference_video_strength``, ``conditioning_attention_strength``).
+    ``image_url`` / ``image_b64`` / dims were passed through correctly.
     """
 
     def __init__(self) -> None:
@@ -36,112 +32,19 @@ class MockGenerator:
             kwargs.get("image_url") is not None
             or kwargs.get("image_b64") is not None
         )
-        has_ref_video = (
-            kwargs.get("reference_video_url") is not None
-            or kwargs.get("reference_video_b64") is not None
-        )
-        variant = kwargs.get("pipeline_variant", "default")
-
-        if variant == "triple_stages":
-            if has_ref_video:
-                raise ValueError(
-                    "pipeline_variant='triple_stages' does not support "
-                    "reference_video_* inputs"
-                )
-            mode = "triple_i2v" if has_image else "triple_t2v"
-            parameters = {
-                "mode": mode,
-                "width": kwargs.get("width", 1536),
-                "height": kwargs.get("height", 1024),
-                "num_frames": kwargs.get("num_frames", 121),
-                "stage1_steps": kwargs.get("stage1_steps", 16),
-                "stage2_steps": kwargs.get("stage2_steps", 8),
-                "seed": kwargs.get("seed", 42),
-                "frame_rate": kwargs.get("frame_rate", 24.0),
-                "cfg_scale": kwargs.get("cfg_scale", 1.0),
-                "stg_scale": kwargs.get("stg_scale", 0.0),
-                "rescale_scale": kwargs.get("rescale_scale", 0.0),
-                "image_strength": (
-                    kwargs.get("image_strength", 1.0) if has_image else None
-                ),
-                "image_frame_idx": (
-                    kwargs.get("image_frame_idx", 0) if has_image else None
-                ),
-                "enhance_prompt": kwargs.get("enhance_prompt", False),
-            }
-            return {
-                "output_path": output_path,
-                "output_filename": output_filename,
-                "generation_time_seconds": 0.01,
-                "parameters": parameters,
-            }
-
-        if variant == "triple_stages_comfyui":
-            if has_ref_video:
-                raise ValueError(
-                    "pipeline_variant='triple_stages_comfyui' does not support "
-                    "reference_video_* inputs"
-                )
-            mode = "triple_comfyui_i2v" if has_image else "triple_comfyui_t2v"
-            parameters = {
-                "mode": mode,
-                "width": kwargs.get("width", 896),
-                "height": kwargs.get("height", 1280),
-                "num_frames": kwargs.get("num_frames", 241),
-                "seed": kwargs.get("seed", 42),
-                "frame_rate": kwargs.get("frame_rate", 24.0),
-                "image_frame_idx": (
-                    kwargs.get("image_frame_idx", 0) if has_image else None
-                ),
-                "enhance_prompt": kwargs.get("enhance_prompt", False),
-            }
-            return {
-                "output_path": output_path,
-                "output_filename": output_filename,
-                "generation_time_seconds": 0.01,
-                "parameters": parameters,
-            }
-
-        if has_ref_video:
-            mode = "v2v"
-        elif has_image:
-            mode = "i2v"
-        else:
-            mode = "t2v"
-
-        if mode == "t2v":
-            parameters = {
-                "mode": mode,
-                "width": kwargs.get("width", 1024),
-                "height": kwargs.get("height", 1536),
-                "num_frames": kwargs.get("num_frames", 121),
-                "num_inference_steps": kwargs.get("num_inference_steps", 30),
-                "seed": kwargs.get("seed", 42),
-                "frame_rate": kwargs.get("frame_rate", 24.0),
-                "cfg_scale": kwargs.get("cfg_scale", 3.0),
-                "stg_scale": kwargs.get("stg_scale", 1.0),
-                "rescale_scale": kwargs.get("rescale_scale", 0.7),
-            }
-        else:
-            parameters = {
-                "mode": mode,
-                "width": kwargs.get("width", 512),
-                "height": kwargs.get("height", 768),
-                "num_frames": kwargs.get("num_frames", 25),
-                "seed": kwargs.get("seed", 42),
-                "frame_rate": kwargs.get("frame_rate", 24.0),
-                "reference_downscale_factor": 2,
-                "reference_video_strength": (
-                    kwargs.get("reference_video_strength", 1.0)
-                    if has_ref_video else None
-                ),
-                "conditioning_attention_strength": (
-                    kwargs.get("conditioning_attention_strength", 1.0)
-                    if (has_image or has_ref_video) else None
-                ),
-                "enhance_prompt": kwargs.get("enhance_prompt", False),
-            }
-
+        mode = "triple_comfyui_i2v" if has_image else "triple_comfyui_t2v"
+        parameters = {
+            "mode": mode,
+            "width": kwargs.get("width", 896),
+            "height": kwargs.get("height", 1280),
+            "num_frames": kwargs.get("num_frames", 241),
+            "seed": kwargs.get("seed", 42),
+            "frame_rate": kwargs.get("frame_rate", 24.0),
+            "image_frame_idx": (
+                kwargs.get("image_frame_idx", 0) if has_image else None
+            ),
+            "enhance_prompt": kwargs.get("enhance_prompt", False),
+        }
         return {
             "output_path": output_path,
             "output_filename": output_filename,

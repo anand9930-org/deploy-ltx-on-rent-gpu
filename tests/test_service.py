@@ -15,14 +15,15 @@ def _run_generate(mock_gen, **kwargs):
 
     defaults = dict(
         prompt="test prompt",
-        negative_prompt="worst quality",
-        width=512, height=768, num_frames=25,
-        num_inference_steps=30, seed=42, frame_rate=24.0,
-        cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7,
-        image_url=None, image_b64=None,
-        reference_video_url=None, reference_video_b64=None,
-        reference_video_strength=1.0,
-        conditioning_attention_strength=1.0,
+        negative_prompt="blurry, low quality",
+        width=896,
+        height=1280,
+        num_frames=241,
+        seed=42,
+        frame_rate=24.0,
+        image_url=None,
+        image_b64=None,
+        image_frame_idx=0,
         enhance_prompt=False,
     )
     defaults.update(kwargs)
@@ -37,7 +38,7 @@ def _run_generate(mock_gen, **kwargs):
 
     if upload_to_supabase and storage.is_configured():
         response["video_url"] = storage.upload_video(
-            result["output_path"], result["output_filename"]
+            result["output_path"], result["output_filename"],
         )
         try:
             os.remove(result["output_path"])
@@ -53,14 +54,15 @@ def _run_generate_sync(mock_gen, **kwargs):
     """Simulate what LTXVideoService.generate_sync() does."""
     defaults = dict(
         prompt="test prompt",
-        negative_prompt="worst quality",
-        width=512, height=768, num_frames=25,
-        num_inference_steps=30, seed=42, frame_rate=24.0,
-        cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7,
-        image_url=None, image_b64=None,
-        reference_video_url=None, reference_video_b64=None,
-        reference_video_strength=1.0,
-        conditioning_attention_strength=1.0,
+        negative_prompt="blurry, low quality",
+        width=896,
+        height=1280,
+        num_frames=241,
+        seed=42,
+        frame_rate=24.0,
+        image_url=None,
+        image_b64=None,
+        image_frame_idx=0,
         enhance_prompt=False,
     )
     defaults.update(kwargs)
@@ -81,10 +83,10 @@ class TestGenerate:
         assert isinstance(result["generation_time_seconds"], float)
 
     def test_returns_parameters(self, mock_generator):
-        result = _run_generate(mock_generator, width=1024, height=1536, seed=99)
+        result = _run_generate(mock_generator, width=1024, height=1280, seed=99)
         params = result["parameters"]
         assert params["width"] == 1024
-        assert params["height"] == 1536
+        assert params["height"] == 1280
         assert params["seed"] == 99
 
     def test_supabase_skipped_when_not_configured(self, mock_generator):
@@ -94,14 +96,24 @@ class TestGenerate:
         assert "video_url" not in result
 
     def test_supabase_upload_when_configured(self, mock_generator):
-        with patch("src.storage.is_configured", return_value=True), \
-             patch("src.storage.upload_video", return_value="https://example.com/v.mp4"):
+        with (
+            patch("src.storage.is_configured", return_value=True),
+            patch(
+                "src.storage.upload_video",
+                return_value="https://example.com/v.mp4",
+            ),
+        ):
             result = _run_generate(mock_generator, upload_to_supabase=True)
         assert result["video_url"] == "https://example.com/v.mp4"
 
     def test_cleanup_after_supabase_upload(self, mock_generator):
-        with patch("src.storage.is_configured", return_value=True), \
-             patch("src.storage.upload_video", return_value="https://example.com/v.mp4"):
+        with (
+            patch("src.storage.is_configured", return_value=True),
+            patch(
+                "src.storage.upload_video",
+                return_value="https://example.com/v.mp4",
+            ),
+        ):
             result = _run_generate(mock_generator, upload_to_supabase=True)
         assert "video_url" in result
 
@@ -123,94 +135,38 @@ class TestDefaults:
         params = result["parameters"]
         assert params["seed"] == 42
         assert params["frame_rate"] == 24.0
-        assert params["mode"] == "t2v"
+        assert params["mode"] == "triple_comfyui_t2v"
 
-    def test_t2v_scheduler_defaults(self, mock_generator):
-        """T2V path emits the proven fp8-h100 scheduler config: 30 steps,
-        CFG 3.0, STG 1.0, rescale 0.7."""
+    def test_default_dims_match_workflow(self, mock_generator):
         result = _run_generate(mock_generator)
         params = result["parameters"]
-        assert params["num_inference_steps"] == 30
-        assert params["cfg_scale"] == 3.0
-        assert params["stg_scale"] == 1.0
-        assert params["rescale_scale"] == 0.7
+        assert params["width"] == 896
+        assert params["height"] == 1280
+        assert params["num_frames"] == 241
+
+    def test_i2v_mode_when_image_supplied(self, mock_generator):
+        result = _run_generate(
+            mock_generator, image_url="https://example.com/cat.png",
+        )
+        assert result["parameters"]["mode"] == "triple_comfyui_i2v"
 
     def test_i2v_default_includes_enhance_prompt(self, mock_generator):
-        result = _run_generate(mock_generator, image_url="https://example.com/cat.png")
-        params = result["parameters"]
-        assert params["enhance_prompt"] is False
-        # T2V scheduler fields are not surfaced on the unified path.
-        assert "cfg_scale" not in params
-        assert "num_inference_steps" not in params
-
-
-class TestModeRouting:
-    """Veo-style mode discrimination: input presence picks the path."""
-
-    def test_t2v_when_no_image_no_ref_video(self, mock_generator):
-        result = _run_generate(mock_generator)
-        assert result["parameters"]["mode"] == "t2v"
-
-    def test_i2v_when_image_url_set(self, mock_generator):
         result = _run_generate(
-            mock_generator, image_url="https://example.com/cat.png"
+            mock_generator, image_url="https://example.com/cat.png",
         )
-        assert result["parameters"]["mode"] == "i2v"
-
-    def test_i2v_when_image_b64_set(self, mock_generator):
-        result = _run_generate(mock_generator, image_b64="aGVsbG8=")
-        assert result["parameters"]["mode"] == "i2v"
-
-    def test_v2v_when_reference_video_url_set(self, mock_generator):
-        result = _run_generate(
-            mock_generator,
-            reference_video_url="https://example.com/ref.mp4",
-        )
-        assert result["parameters"]["mode"] == "v2v"
-
-    def test_v2v_when_reference_video_b64_set(self, mock_generator):
-        result = _run_generate(mock_generator, reference_video_b64="dmlkZW8=")
-        assert result["parameters"]["mode"] == "v2v"
-
-    def test_v2v_takes_precedence_over_image(self, mock_generator):
-        result = _run_generate(
-            mock_generator,
-            image_url="https://example.com/cat.png",
-            reference_video_url="https://example.com/ref.mp4",
-        )
-        assert result["parameters"]["mode"] == "v2v"
-
-
-class TestT2VForwarding:
-    """T2V scheduler args must reach the generator unchanged — these pin the
-    ``feature/fp8-h100`` proven configuration so a future refactor that drops
-    the params from the forward chain fails fast."""
-
-    def test_num_inference_steps_reaches_generator(self, mock_generator):
-        _run_generate(mock_generator, num_inference_steps=20)
-        assert mock_generator.last_call["num_inference_steps"] == 20
-
-    def test_cfg_stg_rescale_reach_generator(self, mock_generator):
-        _run_generate(
-            mock_generator, cfg_scale=4.0, stg_scale=2.0, rescale_scale=0.5,
-        )
-        assert mock_generator.last_call["cfg_scale"] == 4.0
-        assert mock_generator.last_call["stg_scale"] == 2.0
-        assert mock_generator.last_call["rescale_scale"] == 0.5
-
-    def test_negative_prompt_reaches_generator(self, mock_generator):
-        _run_generate(mock_generator, negative_prompt="bad quality")
-        assert mock_generator.last_call["negative_prompt"] == "bad quality"
+        assert result["parameters"]["enhance_prompt"] is False
 
 
 class TestImageInputForwarding:
     """The service layer just forwards image_url / image_b64 to the generator
-    — no transformation. These tests pin that contract so a future refactor
-    that drops the params from the forward chain fails fast."""
+    — no transformation."""
 
     def test_image_url_reaches_generator(self, mock_generator):
         _run_generate(mock_generator, image_url="https://example.com/cat.png")
-        assert mock_generator.last_call["image_url"] == "https://example.com/cat.png"
+        assert (
+            mock_generator.last_call["image_url"]
+            == "https://example.com/cat.png"
+        )
         assert mock_generator.last_call["image_b64"] is None
 
     def test_image_b64_reaches_generator(self, mock_generator):
@@ -222,28 +178,3 @@ class TestImageInputForwarding:
         _run_generate(mock_generator)
         assert mock_generator.last_call["image_url"] is None
         assert mock_generator.last_call["image_b64"] is None
-
-
-class TestReferenceVideoForwarding:
-    """Same contract for V2V wire fields — service forwards verbatim."""
-
-    def test_reference_video_url_reaches_generator(self, mock_generator):
-        _run_generate(
-            mock_generator,
-            reference_video_url="https://example.com/ref.mp4",
-        )
-        assert (
-            mock_generator.last_call["reference_video_url"]
-            == "https://example.com/ref.mp4"
-        )
-        assert mock_generator.last_call["reference_video_b64"] is None
-
-    def test_reference_video_b64_reaches_generator(self, mock_generator):
-        _run_generate(mock_generator, reference_video_b64="dmlkZW8=")
-        assert mock_generator.last_call["reference_video_b64"] == "dmlkZW8="
-        assert mock_generator.last_call["reference_video_url"] is None
-
-    def test_strength_and_attn_strength_default_one(self, mock_generator):
-        _run_generate(mock_generator, image_url="https://example.com/cat.png")
-        assert mock_generator.last_call["reference_video_strength"] == 1.0
-        assert mock_generator.last_call["conditioning_attention_strength"] == 1.0

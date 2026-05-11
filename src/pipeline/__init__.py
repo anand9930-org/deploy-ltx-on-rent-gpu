@@ -1,17 +1,15 @@
-"""LTX-2.3 Unified Pipeline package.
+"""LTX-2.3 ComfyUI pipeline package.
 
-Public surface preserved from the previous single-module ``src.pipeline``:
-``LTXVideoGenerator``, ``DEFAULT_NEGATIVE_PROMPT``, ``_round_to``,
-``_round_frames``. Internals are split by scenario — see ``core.py`` (shared
-FP8/init/dispatch), ``t2v.py``, ``i2v.py``, ``v2v.py``.
+Public surface: ``LTXVideoGenerator``, ``DEFAULT_NEGATIVE_PROMPT``,
+``_round_to``, ``_round_frames``.
 """
 
 from src.pipeline.core import (
-    DEFAULT_NEGATIVE_PROMPT,
     LTXVideoGenerator,
     _round_frames,
     _round_to,
 )
+from src.pipeline.triple_stages_comfyui_graph import DEFAULT_NEGATIVE_PROMPT
 
 __all__ = [
     "DEFAULT_NEGATIVE_PROMPT",

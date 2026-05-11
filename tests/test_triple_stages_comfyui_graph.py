@@ -3,8 +3,8 @@
 ``src/pipeline/triple_stages_comfyui_graph.py`` runs real ComfyUI nodes at
 runtime, so the cascade itself can't be exercised without a GPU + the ComfyUI
 checkout (that's the pod step). But the module must be *importable* without
-ComfyUI (``service.py`` imports ``COMFY_DEFAULT_NEGATIVE_PROMPT`` from it at
-module level), and its pure bits — the per-stage seed derivation and the
+ComfyUI (``service.py`` imports ``DEFAULT_NEGATIVE_PROMPT`` from it at module
+level), and its pure bits — the per-stage seed derivation and the
 workflow-literal constants — must stay correct. A stray edit to a sigma string
 or sampler name would silently change the output, so it's pinned here.
 """
@@ -13,7 +13,6 @@ from src.pipeline.triple_stages_comfyui_graph import (
     COMFY_CFG,
     COMFY_DECODE_TILING,
     COMFY_DEFAULT_FRAME_RATE,
-    COMFY_DEFAULT_NEGATIVE_PROMPT,
     COMFY_DEFAULT_NUM_FRAMES,
     COMFY_DISTILLED_LORA_STRENGTH,
     COMFY_IMG_COND_STRENGTH,
@@ -23,6 +22,7 @@ from src.pipeline.triple_stages_comfyui_graph import (
     COMFY_STAGE_1_SIGMAS,
     COMFY_STAGE_23_SAMPLER,
     COMFY_STAGE_23_SIGMAS,
+    DEFAULT_NEGATIVE_PROMPT,
     _derive_stage_seeds,
 )
 
@@ -72,9 +72,9 @@ class TestWorkflowLiterals:
         }
 
     def test_negative_prompt_is_the_workflow_literal(self):
-        assert COMFY_DEFAULT_NEGATIVE_PROMPT.startswith("camera zooming out, low resolution, blurry,")
-        assert COMFY_DEFAULT_NEGATIVE_PROMPT.endswith("warping, extra body parts")
-        assert "scene cut, scene transition" in COMFY_DEFAULT_NEGATIVE_PROMPT
+        assert DEFAULT_NEGATIVE_PROMPT.startswith("camera zooming out, low resolution, blurry,")
+        assert DEFAULT_NEGATIVE_PROMPT.endswith("warping, extra body parts")
+        assert "scene cut, scene transition" in DEFAULT_NEGATIVE_PROMPT
 
 
 def test_module_imports_without_comfyui():
@@ -87,4 +87,4 @@ def test_module_imports_without_comfyui():
     import src.pipeline.triple_stages_comfyui_graph as m
 
     assert hasattr(m, "TripleStagesComfyUIGraphPipeline")
-    assert hasattr(m, "COMFY_DEFAULT_NEGATIVE_PROMPT")
+    assert hasattr(m, "DEFAULT_NEGATIVE_PROMPT")

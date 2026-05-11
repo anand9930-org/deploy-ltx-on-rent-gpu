@@ -29,8 +29,8 @@ on H100. See ``src/comfyui_runtime.py`` for the bootstrap, the Dockerfile for th
 pinned ComfyUI SHA.
 
 Module import is ComfyUI-free (the node imports live inside ``__init__``), so this
-module — and the ``COMFY_DEFAULT_NEGATIVE_PROMPT`` constant ``service.py`` imports
-— can be imported on a box without ComfyUI installed (e.g. the test suite).
+module — and the ``DEFAULT_NEGATIVE_PROMPT`` constant ``service.py`` imports — can
+be imported on a box without ComfyUI installed (e.g. the test suite).
 
 Stage layout (mirrors the JSON):
 
@@ -51,12 +51,15 @@ import logging
 import os
 import uuid
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import Any, NamedTuple
 
 from src import comfyui_runtime
 
-if TYPE_CHECKING:  # ImageConditioningInput is only used for the type hint
-    from ltx_pipelines.utils.args import ImageConditioningInput
+
+class ImageInput(NamedTuple):
+    path: str
+    frame_idx: int
+    strength: float
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 # CheckpointLoaderSimple "5025:5022" / LTXVAudioVAELoader "5025:5024" /
 # LTXAVTextEncoderLoader "5025:5017" ckpt_name.
-COMFY_CKPT_NAME = "ltx-2.3-22b-dev.safetensors"
+COMFY_CKPT_NAME = "ltx-2.3-22b-dev-fp8.safetensors"
 # LoraLoaderModelOnly "5025:5023" — the JSON names "...-384.safetensors"; the
 # image ships the "-384-1.1" build (see src/download_models.py). strength 0.5.
 COMFY_DISTILLED_LORA_NAME = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
@@ -108,7 +111,7 @@ COMFY_DEFAULT_FRAME_RATE = 24.0
 COMFY_BYPASS_I2V = False
 
 # CLIPTextEncode-Negative "5026:5019" literal.
-COMFY_DEFAULT_NEGATIVE_PROMPT = (
+DEFAULT_NEGATIVE_PROMPT = (
     "camera zooming out, low resolution, blurry, grainy, pixelated, "
     "wide shot, distant view, shallow focus, motion blur, low detail, "
     "flat lighting, dark scene, noisy image, poor texture, soft edges, "
@@ -302,7 +305,7 @@ class TripleStagesComfyUIGraphPipeline:
         width: int,
         num_frames: int,
         frame_rate: float,
-        images: list[ImageConditioningInput],
+        images: list[ImageInput],
         tiling_config: object | None = None,  # noqa: ARG002 — baked into COMFY_DECODE_TILING
         enhance_prompt: bool = False,
         max_batch_size: int = 1,  # noqa: ARG002 — ComfyUI manages batching
@@ -399,7 +402,7 @@ class TripleStagesComfyUIGraphPipeline:
         video_obj = _invoke(CreateVideo, images=frames, fps=float(fps), audio=audio)[0]
         video_obj.save_to(output_path)
 
-    def _stage_input_image(self, images: list[ImageConditioningInput], width: int, height: int) -> str:
+    def _stage_input_image(self, images: list[ImageInput], width: int, height: int) -> str:
         """Copy the conditioning image into ComfyUI's input dir and return its
         basename (for ``LoadImage``). T2V (empty ``images``) → a neutral-gray PNG."""
         in_dir = comfyui_runtime.input_dir()
