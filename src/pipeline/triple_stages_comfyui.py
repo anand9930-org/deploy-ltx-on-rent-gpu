@@ -20,12 +20,16 @@ Key differences from ``TripleStagesMixin`` (the standard fork):
   stage. We use the standalone LoRA file rather than pre-fused
   distilled-fp8 so the strength stays explicit and tunable.
 * No ``MultiModalGuiderParams`` — the vendored ``__call__`` doesn't accept
-  ``video_guider_params``/``audio_guider_params``. Every stage runs cfg=1
-  → ``SimpleDenoiser``.
+  ``video_guider_params``/``audio_guider_params``. cfg=1 on every stage, but
+  ComfyUI's cfg++ samplers still run the negative-prompt uncond pass at cfg=1
+  (``disable_cfg1_optimization``), so the vendored loop runs two
+  ``SimpleDenoiser`` passes (positive + negative) per step.
 * Sigma schedules + tiling are **baked in** at the vendor module
   (``COMFY_STAGE_*_SIGMAS``, ``COMFY_TILING_CONFIG``); per-call params
   reduce to prompt/dims/seed/image. No ``stage1_steps``/``stage2_steps`` —
   step counts are fixed by the workflow's ManualSigmas literals (9/4/4).
+  The single request ``seed`` is spread into three per-stage seeds inside
+  the vendored ``__call__`` (one per ComfyUI ``RandomNoise`` node).
 * Resolution must be divisible by **128** (vendored ``_assert_quad_resolution``
   enforces this for the 4× downscale chain).
 """

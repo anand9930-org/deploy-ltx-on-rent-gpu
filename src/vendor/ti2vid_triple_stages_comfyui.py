@@ -40,19 +40,27 @@ Key differences from ``ti2vid_triple_stages.py``:
 * Distilled LoRA at strength 0.5 is applied to **all three** stages (matches
   the single ``LoraLoaderModelOnly`` whose output feeds every CFGGuider in
   the JSON), not just the final stage.
-* ``SimpleDenoiser`` everywhere — every CFGGuider in the workflow has
-  ``cfg=1`` which is the no-op CFG case, so guidance machinery is bypassed.
+* ``cfg=1`` on every CFGGuider, but **not** the no-op CFG case. ComfyUI's
+  cfg++ samplers register their post-CFG hook with
+  ``disable_cfg1_optimization=True``, so even at cfg=1 ComfyUI runs **two**
+  model forwards per step: a conditional pass on the (empty) positive prompt
+  → ``denoised`` (the x0 estimate) and an unconditional pass on the long
+  negative prompt → ``uncond_denoised``, which the cfg++ ODE derivative uses.
+  We mirror this with two ``SimpleDenoiser`` passes per step (positive and
+  negative context) — the negative prompt is load-bearing here.
 * Stage 1 image conditioning runs through ``LTXVPreprocess(img_compression=18)``
   (CRF=18 H.264 round-trip); Stages 2 and 3 use the resized image directly
   (CRF=0 → ``preprocess()`` becomes the identity). All three stages use
   ``strength=1.0`` (the ``ImageConditioningInput`` default).
 * Samplers come from vendored ComfyUI (``src/vendor/comfy_sampling.py``).
-  Stage 1 calls ``sample_euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0);
-  Stages 2/3 call ``sample_euler_cfg_pp`` (eta=0.0, s_noise=0.0). The
-  per-step math is shared via ``cfgpp_denoising_step``; we apply it in a
-  joint AV loop so the denoiser runs once per step (matching the workflow's
-  ``LTXVConcatAVLatent → SamplerCustomAdvanced → LTXVSeparateAVLatent``
-  pattern in compute terms, though we keep modalities split tensor-wise).
+  Stage 1 uses ComfyUI's ``euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0);
+  Stages 2/3 use ``euler_cfg_pp`` (eta=0.0, s_noise=0.0). The per-step math
+  is ``cfgpp_denoising_step`` (verbatim from ComfyUI's
+  ``sample_euler_ancestral_cfg_pp`` body). We apply it in a joint AV loop:
+  per step the conditional and unconditional denoisers each run one forward
+  (matching ComfyUI's ``calc_cond_batch`` with ``disable_cfg1_optimization=True``)
+  and the cfg++ step is applied to each modality independently (the step math
+  is element-wise).
 * Stage 3 ``ModalitySpec`` carries the upscaled latent through as
   ``initial_latent`` (the original variant dropped this and restarted Stage 3
   from pure noise).
@@ -62,10 +70,13 @@ Non-behavioral divergences (unavoidable framework gaps, listed for honesty):
 * ComfyUI ``VAEDecodeTiled(temporal_overlap=4)`` — ltx-pipelines requires
   ``tile_overlap_in_frames`` divisible by 8. We use 8. The default 241-frame
   request fits in a single 512-frame temporal tile so overlap is moot.
-* ComfyUI uses three independent ``RandomNoise`` seeds (one per stage); we
-  thread one ``torch.Generator`` through the noiser AND each stage's
-  ancestral renoise. Random draws still differ per stage because the
-  generator's state advances between calls.
+* ComfyUI uses three independent ``RandomNoise`` seeds (one per stage, each
+  also seeding that stage's ancestral renoise via
+  ``default_noise_sampler(x, seed)``). We derive three seeds from the request
+  ``seed`` (``_derive_stage_seeds``) and give each stage its own
+  ``torch.Generator`` driving both its initial noise and its renoise — same
+  structure as the workflow, just not the workflow's literal seed values
+  (which ``scripts/workflow_3mljpp.py`` re-randomises at runtime anyway).
 """
 
 import argparse
@@ -153,7 +164,9 @@ COMFY_IMAGE_LONGER_DIM = 1536
 COMFY_DISTILLED_LORA_STRENGTH = 0.5
 
 # CFGGuider("5002:4828", "5001:4964", "5012:5005") — cfg=1 on every stage.
-# cfg=1 is the no-guidance case; SimpleDenoiser is the equivalent denoiser.
+# Not the no-guidance case: ComfyUI's cfg++ samplers run the negative-prompt
+# uncond pass even at cfg=1 (disable_cfg1_optimization). _cfgpp_denoising_loop
+# therefore runs two SimpleDenoiser passes (positive + negative) per step.
 
 # VAEDecodeTiled("5027:4851") — tile_size=512, overlap=64, temporal_size=512,
 # temporal_overlap=4 (rounded to 8 to satisfy TemporalTilingConfig).
@@ -177,6 +190,25 @@ COMFY_DEFAULT_NEGATIVE_PROMPT = (
     "glitching, low resolution, extra hands appearing, extra limbs appearing, "
     "warping, extra body parts"
 )
+
+
+# RandomNoise("5002:4832"=727273229127121, "5001:4967"=200996433497366,
+# "5012:5009"=975078551246030) — three independent seeds, one per stage. The
+# literals aren't load-bearing (scripts/workflow_3mljpp.py re-randomises them at
+# runtime), so we derive three deterministic per-stage seeds from the request
+# seed instead — keeps the API single-seed and reproducible. Within a stage that
+# seed drives both the initial latent noise (GaussianNoiser) and the ancestral
+# renoise (_cfgpp_denoising_loop), mirroring ComfyUI's RandomNoise(seed) +
+# default_noise_sampler(x, seed).
+_STAGE_SEED_MASK = (1 << 63) - 1
+_STAGE_SEED_SALTS = (0, 0x9E3779B97F4A7C15, 0x2545F4914F6CDD1D)
+
+
+def _derive_stage_seeds(seed: int) -> tuple[int, int, int]:
+    """Spread one request seed into three decorrelated per-stage seeds."""
+    base = seed & _STAGE_SEED_MASK
+    s1, s2, s3 = ((base ^ salt) & _STAGE_SEED_MASK for salt in _STAGE_SEED_SALTS)
+    return s1, s2, s3
 
 
 def _assert_quad_resolution(height: int, width: int) -> None:
@@ -229,6 +261,7 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
     transformer: X0Model,
     denoiser: Denoiser,
     *,
+    neg_denoiser: Denoiser,
     generator: torch.Generator,
     eta: float,
     s_noise: float,
@@ -236,41 +269,48 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
     """Joint audio-video denoising loop using ComfyUI's CFG++ ancestral Euler.
 
     Per-step math is delegated to ``src.vendor.comfy_sampling.cfgpp_denoising_step``,
-    which is lifted verbatim from the else-branch of
-    ``comfy.k_diffusion.sampling.sample_euler_ancestral_cfg_pp`` (see that
-    module's docstring for the two stubs we apply for our cfg=1 + RF model).
+    lifted verbatim from the else-branch of
+    ``comfy.k_diffusion.sampling.sample_euler_ancestral_cfg_pp``.
 
     Choice of ``eta``/``s_noise``:
 
     * ``(1.0, 1.0)`` reproduces ComfyUI's ``euler_ancestral_cfg_pp`` (Stage 1).
     * ``(0.0, 0.0)`` reproduces ComfyUI's ``euler_cfg_pp`` (Stages 2/3).
 
-    Why a custom loop instead of two ``sample_euler_ancestral_cfg_pp``
-    calls (one per modality): each step needs ONE joint forward of the
-    transformer producing both denoised tensors at once. Running ComfyUI's
-    sampler twice would double the transformer work. We invoke ``denoiser``
-    once per step here and apply ``cfgpp_denoising_step`` to each modality
-    independently — the math is identical to ComfyUI's single-tensor
-    sampler applied per-modality because the cfg_pp step is element-wise.
+    Two denoisers, two forwards per step. ``denoiser`` carries the positive
+    context (the workflow's empty prompt) and produces the x0 estimate
+    ``denoised``; ``neg_denoiser`` carries the negative context (the long
+    quality prompt) and produces ``uncond_denoised``, which the cfg++
+    derivative ``d = to_d(x, sigma, alpha_s · uncond_denoised)`` consumes.
+    ComfyUI's ``sample_euler_ancestral_cfg_pp`` registers its post-CFG hook
+    with ``disable_cfg1_optimization=True``, so it runs both passes even at
+    cfg=1 — folding ``uncond_denoised`` into ``denoised`` (the pre-2026-05
+    behaviour here) made the cfg++ direction wrong on every step. The cfg++
+    step is element-wise, so applying it per modality after one joint forward
+    apiece is identical to ComfyUI's single-tensor sampler run per modality.
+    At ``max_batch_size=1`` the two passes run sequentially (one B=1 forward
+    each) — numerically the same as one batched B=2 forward; batching is a
+    latency optimisation, not a correctness requirement.
 
-    The ``stepper`` argument is unused (kept for the ``loop=`` callable
-    signature accepted by ``DiffusionStage.run_denoising``); the CFG++
-    math has no use for upstream's ``EulerDiffusionStep``.
+    ``stepper`` is unused (kept for the ``loop=`` callable signature accepted
+    by ``DiffusionStage.run_denoising``).
 
-    Mask handling: ``post_process_latent`` is applied to each modality's
-    ``denoised`` output before stepping, so LTX image-conditioning frames
-    stay pinned to ``clean_latent`` at sampling time (matches the
-    pre-refactor loop's lines and ComfyUI's ``KSamplerX0Inpaint`` mask
-    handling, which happens inside the model wrapper rather than the
-    sampler).
+    Mask handling: ``post_process_latent`` is applied to BOTH the conditional
+    and unconditional ``denoised`` outputs before stepping, so LTX
+    image-conditioning frames stay pinned to ``clean_latent`` at sampling time
+    — matching ComfyUI's ``KSamplerX0Inpaint``, which wraps the model *before*
+    the CFG combine and thus inpaints both passes.
+
+    Both noise samplers share this loop's ``generator`` (renoise stream
+    advances across video then audio per step). Each stage gets its own
+    generator (see ``__call__``); within a stage it also drives the initial
+    latent noise — mirroring ComfyUI, where one ``RandomNoise`` seed feeds
+    both ``SamplerCustomAdvanced`` and ``default_noise_sampler(x, seed)``.
+    ``torch.randn`` in fp32 matches the pre-refactor renoise dtype (the step
+    fn casts everything to fp32 anyway).
     """
     from src.vendor.comfy_sampling import cfgpp_denoising_step
 
-    # Per-modality noise sampler. Both share the same generator so the noise
-    # stream advances deterministically across video then audio per step —
-    # mirroring the pre-refactor behaviour. (The workflow uses three
-    # independent RandomNoise seeds, one per stage; that's a separate
-    # follow-up.) torch.randn in fp32 matches the pre-refactor renoise dtype.
     def make_noise_sampler(latent_template: torch.Tensor):
         return lambda sigma, sigma_next: torch.randn(
             latent_template.shape, dtype=torch.float32,
@@ -281,20 +321,25 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
     audio_noise_sampler = make_noise_sampler(audio_state.latent) if audio_state is not None else None
 
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        # Conditional (positive/empty prompt) → x0 estimate; unconditional
+        # (negative prompt) → uncond_denoised used by the cfg++ derivative.
+        # Mirrors ComfyUI's calc_cond_batch with disable_cfg1_optimization=True.
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        uncond_video, uncond_audio = neg_denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
         sigma = sigmas[step_idx].to(torch.float32)
         sigma_next = sigmas[step_idx + 1].to(torch.float32)
 
         if video_state is not None and denoised_video is not None:
             v_dtype = video_state.latent.dtype
-            v_pp = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
-            # cfg=1 → uncond_denoised == denoised; pass the post-processed
-            # tensor for both (matches ComfyUI's CFGGuider behavior at cfg=1).
+            # ComfyUI applies KSamplerX0Inpaint to the model output *before* the
+            # CFG combine, so both passes get the conditioning-frame pin.
+            v_cond = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
+            v_uncond = post_process_latent(uncond_video, video_state.denoise_mask, video_state.clean_latent)
             v_new = cfgpp_denoising_step(
                 video_state.latent.to(torch.float32),
-                v_pp.to(torch.float32),
-                v_pp.to(torch.float32),
+                v_cond.to(torch.float32),
+                v_uncond.to(torch.float32),
                 sigma, sigma_next,
                 eta=eta, s_noise=s_noise,
                 noise_sampler=video_noise_sampler,
@@ -303,11 +348,12 @@ def _cfgpp_denoising_loop(  # noqa: PLR0913
 
         if audio_state is not None and denoised_audio is not None:
             a_dtype = audio_state.latent.dtype
-            a_pp = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+            a_cond = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+            a_uncond = post_process_latent(uncond_audio, audio_state.denoise_mask, audio_state.clean_latent)
             a_new = cfgpp_denoising_step(
                 audio_state.latent.to(torch.float32),
-                a_pp.to(torch.float32),
-                a_pp.to(torch.float32),
+                a_cond.to(torch.float32),
+                a_uncond.to(torch.float32),
                 sigma, sigma_next,
                 eta=eta, s_noise=s_noise,
                 noise_sampler=audio_noise_sampler,
@@ -390,8 +436,13 @@ class TI2VidTripleStagesComfyUIPipeline:
         assert_resolution(height=height, width=width, is_two_stage=True)
         _assert_quad_resolution(height=height, width=width)
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
+        # One generator per stage (matches ComfyUI's three RandomNoise nodes).
+        # Each stage's generator drives both its initial latent noise
+        # (GaussianNoiser, below) and its ancestral renoise (_cfgpp_denoising_loop).
+        stage_seeds = _derive_stage_seeds(seed)
+        stage_generators = tuple(
+            torch.Generator(device=self.device).manual_seed(s) for s in stage_seeds
+        )
         dtype = self.dtype
 
         # ── Image pre-resize (ResizeImageMaskNode "5016:4990") ──────────────
@@ -403,17 +454,18 @@ class TI2VidTripleStagesComfyUIPipeline:
             images = _resize_images_to_longer_dim(images, COMFY_IMAGE_LONGER_DIM, tmp)
 
             # ── Text encoding (LTXAVTextEncoderLoader + 2× CLIPTextEncode + LTXVConditioning) ──
-            # The negative prompt is encoded but unused: cfg=1 on every CFGGuider
-            # collapses to SimpleDenoiser, which doesn't consume negative context.
-            # Encoding it anyway mirrors the workflow's CLIPTextEncode-Negative node
-            # (and matches its boot-time work).
-            ctx_p, _ctx_n = self.prompt_encoder(
+            # Both the positive (empty) and negative prompts are used: ComfyUI's
+            # cfg++ samplers run a negative-prompt uncond pass even at cfg=1
+            # (disable_cfg1_optimization), and the cfg++ ODE direction depends
+            # on it. See _cfgpp_denoising_loop.
+            ctx_p, ctx_n = self.prompt_encoder(
                 [prompt, negative_prompt],
                 enhance_first_prompt=enhance_prompt,
                 enhance_prompt_image=images[0][0] if len(images) > 0 else None,
                 enhance_prompt_seed=seed,
             )
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
             # ── Sigma schedules — pinned to the workflow's ManualSigmas literals ──
             stage_1_sigmas = torch.tensor(COMFY_STAGE_1_SIGMAS, dtype=torch.float32, device=self.device)
@@ -441,7 +493,7 @@ class TI2VidTripleStagesComfyUIPipeline:
             video_state, audio_state = self.stage_1(
                 denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
                 sigmas=stage_1_sigmas,
-                noiser=noiser,
+                noiser=GaussianNoiser(generator=stage_generators[0]),
                 width=stage_1_width,
                 height=stage_1_height,
                 frames=num_frames,
@@ -455,9 +507,12 @@ class TI2VidTripleStagesComfyUIPipeline:
                     context=a_context_p,
                     noise_scale=stage_1_sigmas[0].item(),
                 ),
-                # ComfyUI's ``euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0).
+                # ComfyUI's ``euler_ancestral_cfg_pp`` (eta=1.0, s_noise=1.0) +
+                # the negative-prompt uncond pass (disable_cfg1_optimization).
                 loop=functools.partial(
-                    _cfgpp_denoising_loop, generator=generator, eta=1.0, s_noise=1.0,
+                    _cfgpp_denoising_loop,
+                    neg_denoiser=SimpleDenoiser(v_context=v_context_n, a_context=a_context_n),
+                    generator=stage_generators[0], eta=1.0, s_noise=1.0,
                 ),
                 max_batch_size=max_batch_size,
             )
@@ -486,7 +541,7 @@ class TI2VidTripleStagesComfyUIPipeline:
             video_state, audio_state = self.stage_2(
                 denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
                 sigmas=stage_2_sigmas,
-                noiser=noiser,
+                noiser=GaussianNoiser(generator=stage_generators[1]),
                 width=stage_2_width,
                 height=stage_2_height,
                 frames=num_frames,
@@ -502,9 +557,12 @@ class TI2VidTripleStagesComfyUIPipeline:
                     noise_scale=stage_2_sigmas[0].item(),
                     initial_latent=audio_state.latent,
                 ),
-                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0).
+                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0) +
+                # the negative-prompt uncond pass (disable_cfg1_optimization).
                 loop=functools.partial(
-                    _cfgpp_denoising_loop, generator=generator, eta=0.0, s_noise=0.0,
+                    _cfgpp_denoising_loop,
+                    neg_denoiser=SimpleDenoiser(v_context=v_context_n, a_context=a_context_n),
+                    generator=stage_generators[1], eta=0.0, s_noise=0.0,
                 ),
                 max_batch_size=max_batch_size,
             )
@@ -527,7 +585,7 @@ class TI2VidTripleStagesComfyUIPipeline:
             video_state, audio_state = self.stage_3(
                 denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
                 sigmas=stage_3_sigmas,
-                noiser=noiser,
+                noiser=GaussianNoiser(generator=stage_generators[2]),
                 width=width,
                 height=height,
                 frames=num_frames,
@@ -543,9 +601,12 @@ class TI2VidTripleStagesComfyUIPipeline:
                     noise_scale=stage_3_sigmas[0].item(),
                     initial_latent=audio_state.latent,
                 ),
-                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0).
+                # ComfyUI's ``euler_cfg_pp`` (eta=0.0, s_noise=0.0) +
+                # the negative-prompt uncond pass (disable_cfg1_optimization).
                 loop=functools.partial(
-                    _cfgpp_denoising_loop, generator=generator, eta=0.0, s_noise=0.0,
+                    _cfgpp_denoising_loop,
+                    neg_denoiser=SimpleDenoiser(v_context=v_context_n, a_context=a_context_n),
+                    generator=stage_generators[2], eta=0.0, s_noise=0.0,
                 ),
                 max_batch_size=max_batch_size,
             )
@@ -554,7 +615,7 @@ class TI2VidTripleStagesComfyUIPipeline:
             decoded_video = self.video_decoder(
                 video_state.latent,
                 tiling_config or COMFY_TILING_CONFIG,
-                generator,
+                stage_generators[2],
             )
             decoded_audio = self.audio_decoder(audio_state.latent)
         return decoded_video, decoded_audio
@@ -580,11 +641,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", type=str, required=True,
                         help="Positive text prompt. The workflow ships an empty string here.")
     parser.add_argument("--negative-prompt", type=str, default=COMFY_DEFAULT_NEGATIVE_PROMPT,
-                        help="Negative prompt (encoded but unused under cfg=1).")
+                        help="Negative prompt (drives the cfg++ uncond pass; "
+                             "ComfyUI runs it even at cfg=1).")
     parser.add_argument("--output-path", type=str, required=True,
                         help="Output video path (.mp4).")
     parser.add_argument("--seed", type=int, default=10,
-                        help="Random seed (single seed; ComfyUI uses three).")
+                        help="Random seed; three per-stage seeds are derived "
+                             "from it (ComfyUI uses three independent seeds).")
     parser.add_argument("--width", type=int, default=896,
                         help="Final output width. Must be divisible by 128. "
                              "Default 896 mirrors workflow's hardcoded "
