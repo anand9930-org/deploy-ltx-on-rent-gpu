@@ -226,12 +226,15 @@ RUN PYTHONPATH=/app python -c "import src.upstream; print('upstream contract OK'
 # in src/pipeline/triple_stages_comfyui_graph.py uses, so a node rename / wrong
 # COMFYUI_SHA fails the build instead of a request 5 minutes in. (No ComfyUI-LTXVideo
 # import — that pipeline uses only ComfyUI core nodes; see the graph module.)
-# /models is empty at build time — that's fine (bootstrap only *registers* the
-# model dirs; node imports don't scan them).
+# cpu_only=True: this builder has no NVIDIA driver, and `import nodes` pulls in
+# comfy.model_management which probes torch.cuda at import time unless args.cpu is
+# set — bootstrap_once(cpu_only=True) sets it before the node imports. /models is
+# empty at build time — fine (bootstrap only *registers* the model dirs; node
+# imports don't scan them).
 RUN PYTHONPATH=/app python -c "\
 import os; \
 from src import comfyui_runtime; \
-comfyui_runtime.bootstrap_once(os.environ.get('COMFYUI_PATH', '/app/ComfyUI'), os.environ.get('MODEL_DIR', '/models')); \
+comfyui_runtime.bootstrap_once(os.environ.get('COMFYUI_PATH', '/app/ComfyUI'), os.environ.get('MODEL_DIR', '/models'), cpu_only=True); \
 from nodes import CheckpointLoaderSimple, LoraLoaderModelOnly, LoadImage, VAEDecodeTiled, CLIPTextEncode; \
 from comfy_extras.nodes_custom_sampler import KSamplerSelect, ManualSigmas, RandomNoise, CFGGuider, SamplerCustomAdvanced; \
 from comfy_extras.nodes_hunyuan import LatentUpscaleModelLoader; \
