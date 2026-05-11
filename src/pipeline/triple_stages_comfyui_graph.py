@@ -88,7 +88,9 @@ COMFY_STAGE_1_IMAGE_CRF = 18
 # LTXVImgToVideoConditionOnly strength (all 3 stages).
 COMFY_IMG_COND_STRENGTH = 1.0
 # CFGGuider "5002:4828" / "5001:4964" / "5012:5005" — cfg=1 on every stage.
-COMFY_CFG = 1
+# (FLOAT input — keep it a float so it round-trips through the schema as the
+# workflow's literal does.)
+COMFY_CFG = 1.0
 # KSamplerSelect: "5002:4831" (Stage 1) vs "5001:4976" / "5012:5003" (Stages 2/3).
 COMFY_STAGE_1_SAMPLER = "euler_ancestral_cfg_pp"
 COMFY_STAGE_23_SAMPLER = "euler_cfg_pp"
@@ -140,8 +142,15 @@ def _invoke(node_cls: Any, **kwargs: Any) -> tuple:
 
     V3 nodes (``comfy_extras.nodes_lt`` etc.) expose a classmethod
     ``EXECUTE_NORMALIZED`` returning an ``io.NodeOutput`` (``.args`` is the output
-    tuple). V1 nodes (``LTXVImgToVideoConditionOnly``, ``LTXVLatentUpsampler``,
-    the ``nodes.py`` loaders, …) have ``FUNCTION = "<method>"`` returning a tuple.
+    tuple). V1 nodes (``LTXVLatentUpsampler``, the ``nodes.py`` loaders
+    ``CheckpointLoaderSimple``/``LoraLoaderModelOnly``/``LoadImage``/``CLIPTextEncode``/
+    ``VAEDecodeTiled``, …) have ``FUNCTION = "<method>"`` returning a tuple.
+
+    Note: ``EXECUTE_NORMALIZED`` forwards ``**kwargs`` verbatim to ``execute`` — it
+    does NOT reassemble ComfyUI's graph-executor sugar. A V3 ``DynamicCombo`` input
+    (here only ``ResizeImageMaskNode.resize_type``) must be passed pre-built as a
+    dict ``{"<combo-name>": <value>, "<subwidget>": <value>}``, not as the API-JSON's
+    dotted ``"<combo-name>.<subwidget>"`` key.
     """
     if hasattr(node_cls, "EXECUTE_NORMALIZED"):
         return tuple(node_cls.EXECUTE_NORMALIZED(**kwargs).args)
@@ -314,10 +323,15 @@ class TripleStagesComfyUIGraphPipeline:
         # I2V; LoadImage → ResizeImageMaskNode → LTXVImgToVideoConditionOnly always run).
         image_name = self._stage_input_image(images, width, height)
         (loaded_image, _mask) = _invoke(self._n["LoadImage"], image=image_name)
+        # ResizeImageMaskNode is V3 with a DynamicCombo `resize_type` — execute() wants
+        # it as a dict {"resize_type": <combo value>, "<subwidget>": <value>}. The API-JSON's
+        # dotted "resize_type.longer_size" is graph-executor sugar; calling EXECUTE_NORMALIZED
+        # directly bypasses that (see _invoke), so build the dict here.
         (resized_image,) = _invoke(
             self._n["ResizeImageMaskNode"],
-            resize_type="scale longer dimension", scale_method="lanczos", input=loaded_image,
-            **{"resize_type.longer_size": COMFY_IMAGE_LONGER_DIM},
+            input=loaded_image,
+            scale_method="lanczos",
+            resize_type={"resize_type": "scale longer dimension", "longer_size": COMFY_IMAGE_LONGER_DIM},
         )
 
         # ── Text conditioning.
