@@ -176,6 +176,37 @@ assert hasattr(flash_attn_interface, 'flash_attn_func'), 'FA3 wheel missing flas
 torch.zeros(2).numpy(); \
 print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__, '/ torchaudio stub OK / FA3', getattr(flash_attn_interface, '__version__', 'unknown'))"
 
+# ---- ComfyUI (triple_stages_comfyui pipeline only) -------------------------
+# That pipeline runs the real ComfyUI **core** node classes — no ComfyUI-LTXVideo
+# (its modules use relative imports that need the full nodes.init_extra_nodes()
+# runtime; the two nodes the workflow uses from it — LTXVImgToVideoConditionOnly,
+# LTXFloatToInt — have core equivalents: LTXVImgToVideoInplace and round(),
+# see src/pipeline/triple_stages_comfyui_graph.py). We clone (not pip-install) so
+# the SHA is pinnable like LTX2_UPSTREAM_SHA above. Strip torch / torchvision /
+# torchaudio / numpy / transformers / diffusers / Pillow from ComfyUI's
+# requirements so the NGC torch ABI pins (+ our torchaudio stub + numpy<2)
+# survive — then re-assert the NGC stack is intact. The legacy ltx_pipelines
+# triple-stages-comfyui path is still reachable via COMFYUI_GRAPH_MODE=0 and does
+# NOT need ComfyUI; this block is the only thing the new path adds, so the other
+# pipelines are untouched.
+ARG COMFYUI_SHA=64b8457f55cd7fb54ca7a956d9c73b505e903e0c
+RUN git init /app/ComfyUI \
+    && git -C /app/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
+    && git -C /app/ComfyUI fetch --depth 1 origin "${COMFYUI_SHA}" \
+    && git -C /app/ComfyUI checkout FETCH_HEAD \
+    && sed -i -E '/^(torch|torchvision|torchaudio|numpy|transformers|diffusers|[Pp]illow)\b/d' \
+        /app/ComfyUI/requirements.txt \
+    && uv pip install --system --break-system-packages --no-cache \
+        -r /app/ComfyUI/requirements.txt \
+    && python -c "\
+import torch, numpy, torchaudio, torchvision; \
+assert numpy.__version__.split('.')[0] == '1', f'numpy clobbered by ComfyUI install: {numpy.__version__}'; \
+assert '.nv' in torch.__version__, f'NGC torch clobbered by ComfyUI install: {torch.__version__}'; \
+assert torchaudio.__version__ == '0.0.0-stub', f'torchaudio stub clobbered by ComfyUI install: {torchaudio.__version__}'; \
+torchvision.ops.nms; torch.zeros(2).numpy(); \
+print('NGC stack intact after ComfyUI install — torch', torch.__version__, '/ numpy', numpy.__version__, '/ torchvision', torchvision.__version__)"
+ENV COMFYUI_PATH=/app/ComfyUI
+
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
 COPY service.py /app/service.py
@@ -188,6 +219,28 @@ RUN chmod +x /app/start.sh
 # the pinned SHA into a build failure with the exact missing name, instead of
 # a cryptic AttributeError 30 minutes into a generation on a deployed pod.
 RUN PYTHONPATH=/app python -c "import src.upstream; print('upstream contract OK')"
+
+# ---- ComfyUI node-contract fail-fast (triple_stages_comfyui-graph path) ----
+# Analog of the `import src.upstream` check above, for the ComfyUI side: bootstrap
+# the minimal ComfyUI runtime and import every ComfyUI core node class the cascade
+# in src/pipeline/triple_stages_comfyui_graph.py uses, so a node rename / wrong
+# COMFYUI_SHA fails the build instead of a request 5 minutes in. (No ComfyUI-LTXVideo
+# import — that pipeline uses only ComfyUI core nodes; see the graph module.)
+# /models is empty at build time — that's fine (bootstrap only *registers* the
+# model dirs; node imports don't scan them).
+RUN PYTHONPATH=/app python -c "\
+import os; \
+from src import comfyui_runtime; \
+comfyui_runtime.bootstrap_once(os.environ.get('COMFYUI_PATH', '/app/ComfyUI'), os.environ.get('MODEL_DIR', '/models')); \
+from nodes import CheckpointLoaderSimple, LoraLoaderModelOnly, LoadImage, VAEDecodeTiled, CLIPTextEncode; \
+from comfy_extras.nodes_custom_sampler import KSamplerSelect, ManualSigmas, RandomNoise, CFGGuider, SamplerCustomAdvanced; \
+from comfy_extras.nodes_hunyuan import LatentUpscaleModelLoader; \
+from comfy_extras.nodes_lt import EmptyLTXVLatentVideo, LTXVConcatAVLatent, LTXVConditioning, LTXVImgToVideoInplace, LTXVPreprocess, LTXVSeparateAVLatent; \
+from comfy_extras.nodes_lt_audio import LTXAVTextEncoderLoader, LTXVAudioVAEDecode, LTXVAudioVAELoader, LTXVEmptyLatentAudio; \
+from comfy_extras.nodes_lt_upsampler import LTXVLatentUpsampler; \
+from comfy_extras.nodes_post_processing import ResizeImageMaskNode; \
+from comfy_extras.nodes_video import CreateVideo; \
+print('ComfyUI node contract OK')"
 
 WORKDIR /app
 EXPOSE 8000
