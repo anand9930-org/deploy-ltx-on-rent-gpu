@@ -75,10 +75,20 @@ class TripleStagesComfyUIMixin:
     directly."""
 
     def _build_triple_stages_comfyui(self) -> None:
-        """Build ``TI2VidTripleStagesComfyUIPipeline``. Distilled LoRA goes on
-        all three stages at strength 0.5 on every FP8 mode (cast/bf16 via the
-        vendored class's ``distilled_lora`` arg; scaled_mm via runtime LoRA
-        fusion on top of dev-fp8 during the per-stage rebuild)."""
+        """Build the triple-stages-comfyui pipeline.
+
+        Default (``comfyui_graph_mode=True``): the new path that runs the real
+        ComfyUI **core** node classes (``TripleStagesComfyUIGraphPipeline``) —
+        BF16, ComfyUI's own model loading, no FP8/FA3/torch.compile. Set
+        ``COMFYUI_GRAPH_MODE=0`` to fall back to the legacy ``ltx_pipelines``-based
+        ``TI2VidTripleStagesComfyUIPipeline`` port below (distilled LoRA strength
+        0.5 on all 3 stages; scaled_mm/cast FP8 modes; the per-stage scaled_mm rebuild)."""
+        from src.config import get_settings
+        if get_settings().comfyui_graph_mode:
+            self._build_triple_stages_comfyui_graph()
+            return
+
+        # ── Legacy path (COMFYUI_GRAPH_MODE=0): ltx_pipelines-based port ────
         from src.pipeline.core import (
             _build_scaled_mm_policy,
             _install_build_transformer_audit,
@@ -252,6 +262,31 @@ class TripleStagesComfyUIMixin:
 
         self._log_attention_fingerprint()
 
+    def _build_triple_stages_comfyui_graph(self) -> None:
+        """Build ``TripleStagesComfyUIGraphPipeline`` — runs the real ComfyUI
+        **core** node graph (BF16, ComfyUI's own model loading; no
+        FP8/FA3/torch.compile). The ComfyUI runtime is bootstrapped lazily on
+        first use and stays resident for the process; ``_ensure_mode`` frees its
+        resident model weights when switching away to another pipeline."""
+        from src import comfyui_runtime
+        from src.config import get_settings
+        from src.pipeline.triple_stages_comfyui_graph import (
+            TripleStagesComfyUIGraphPipeline,
+        )
+
+        settings = get_settings()
+        comfyui_runtime.reset_to_clean_gpu()
+        _t0 = time.perf_counter()
+        self._pipeline = TripleStagesComfyUIGraphPipeline(
+            model_dir=settings.model_dir, comfyui_path=settings.comfyui_path,
+        )
+        # TeaCache is an ltx_pipelines/teacache concept — not used on this path.
+        self._teacache_enabled = False
+        logger.info(
+            "Triple-stages-comfyui-graph: pipeline ready in %.1fs "
+            "(BF16, ComfyUI=%s)", time.perf_counter() - _t0, settings.comfyui_path,
+        )
+
     def _triple_stages_comfyui_generate(
         self, *, prompt: str, negative_prompt: str,
         width: int | None, height: int | None, num_frames: int,
@@ -260,8 +295,9 @@ class TripleStagesComfyUIMixin:
         image_frame_idx: int,
         enhance_prompt: bool,
     ) -> dict:
-        from src.vendor.ti2vid_triple_stages_comfyui import COMFY_TILING_CONFIG
+        from src.config import get_settings
 
+        graph_mode = get_settings().comfyui_graph_mode
         job_id = uuid.uuid4().hex[:12]
         image_path: str | None = None
         try:
@@ -299,12 +335,19 @@ class TripleStagesComfyUIMixin:
                 width, height, num_frames, seed,
             )
 
-            tiling_config = COMFY_TILING_CONFIG
-            video_chunks_number = None
-            if self._get_video_chunks_number is not None:
-                video_chunks_number = self._get_video_chunks_number(
-                    num_frames, tiling_config
-                )
+            if graph_mode:
+                # ComfyUI path: tiling is baked into VAEDecodeTiled; the decode
+                # returns the full tensor (no chunked encode).
+                tiling_config = None
+                video_chunks_number = None
+            else:
+                from src.vendor.ti2vid_triple_stages_comfyui import COMFY_TILING_CONFIG
+                tiling_config = COMFY_TILING_CONFIG
+                video_chunks_number = None
+                if self._get_video_chunks_number is not None:
+                    video_chunks_number = self._get_video_chunks_number(
+                        num_frames, tiling_config
+                    )
 
             from src.upstream import ImageConditioningInput
             images = (
@@ -345,13 +388,20 @@ class TripleStagesComfyUIMixin:
 
             output_filename = f"ltx_{job_id}.mp4"
             output_path = os.path.join(tempfile.gettempdir(), output_filename)
-            encode_kwargs = dict(video=video, fps=int(frame_rate), output_path=output_path)
-            if audio is not None:
-                encode_kwargs["audio"] = audio
-            if video_chunks_number is not None:
-                encode_kwargs["video_chunks_number"] = video_chunks_number
             encode_start = time.time()
-            self._encode_video(**encode_kwargs)
+            if graph_mode:
+                # ComfyUI path: assemble + write the mp4 via the workflow's
+                # CreateVideo (consumes ComfyUI's IMAGE/AUDIO directly).
+                self._pipeline.encode_to_mp4(
+                    frames=video, audio=audio, output_path=output_path, fps=int(frame_rate),
+                )
+            else:
+                encode_kwargs = dict(video=video, fps=int(frame_rate), output_path=output_path)
+                if audio is not None:
+                    encode_kwargs["audio"] = audio
+                if video_chunks_number is not None:
+                    encode_kwargs["video_chunks_number"] = video_chunks_number
+                self._encode_video(**encode_kwargs)
             logger.info(
                 "Job %s: mp4 encode %.1fs → %s",
                 job_id, time.time() - encode_start, output_path,

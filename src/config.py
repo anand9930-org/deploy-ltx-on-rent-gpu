@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     ltx_default_mode: str = "i2v"       # "t2v", "i2v", "triple_stages", "triple_stages_comfyui"
     enable_torch_compile: bool = True
 
+    # ── ComfyUI graph runtime (triple_stages_comfyui pipeline only) ──────
+    # The triple-stages-comfyui pipeline runs the real ComfyUI **core** node
+    # classes (ComfyUI cloned into the image at COMFYUI_PATH; see Dockerfile). It
+    # uses ComfyUI's own model path — NOT the ltx_core FA3 / FP8-scaled_mm /
+    # torch.compile patches the other pipelines rely on.
+    comfyui_path: str = "/app/ComfyUI"
+    # Rollback knob: False falls back to the legacy ltx_pipelines-based
+    # TI2VidTripleStagesComfyUIPipeline (kept reachable until pod-verified).
+    comfyui_graph_mode: bool = True
+
     # ── TeaCache ────────────────────────────────────────────────────────
     enable_teacache: bool = False
     teacache_threshold: float = 0.03

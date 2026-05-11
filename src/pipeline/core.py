@@ -669,6 +669,11 @@ class LTXVideoGenerator(
             self._pipeline = None
             self._unified_meta = {}
             self._teacache_enabled = False
+            # If the triple-stages-comfyui-graph pipeline was active, free
+            # ComfyUI's resident model weights so the ltx_pipelines path gets the
+            # GPU back. No-op if ComfyUI was never bootstrapped (legacy/other mode).
+            from src import comfyui_runtime
+            comfyui_runtime.unload_models()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

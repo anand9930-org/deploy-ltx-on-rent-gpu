@@ -14,10 +14,16 @@ export LTX_ATTENTION_TYPE="${LTX_ATTENTION_TYPE:-flash_attention_3}"
 # ICLoraPipeline (I2V and V2V share weights).
 export LTX_DEFAULT_MODE="${LTX_DEFAULT_MODE:-i2v}"
 
+# Cloned ComfyUI checkout — used only by the triple_stages_comfyui pipeline (see
+# the Dockerfile + src/comfyui_runtime.py). The Dockerfile already exports this;
+# the default here keeps `./start.sh` working in a non-Docker dev shell.
+export COMFYUI_PATH="${COMFYUI_PATH:-/app/ComfyUI}"
+
 echo "=== LTX-2.3 Video Generation Service ==="
 echo "MODEL_DIR=${MODEL_DIR:-/models}"
 echo "LTX_ATTENTION_TYPE=${LTX_ATTENTION_TYPE}"
 echo "LTX_DEFAULT_MODE=${LTX_DEFAULT_MODE}"
+echo "COMFYUI_PATH=${COMFYUI_PATH}"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'not available')"
 
 # Download models (idempotent — skips if already present).
@@ -53,6 +59,12 @@ for p in \
     "$MODELS"/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors ; do
     [ -f "$p" ] && PREWARM_FILES+=("$p")
 done
+# The triple_stages_comfyui-graph path loads the *full* dev BF16 (~46 GB), not
+# dev-fp8 — prewarm it only when this pod preloads that mode (other modes touch
+# only its VAE/embeddings keys, so caching all 46 GB would evict pages they need).
+if [ "${LTX_DEFAULT_MODE}" = "triple_stages_comfyui" ]; then
+    [ -f "$MODELS"/ltx-2.3-22b-dev.safetensors ] && PREWARM_FILES+=("$MODELS"/ltx-2.3-22b-dev.safetensors)
+fi
 # Gemma shards: download_models.py uses snapshot_download(local_dir=...)
 # so files land flat under $MODELS/gemma-3-12b-it-qat-q4_0-unquantized/,
 # NOT under the HF hub cache layout. Glob the top level for any future

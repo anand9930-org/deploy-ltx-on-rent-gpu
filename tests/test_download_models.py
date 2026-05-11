@@ -45,6 +45,12 @@ class TestEnsureModelsDownloaded:
         gemma_dir.mkdir()
         (gemma_dir / "model.safetensors").touch()
 
+        # Consolidated single-file Gemma for the ComfyUI-graph triple-stages
+        # pipeline (Comfy-Org/ltx-2 → split_files/text_encoders/...).
+        comfy_te_dir = tmp_path / "split_files" / "text_encoders"
+        comfy_te_dir.mkdir(parents=True)
+        (comfy_te_dir / "gemma_3_12B_it.safetensors").touch()
+
         env = {"HF_TOKEN": "hf_test"}
         if fp8_mode:
             env["LTX_FP8_MODE"] = fp8_mode

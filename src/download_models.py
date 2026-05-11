@@ -149,6 +149,19 @@ def ensure_models_downloaded(model_dir: str) -> None:
     else:
         logger.info("Gemma 3 text encoder already cached.")
 
+    # 9. Gemma single-file text encoder for the ComfyUI-graph triple-stages pipeline.
+    # Comfy-Org/ltx-2 packages a consolidated gemma_3_12B_it.safetensors (~24 GB) —
+    # the exact filename the 3mljpp workflow's LTXAVTextEncoderLoader uses — under
+    # split_files/text_encoders/. hf_hub_download lands it at
+    # <model_dir>/split_files/text_encoders/gemma_3_12B_it.safetensors; comfyui_runtime
+    # registers that dir as a "text_encoders" folder so ComfyUI's loader finds it.
+    # (Distinct from the google/gemma-3-12b-it-qat-q4_0-unquantized shard dir above —
+    # that one stays for the ltx_pipelines paths via self._gemma_root.)
+    _hf_get(
+        "Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it.safetensors",
+        model_dir, hf_token, "Gemma 3 12B text encoder for ComfyUI (~24 GB)",
+    )
+
     logger.info("All models verified / downloaded to %s", model_dir)
 
 

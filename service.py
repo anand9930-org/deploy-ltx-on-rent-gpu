@@ -30,7 +30,7 @@ from pydantic import Field
 from src import storage
 from src.config import get_settings
 from src.pipeline import DEFAULT_NEGATIVE_PROMPT, LTXVideoGenerator
-from src.vendor.ti2vid_triple_stages_comfyui import COMFY_DEFAULT_NEGATIVE_PROMPT
+from src.pipeline.triple_stages_comfyui_graph import COMFY_DEFAULT_NEGATIVE_PROMPT
 
 _settings = get_settings()
 
