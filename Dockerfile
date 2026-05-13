@@ -48,12 +48,20 @@ RUN uv pip install --system --break-system-packages --no-cache /app
 # regression or wrong-index install at build time, in GHA, with no GPU.
 # Accepted: sm_122, sm_120 (binary kernels) or compute_122 / compute_120 (PTX
 # that JITs forward to sm_122 at first kernel launch on RTX PRO 6000).
+#
+# Why _C._cuda_getArchFlags() and not torch.cuda.get_arch_list()?
+# get_arch_list() gates on torch.cuda.is_available(), which returns False on
+# the GHA ubuntu-latest builder (no GPU), so the wrapper always returns [].
+# The private getter reads from a compile-time static NVCC_FLAGS_EXTRA string
+# and works without a GPU — it is exactly what get_arch_list() delegates to
+# when CUDA is available.
 RUN python -c "\
 import importlib.metadata as m, anyio, numpy, torch, torchvision; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
 assert torch.__version__.startswith('2.8.'), f'expected torch 2.8.x; got {torch.__version__}'; \
 assert torch.version.cuda and torch.version.cuda.startswith('12.'), f'expected CUDA 12.x runtime; got {torch.version.cuda}'; \
-arch_list = torch.cuda.get_arch_list(); \
+arch_flags = torch._C._cuda_getArchFlags() or ''; \
+arch_list = arch_flags.split(); \
 needed = ('sm_122', 'compute_122', 'sm_120', 'compute_120'); \
 assert any(a in needed for a in arch_list), \
     f'torch wheel lacks Blackwell workstation arch (sm_120/sm_122); got {arch_list!r}'; \
