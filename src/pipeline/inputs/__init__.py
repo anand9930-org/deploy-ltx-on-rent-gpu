@@ -5,11 +5,11 @@ a tempfile path that the pipeline consumes.
 """
 
 from src.pipeline.inputs.image import (
-    derive_dims_from_image,
+    derive_orientation,
     materialize_image,
 )
 
 __all__ = [
-    "derive_dims_from_image",
+    "derive_orientation",
     "materialize_image",
 ]

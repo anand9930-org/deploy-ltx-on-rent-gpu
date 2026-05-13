@@ -1,13 +1,8 @@
 {
   "prompt": "A golden retriever puppy playing in a sunlit meadow with wildflowers, cinematic quality, soft natural lighting, shallow depth of field, the puppy runs joyfully through tall green grass as colorful butterflies flutter around, warm golden hour atmosphere, shot on 35mm film",
   "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted, low resolution, watermark, text",
-  "width": 1024,
-  "height": 1536,
+  "aspect_ratio": "16:9",
   "num_frames": 121,
-  "num_inference_steps": 30,
   "seed": 42,
-  "frame_rate": 24,
-  "cfg_scale": 3.0,
-  "stg_scale": 1.0,
-  "rescale_scale": 0.7
+  "frame_rate": 24
 }

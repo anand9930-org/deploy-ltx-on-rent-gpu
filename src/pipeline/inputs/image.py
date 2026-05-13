@@ -12,6 +12,7 @@ import logging
 import re
 import tempfile
 from io import BytesIO
+from typing import Literal
 
 import httpx
 from PIL import Image, UnidentifiedImageError
@@ -37,14 +38,6 @@ _FETCH_HEADERS = {
 
 # data:image/png;base64,iVBORw0... — strip the URI prefix browsers send.
 _DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,", re.IGNORECASE)
-
-_GRID = 64
-_MAX_SIDE = 1920
-_MIN_SIDE = 256
-
-
-def _round_to_grid(value: int) -> int:
-    return (value // _GRID) * _GRID
 
 
 def _validate_image_bytes(blob: bytes) -> str:
@@ -150,25 +143,16 @@ def materialize_image(
     return tmp.name
 
 
-def derive_dims_from_image(image_path: str) -> tuple[int, int]:
-    """Return (width, height) for the auto-AR case. Scales DOWN to fit
-    longest side ≤ MAX_SIDE (never upscales — VAE-interpolating a small
-    input wastes VRAM and blurs frame 1), then floor-rounds to the 64-grid
-    and clamps short side to MIN_SIDE."""
+def derive_orientation(image_path: str) -> Literal["16:9", "9:16"]:
+    """Return ``"16:9"`` if the image is wider-than-or-equal-to its height,
+    ``"9:16"`` if taller. Used to resolve ``aspect_ratio="auto"`` in I2V."""
     with Image.open(image_path) as im:
         iw, ih = im.size
     if iw <= 0 or ih <= 0:
         raise ValueError(f"image has invalid dimensions: {iw}x{ih}")
-
-    longest = max(iw, ih)
-    scale = min(1.0, _MAX_SIDE / longest)
-    w = int(round(iw * scale))
-    h = int(round(ih * scale))
-
-    w = max(_MIN_SIDE, _round_to_grid(w))
-    h = max(_MIN_SIDE, _round_to_grid(h))
+    orientation: Literal["16:9", "9:16"] = "16:9" if iw >= ih else "9:16"
     logger.info(
-        "I2V auto-AR: input %dx%d -> output %dx%d (scale=%.3f, /64-grid)",
-        iw, ih, w, h, scale,
+        "I2V auto orientation: input %dx%d -> %s",
+        iw, ih, orientation,
     )
-    return w, h
+    return orientation

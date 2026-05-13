@@ -8,17 +8,37 @@ from io import BytesIO
 import pytest
 
 
+# Mirrors the resolution table in src/pipeline/triple_stages_comfyui.py — keep
+# in sync if the buckets ever change. (Independent copy on purpose: tests must
+# import this module without pulling the pipeline mixin, which only loads on
+# Python with torch + ComfyUI deps available.)
+_BUCKET_BY_RATIO = {
+    "16:9": (1920, 1080),
+    "9:16": (1080, 1920),
+}
+
+
+def _resolve_bucket(aspect_ratio: str, has_image: bool, image_orientation: str | None) -> tuple[int, int]:
+    if aspect_ratio == "auto":
+        aspect_ratio = image_orientation if has_image and image_orientation else "16:9"
+    return _BUCKET_BY_RATIO[aspect_ratio]
+
+
 class MockGenerator:
     """Drop-in replacement for LTXVideoGenerator that runs without GPU.
 
     Returns a tiny valid MP4 file so the full serving flow
     (BentoML endpoint → generate → encode → response) can be tested locally.
     Records the last call's kwargs on ``last_call`` so tests can assert that
-    ``image_url`` / ``image_b64`` / dims were passed through correctly.
+    ``image_url`` / ``image_b64`` / ``aspect_ratio`` were passed through.
+
+    For ``aspect_ratio="auto"`` with an image, tests may set
+    ``image_orientation`` on the fixture to control what auto resolves to.
     """
 
     def __init__(self) -> None:
         self.last_call: dict | None = None
+        self.image_orientation: str | None = None
 
     def generate(self, **kwargs):
         self.last_call = dict(kwargs)
@@ -33,10 +53,16 @@ class MockGenerator:
             or kwargs.get("image_b64") is not None
         )
         mode = "triple_comfyui_i2v" if has_image else "triple_comfyui_t2v"
+        aspect_ratio = kwargs.get("aspect_ratio", "auto")
+        out_w, out_h = _resolve_bucket(
+            aspect_ratio, has_image, self.image_orientation,
+        )
+        resolved_ratio = "16:9" if (out_w, out_h) == (1920, 1080) else "9:16"
         parameters = {
             "mode": mode,
-            "width": kwargs.get("width", 896),
-            "height": kwargs.get("height", 1280),
+            "aspect_ratio": resolved_ratio,
+            "width": out_w,
+            "height": out_h,
             "num_frames": kwargs.get("num_frames", 241),
             "seed": kwargs.get("seed", 42),
             "frame_rate": kwargs.get("frame_rate", 24.0),

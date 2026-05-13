@@ -2,7 +2,7 @@
 
 Exercises the ``/generate_sync`` + ``/generate`` endpoints via MockGenerator.
 Pins the *contract* between service.py and the generator — image fields
-forwarded, default dims, mode discriminator — so a future refactor that
+forwarded, default bucket, mode discriminator — so a future refactor that
 drifts fails fast.
 """
 
@@ -14,8 +14,7 @@ def _run_comfyui_sync(mock_gen, **kwargs):
     defaults = dict(
         prompt="test prompt",
         negative_prompt="blurry, low quality",
-        width=896,
-        height=1280,
+        aspect_ratio="auto",
         num_frames=241,
         seed=42,
         frame_rate=24.0,
@@ -78,6 +77,10 @@ class TestParameterForwarding:
         _run_comfyui_sync(mock_generator, seed=1234)
         assert mock_generator.last_call["seed"] == 1234
 
+    def test_aspect_ratio_reaches_generator(self, mock_generator):
+        _run_comfyui_sync(mock_generator, aspect_ratio="9:16")
+        assert mock_generator.last_call["aspect_ratio"] == "9:16"
+
 
 class TestParametersBlock:
     """The result['parameters'] block must NOT carry cfg/stg/rescale or step
@@ -106,8 +109,17 @@ class TestParametersBlock:
         )
         assert result["parameters"]["image_frame_idx"] == 4
 
-    def test_default_dims_match_workflow(self, mock_generator):
+    def test_t2v_default_dims_are_landscape_1080p(self, mock_generator):
+        # aspect_ratio="auto" + no image → "16:9" → 1920x1080
         result = mock_generator.generate(prompt="test")
-        assert result["parameters"]["width"] == 896
-        assert result["parameters"]["height"] == 1280
-        assert result["parameters"]["num_frames"] == 241
+        params = result["parameters"]
+        assert params["aspect_ratio"] == "16:9"
+        assert params["width"] == 1920
+        assert params["height"] == 1080
+        assert params["num_frames"] == 241
+
+    def test_explicit_portrait_dims(self, mock_generator):
+        result = mock_generator.generate(prompt="test", aspect_ratio="9:16")
+        params = result["parameters"]
+        assert params["aspect_ratio"] == "9:16"
+        assert (params["width"], params["height"]) == (1080, 1920)

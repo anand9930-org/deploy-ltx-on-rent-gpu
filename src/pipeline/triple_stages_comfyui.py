@@ -4,9 +4,11 @@ Mixin owns ``_build_triple_stages_comfyui`` (boot/rebuild) and
 ``_triple_stages_comfyui_generate`` (per-call denoise → encode). Single
 mixin covers both T2V (empty ``images=[]``) and I2V.
 
-Resolution must be divisible by **128** (the 4× downscale chain enforces this
-for the 4× downscale chain). Sigma schedules and step counts are fixed by the
-workflow's ManualSigmas literals (8/3/3 steps at sigmas 1.0 and 0.85).
+Output dimensions are resolved from ``aspect_ratio`` into two canonical
+buckets: landscape generates 1920x1152 and post-crops to 1920x1080, portrait
+generates 1152x1920 and post-crops to 1080x1920. The /128 generation grid is
+required by the 3-stage cascade (Stage 1 runs at final/4 and must be VAE-/32
+aligned); the post-decode center-crop is what turns that into "true 1080p".
 """
 
 import logging
@@ -14,34 +16,42 @@ import os
 import tempfile
 import time
 import uuid
+from typing import Literal
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 
-def _round_to_128(value: int) -> int:
-    return (value // 128) * 128
+# (gen_w, gen_h, out_w, out_h) — generation dims must be /128 (3-stage cascade);
+# output dims are what the caller receives after the post-decode center-crop.
+LANDSCAPE_BUCKET = (1920, 1152, 1920, 1080)
+PORTRAIT_BUCKET = (1152, 1920, 1080, 1920)
 
 
 def _round_frames_8k1(n: int) -> int:
+    """Floor ``n`` to ``8k+1`` — LTX-2 VAE temporal factor."""
     return ((n - 1) // 8) * 8 + 1
 
 
-def _round_user_inputs_comfyui(
-    width: int, height: int, num_frames: int,
-) -> tuple[int, int, int]:
-    """Round to ComfyUI variant's 4×-chain grid (W/H divisible by 128, frames
-    = 8k+1) and log when we change anything."""
-    w = _round_to_128(width)
-    h = _round_to_128(height)
-    f = _round_frames_8k1(num_frames)
-    if (w, h, f) != (width, height, num_frames):
-        logger.info(
-            "ComfyUI input rounded to 4×-chain grid: %dx%d×%d → %dx%d×%d",
-            width, height, num_frames, w, h, f,
-        )
-    return w, h, f
+def _resolve_aspect_ratio(
+    aspect_ratio: Literal["16:9", "9:16", "auto"],
+    image_path: str | None,
+) -> tuple[int, int, int, int]:
+    """Resolve the request's ``aspect_ratio`` into ``(gen_w, gen_h, out_w, out_h)``.
+
+    ``"auto"`` derives orientation from the input image (I2V) or falls back to
+    landscape (T2V). Explicit ``"16:9"`` / ``"9:16"`` always win, even if the
+    input image's orientation disagrees — that's an intentional caller override.
+    """
+    if aspect_ratio == "auto":
+        if image_path is not None:
+            from src.pipeline.inputs import derive_orientation
+
+            aspect_ratio = derive_orientation(image_path)
+        else:
+            aspect_ratio = "16:9"
+    return LANDSCAPE_BUCKET if aspect_ratio == "16:9" else PORTRAIT_BUCKET
 
 
 class TripleStagesComfyUIMixin:
@@ -75,8 +85,7 @@ class TripleStagesComfyUIMixin:
         *,
         prompt: str,
         negative_prompt: str,
-        width: int | None,
-        height: int | None,
+        aspect_ratio: Literal["16:9", "9:16", "auto"],
         num_frames: int,
         seed: int,
         frame_rate: float,
@@ -90,22 +99,23 @@ class TripleStagesComfyUIMixin:
         try:
             has_image = image_url is not None or image_b64 is not None
             if has_image:
-                from src.pipeline.inputs import (
-                    derive_dims_from_image,
-                    materialize_image,
-                )
+                from src.pipeline.inputs import materialize_image
 
                 image_path = materialize_image(image_url, image_b64)
-                if width is None and height is None:
-                    width, height = derive_dims_from_image(image_path)
 
-            if width is None:
-                width = 896
-            if height is None:
-                height = 1280
-            width, height, num_frames = _round_user_inputs_comfyui(
-                width, height, num_frames,
+            gen_w, gen_h, out_w, out_h = _resolve_aspect_ratio(
+                aspect_ratio, image_path,
             )
+            resolved_ratio: Literal["16:9", "9:16"] = (
+                "16:9" if (gen_w, gen_h) == LANDSCAPE_BUCKET[:2] else "9:16"
+            )
+            rounded_frames = _round_frames_8k1(num_frames)
+            if rounded_frames != num_frames:
+                logger.info(
+                    "num_frames rounded to 8k+1: %d → %d",
+                    num_frames, rounded_frames,
+                )
+            num_frames = rounded_frames
 
             mode = "triple_comfyui_i2v" if has_image else "triple_comfyui_t2v"
             src_label = (
@@ -114,14 +124,18 @@ class TripleStagesComfyUIMixin:
                 else "image_b64" if image_b64 is not None else "none"
             )
             logger.info(
-                "Job %s: %s (image_src=%s) prompt=%r, %dx%d, %d frames, "
-                "fixed schedule (stage1=9/stage2=4/stage3=4 sigmas), seed=%d",
+                "Job %s: %s (image_src=%s) prompt=%r, aspect=%s, gen=%dx%d, "
+                "out=%dx%d, %d frames, fixed schedule "
+                "(stage1=9/stage2=4/stage3=4 sigmas), seed=%d",
                 job_id,
                 mode.upper(),
                 src_label,
                 prompt[:80],
-                width,
-                height,
+                resolved_ratio,
+                gen_w,
+                gen_h,
+                out_w,
+                out_h,
                 num_frames,
                 seed,
             )
@@ -148,8 +162,8 @@ class TripleStagesComfyUIMixin:
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 seed=seed,
-                height=height,
-                width=width,
+                height=gen_h,
+                width=gen_w,
                 num_frames=num_frames,
                 frame_rate=frame_rate,
                 images=images,
@@ -186,6 +200,8 @@ class TripleStagesComfyUIMixin:
                 audio=audio,
                 output_path=output_path,
                 fps=int(frame_rate),
+                out_w=out_w,
+                out_h=out_h,
             )
             logger.info(
                 "Job %s: mp4 encode %.1fs → %s",
@@ -200,8 +216,9 @@ class TripleStagesComfyUIMixin:
                 "generation_time_seconds": round(generation_time, 2),
                 "parameters": {
                     "mode": mode,
-                    "width": width,
-                    "height": height,
+                    "aspect_ratio": resolved_ratio,
+                    "width": out_w,
+                    "height": out_h,
                     "num_frames": num_frames,
                     "seed": seed,
                     "frame_rate": frame_rate,
