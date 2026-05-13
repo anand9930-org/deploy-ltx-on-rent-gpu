@@ -82,10 +82,8 @@ curl -X POST http://<EXTERNAL_IP>:<MAPPED_PORT>/generate/submit \
   -H 'Content-Type: application/json' \
   -d '{
     "prompt": "A golden retriever running through a sunlit meadow, cinematic, 35mm film",
-    "width": 512,
-    "height": 768,
-    "num_frames": 25,
-    "num_inference_steps": 8,
+    "aspect_ratio": "16:9",
+    "num_frames": 121,
     "seed": 42,
     "upload_to_supabase": false
   }'
@@ -104,7 +102,7 @@ Or use the synchronous endpoint (returns MP4 directly, holds connection open):
 ```bash
 curl -X POST http://<EXTERNAL_IP>:<MAPPED_PORT>/generate_sync \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": "A cat sitting on a windowsill", "width": 512, "height": 768, "num_frames": 25, "num_inference_steps": 8}' \
+  -d '{"prompt": "A cat sitting on a windowsill", "aspect_ratio": "9:16", "num_frames": 121}' \
   --output video.mp4
 ```
 
@@ -129,28 +127,25 @@ curl -X POST http://<EXTERNAL_IP>:<MAPPED_PORT>/generate_sync \
 |-----------|------|---------|-------------|
 | `prompt` | string | **required** | Text description (max 2000 chars) |
 | `negative_prompt` | string | *built-in* | Things to avoid |
-| `width` | int | 1024 | 256–1920, rounded to nearest 64 |
-| `height` | int | 1536 | 256–1920, rounded to nearest 64 |
-| `num_frames` | int | 121 | 9–257, rounded to 8k+1 |
-| `num_inference_steps` | int | 30 | 1–100 |
+| `aspect_ratio` | `"16:9" \| "9:16" \| "auto"` | `"auto"` | Output is 1920×1080 (`"16:9"`) or 1080×1920 (`"9:16"`). `"auto"` derives from input image; T2V falls back to landscape. |
+| `num_frames` | int | 241 | 9–257, rounded to 8k+1 |
 | `seed` | int | 42 | Random seed |
 | `frame_rate` | float | 24.0 | Output FPS |
-| `cfg_scale` | float | 3.0 | Classifier-free guidance |
-| `stg_scale` | float | 1.0 | Spatial-temporal guidance |
-| `rescale_scale` | float | 0.7 | Guidance rescaling |
+| `image_url` | string \| null | null | I2V conditioning image URL (http(s); up to 50 MB; image/* content type) |
+| `image_b64` | string \| null | null | I2V conditioning image base64 (alternative to `image_url`) |
+| `image_frame_idx` | int | 0 | Frame index the conditioning image lands on |
+| `enhance_prompt` | bool | false | No-op for ComfyUI graph (the workflow has no prompt-enhancer node) |
 | `upload_to_supabase` | bool | true | Upload to Supabase (async endpoint only) |
 
 ### Quick test parameters (lower VRAM, faster)
 
-For initial testing, use smaller resolution and fewer frames:
+For initial testing, use fewer frames (resolution is fixed at 1920×1080 / 1080×1920):
 
 ```json
 {
   "prompt": "Your prompt here",
-  "width": 512,
-  "height": 768,
+  "aspect_ratio": "16:9",
   "num_frames": 25,
-  "num_inference_steps": 8,
   "seed": 42,
   "upload_to_supabase": false
 }

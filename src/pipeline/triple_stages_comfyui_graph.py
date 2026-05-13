@@ -139,6 +139,22 @@ def _derive_stage_seeds(seed: int) -> tuple[int, int, int]:
     return s1, s2, s3
 
 
+def _center_crop_frames(frames: Any, out_h: int, out_w: int) -> Any:
+    """Center-crop a ComfyUI IMAGE tensor ``(N, H, W, 3)`` to ``(N, out_h, out_w, 3)``.
+
+    Used to convert the 128-grid generation size (e.g. 1920x1152) to the
+    canonical 1080p output (1920x1080) — the cascade can't natively produce
+    1080 on a /128 grid, so we generate the smallest /128 size that contains
+    the target and slice the symmetric margins off in pixel space.
+    """
+    _, h, w, _ = frames.shape
+    if h == out_h and w == out_w:
+        return frames
+    off_h = (h - out_h) // 2
+    off_w = (w - out_w) // 2
+    return frames[:, off_h : off_h + out_h, off_w : off_w + out_w, :]
+
+
 def _invoke(node_cls: Any, **kwargs: Any) -> tuple:
     """Call a ComfyUI node class (V1 ``FUNCTION``-style or V3 ``io.ComfyNode``)
     and return its outputs as a plain tuple.
@@ -390,15 +406,31 @@ class TripleStagesComfyUIGraphPipeline:
         (audio,) = _invoke(self._n["LTXVAudioVAEDecode"], samples=audio_3, audio_vae=self._audio_vae)
         return frames, audio
 
-    def encode_to_mp4(self, *, frames: Any, audio: Any, output_path: str, fps: int) -> None:
+    def encode_to_mp4(
+        self,
+        *,
+        frames: Any,
+        audio: Any,
+        output_path: str,
+        fps: int,
+        out_w: int | None = None,
+        out_h: int | None = None,
+    ) -> None:
         """Assemble the decoded frames + audio into an mp4 via ComfyUI's
         ``CreateVideo`` (the workflow's final node — same fps/container as a real
         ComfyUI run) and write it to ``output_path``. ``CreateVideo`` consumes
         ComfyUI's IMAGE ``(N,H,W,3)`` float[0,1] + AUDIO dict directly (no
         conversion); ``VideoFromComponents.save_to`` with AUTO container/codec →
-        mp4/h264 for a ``.mp4`` path."""
+        mp4/h264 for a ``.mp4`` path.
+
+        When ``out_w``/``out_h`` are supplied and differ from the decoded frame
+        size, center-crop the IMAGE tensor before encoding. This is how the
+        pipeline turns its /128 generation size (e.g. 1920x1152) into the
+        public-facing 1920x1080 output."""
         from comfy_extras.nodes_video import CreateVideo
 
+        if out_w is not None and out_h is not None:
+            frames = _center_crop_frames(frames, out_h=out_h, out_w=out_w)
         video_obj = _invoke(CreateVideo, images=frames, fps=float(fps), audio=audio)[0]
         video_obj.save_to(output_path)
 

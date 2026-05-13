@@ -16,8 +16,7 @@ def _run_generate(mock_gen, **kwargs):
     defaults = dict(
         prompt="test prompt",
         negative_prompt="blurry, low quality",
-        width=896,
-        height=1280,
+        aspect_ratio="auto",
         num_frames=241,
         seed=42,
         frame_rate=24.0,
@@ -55,8 +54,7 @@ def _run_generate_sync(mock_gen, **kwargs):
     defaults = dict(
         prompt="test prompt",
         negative_prompt="blurry, low quality",
-        width=896,
-        height=1280,
+        aspect_ratio="auto",
         num_frames=241,
         seed=42,
         frame_rate=24.0,
@@ -83,10 +81,11 @@ class TestGenerate:
         assert isinstance(result["generation_time_seconds"], float)
 
     def test_returns_parameters(self, mock_generator):
-        result = _run_generate(mock_generator, width=1024, height=1280, seed=99)
+        result = _run_generate(mock_generator, aspect_ratio="9:16", seed=99)
         params = result["parameters"]
-        assert params["width"] == 1024
-        assert params["height"] == 1280
+        assert params["aspect_ratio"] == "9:16"
+        assert params["width"] == 1080
+        assert params["height"] == 1920
         assert params["seed"] == 99
 
     def test_supabase_skipped_when_not_configured(self, mock_generator):
@@ -137,12 +136,20 @@ class TestDefaults:
         assert params["frame_rate"] == 24.0
         assert params["mode"] == "triple_comfyui_t2v"
 
-    def test_default_dims_match_workflow(self, mock_generator):
+    def test_t2v_default_resolves_to_landscape(self, mock_generator):
+        # aspect_ratio="auto" + no image → "16:9" → 1920x1080
         result = _run_generate(mock_generator)
         params = result["parameters"]
-        assert params["width"] == 896
-        assert params["height"] == 1280
+        assert params["aspect_ratio"] == "16:9"
+        assert params["width"] == 1920
+        assert params["height"] == 1080
         assert params["num_frames"] == 241
+
+    def test_explicit_portrait_overrides_default(self, mock_generator):
+        result = _run_generate(mock_generator, aspect_ratio="9:16")
+        params = result["parameters"]
+        assert params["aspect_ratio"] == "9:16"
+        assert (params["width"], params["height"]) == (1080, 1920)
 
     def test_i2v_mode_when_image_supplied(self, mock_generator):
         result = _run_generate(
@@ -178,3 +185,17 @@ class TestImageInputForwarding:
         _run_generate(mock_generator)
         assert mock_generator.last_call["image_url"] is None
         assert mock_generator.last_call["image_b64"] is None
+
+
+class TestAspectRatioForwarding:
+    def test_auto_is_the_default(self, mock_generator):
+        _run_generate(mock_generator)
+        assert mock_generator.last_call["aspect_ratio"] == "auto"
+
+    def test_explicit_landscape_forwarded(self, mock_generator):
+        _run_generate(mock_generator, aspect_ratio="16:9")
+        assert mock_generator.last_call["aspect_ratio"] == "16:9"
+
+    def test_explicit_portrait_forwarded(self, mock_generator):
+        _run_generate(mock_generator, aspect_ratio="9:16")
+        assert mock_generator.last_call["aspect_ratio"] == "9:16"

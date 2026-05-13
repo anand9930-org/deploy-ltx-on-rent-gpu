@@ -8,7 +8,7 @@ an image is supplied).
 import logging
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 
@@ -48,8 +48,7 @@ class LTXVideoService:
         self,
         prompt: Annotated[str, Field(max_length=2000)],
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
-        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        aspect_ratio: Literal["16:9", "9:16", "auto"] = "auto",
         num_frames: Annotated[int, Field(ge=9, le=257)] = 241,
         seed: int = 42,
         frame_rate: float = 24.0,
@@ -61,17 +60,17 @@ class LTXVideoService:
         """Run the 3-stage ComfyUI pipeline. T2V if no image, I2V if
         ``image_url``/``image_b64`` supplied.
 
-        Resolution must be divisible by 128 (the 4× downscale chain enforces
-        this); callers that supply mismatched dims will see them rounded down.
-
-        Defaults mirror the workflow: ``num_frames=241``, ``frame_rate=24.0``,
-        and width/height derived from the image (or 896×1280 fallback for T2V).
+        Output is always 1920x1080 (``aspect_ratio="16:9"``) or 1080x1920
+        (``"9:16"``). ``"auto"`` (the default) derives orientation from the
+        input image for I2V and falls back to landscape for T2V. Internally
+        the pipeline generates at 1920x1152 / 1152x1920 (the /128 grid the
+        3-stage cascade requires) and center-crops to the canonical 1080p
+        dimensions before encoding.
         """
         result = self.generator.generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=width,
-            height=height,
+            aspect_ratio=aspect_ratio,
             num_frames=num_frames,
             seed=seed,
             frame_rate=frame_rate,
@@ -87,8 +86,7 @@ class LTXVideoService:
         self,
         prompt: Annotated[str, Field(max_length=2000)],
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: Annotated[int | None, Field(ge=256, le=1920)] = None,
-        height: Annotated[int | None, Field(ge=256, le=1920)] = None,
+        aspect_ratio: Literal["16:9", "9:16", "auto"] = "auto",
         num_frames: Annotated[int, Field(ge=9, le=257)] = 241,
         seed: int = 42,
         frame_rate: float = 24.0,
@@ -106,8 +104,7 @@ class LTXVideoService:
         result = self.generator.generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=width,
-            height=height,
+            aspect_ratio=aspect_ratio,
             num_frames=num_frames,
             seed=seed,
             frame_rate=frame_rate,

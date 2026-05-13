@@ -23,6 +23,7 @@ from src.pipeline.triple_stages_comfyui_graph import (
     COMFY_STAGE_23_SAMPLER,
     COMFY_STAGE_23_SIGMAS,
     DEFAULT_NEGATIVE_PROMPT,
+    _center_crop_frames,
     _derive_stage_seeds,
 )
 
@@ -75,6 +76,46 @@ class TestWorkflowLiterals:
         assert DEFAULT_NEGATIVE_PROMPT.startswith("camera zooming out, low resolution, blurry,")
         assert DEFAULT_NEGATIVE_PROMPT.endswith("warping, extra body parts")
         assert "scene cut, scene transition" in DEFAULT_NEGATIVE_PROMPT
+
+
+class TestCenterCropFrames:
+    """The post-decode crop slices a /128 IMAGE tensor down to the canonical
+    1080p output. Done as a pure tensor slice so it's testable without ComfyUI
+    runtime."""
+
+    def _make_frames(self, n: int, h: int, w: int):
+        # Build an indexable (N, H, W, 3) array; numpy is fine — torch is the
+        # production tensor type but slicing semantics are identical.
+        import numpy as np
+
+        # value-per-row so we can verify which rows survived the crop.
+        return np.broadcast_to(
+            np.arange(h, dtype=np.float32).reshape(1, h, 1, 1),
+            (n, h, w, 3),
+        ).copy()
+
+    def test_landscape_1152_to_1080(self):
+        # The intended landscape crop: (5, 1152, 1920, 3) → (5, 1080, 1920, 3).
+        # 36 rows off top and bottom.
+        frames = self._make_frames(5, 1152, 1920)
+        out = _center_crop_frames(frames, out_h=1080, out_w=1920)
+        assert out.shape == (5, 1080, 1920, 3)
+        # First surviving row index = 36, last = 36 + 1079 = 1115.
+        assert out[0, 0, 0, 0] == 36.0
+        assert out[0, -1, 0, 0] == 1115.0
+
+    def test_portrait_no_width_crop(self):
+        # Portrait gen 1152x1920 → out 1080x1920. Crop on width only.
+        frames = self._make_frames(2, 1920, 1152)
+        out = _center_crop_frames(frames, out_h=1920, out_w=1080)
+        assert out.shape == (2, 1920, 1080, 3)
+
+    def test_exact_size_is_passthrough(self):
+        # No-op path: if the generation size already matches the output, the
+        # function returns the input unchanged (no needless copy).
+        frames = self._make_frames(1, 1080, 1920)
+        out = _center_crop_frames(frames, out_h=1080, out_w=1920)
+        assert out is frames
 
 
 def test_module_imports_without_comfyui():

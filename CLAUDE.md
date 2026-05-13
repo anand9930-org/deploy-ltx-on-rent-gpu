@@ -64,7 +64,7 @@ Single pipeline: `TripleStagesComfyUIGraphPipeline` in `triple_stages_comfyui_gr
 - Stage 3: full resolution, euler_cfg_pp, 3 steps from sigma 0.85
 - Decode: VAEDecodeTiled + LTXVAudioVAEDecode
 
-Key constants are pinned to the workflow's node inputs in `triple_stages_comfyui_graph.py`. Resolution must be divisible by 128.
+Key constants are pinned to the workflow's node inputs in `triple_stages_comfyui_graph.py`. The cascade generates on a `/128` grid (forced by this workflow's choice of Stage 1 = final/4 — LTX-2.3 itself only requires `/32`, and a Stage-1-at-final/2 cascade would need only `/64`). The public API exposes only two buckets — `aspect_ratio="16:9"` (gen 1920×1152, out 1920×1080) and `"9:16"` (gen 1152×1920, out 1080×1920) — and `encode_to_mp4` center-crops the decoded IMAGE tensor to the 1080p output before encoding.
 
 Models downloaded at boot (~63 GB total):
 - `ltx-2.3-22b-dev-fp8.safetensors` (~30 GB) — ComfyUI handles FP8 natively

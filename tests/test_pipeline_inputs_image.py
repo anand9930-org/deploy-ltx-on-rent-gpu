@@ -1,4 +1,4 @@
-"""Tests for src/pipeline/inputs/image.py — URL fetch, base64 decode, validation, auto-AR."""
+"""Tests for src/pipeline/inputs/image.py — URL fetch, base64 decode, validation, orientation."""
 
 import base64
 import os
@@ -9,7 +9,7 @@ import pytest
 
 from src.pipeline.inputs.image import (
     MAX_DOWNLOAD_BYTES,
-    derive_dims_from_image,
+    derive_orientation,
     materialize_image,
 )
 from tests.conftest import minimal_png_bytes
@@ -141,53 +141,26 @@ class TestMaterializeImage:
             materialize_image(image_url=None, image_b64=bogus)
 
 
-class TestDeriveDimsFromImage:
+class TestDeriveOrientation:
     def _write(self, tmp_path, w: int, h: int) -> str:
         path = str(tmp_path / "i.png")
         with open(path, "wb") as f:
             f.write(minimal_png_bytes(w, h))
         return path
 
-    def test_landscape_1920x1080(self, tmp_path):
-        # longest = MAX_SIDE; no scale; 1080 floored to 64-grid -> 1024
-        # (matches the documented LTX-2.3 landscape behavior — see memory)
-        w, h = derive_dims_from_image(self._write(tmp_path, 1920, 1080))
-        assert (w, h) == (1920, 1024)
+    def test_landscape(self, tmp_path):
+        assert derive_orientation(self._write(tmp_path, 1920, 1080)) == "16:9"
 
-    def test_portrait_1080x1920(self, tmp_path):
-        w, h = derive_dims_from_image(self._write(tmp_path, 1080, 1920))
-        assert (w, h) == (1024, 1920)
+    def test_portrait(self, tmp_path):
+        assert derive_orientation(self._write(tmp_path, 1080, 1920)) == "9:16"
 
-    def test_small_input_not_upscaled(self, tmp_path):
-        # No upscaling: 1024x1024 -> 1024x1024 (already on grid).
-        # Without this guard a small image would be ballooned to 1920x1920,
-        # forcing the VAE to interpolate and the diffusion to render extra
-        # pixels of nothing-new — blurry first frame, wasted VRAM.
-        w, h = derive_dims_from_image(self._write(tmp_path, 1024, 1024))
-        assert (w, h) == (1024, 1024)
+    def test_square_resolves_to_landscape(self, tmp_path):
+        # Tie-breaker: equal sides → "16:9". Cheap and deterministic; callers
+        # who care can pass `aspect_ratio` explicitly.
+        assert derive_orientation(self._write(tmp_path, 512, 512)) == "16:9"
 
-    def test_tiny_input_clamped_to_min(self, tmp_path):
-        # 100x80 -> below MIN_SIDE on both axes; floor to 64 = (64, 64),
-        # clamp to MIN_SIDE = (256, 256). Aspect-ratio is sacrificed only
-        # in the extreme-tiny case; documented behavior.
-        w, h = derive_dims_from_image(self._write(tmp_path, 100, 80))
-        assert w == 256 and h == 256
+    def test_slightly_landscape(self, tmp_path):
+        assert derive_orientation(self._write(tmp_path, 600, 599)) == "16:9"
 
-    def test_oversized_input_capped_to_1920(self, tmp_path):
-        # 4000x3000 -> scale 0.48 -> 1920x1440 -> floor /64 -> 1920x1408
-        w, h = derive_dims_from_image(self._write(tmp_path, 4000, 3000))
-        assert (w, h) == (1920, 1408)
-
-    def test_extreme_aspect_clamps_to_min(self, tmp_path):
-        # 4000x100 -> short side after scale = 48 -> floored to 0 -> clamped to 256
-        w, h = derive_dims_from_image(self._write(tmp_path, 4000, 100))
-        assert w == 1920
-        assert h == 256
-
-    def test_dims_are_64_divisible(self, tmp_path):
-        for size in [(1500, 750), (777, 1234), (1920, 800), (300, 400)]:
-            w, h = derive_dims_from_image(self._write(tmp_path, *size))
-            assert w % 64 == 0
-            assert h % 64 == 0
-            assert w >= 256 and h >= 256
-            assert w <= 1920 and h <= 1920
+    def test_slightly_portrait(self, tmp_path):
+        assert derive_orientation(self._write(tmp_path, 599, 600)) == "9:16"

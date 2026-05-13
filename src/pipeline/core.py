@@ -1,14 +1,14 @@
 """LTX-2.3 ComfyUI-only pipeline wrapper.
 
-Holds ``LTXVideoGenerator`` (init, ``_ensure_mode``, ``generate``) and shared
-rounding helpers (``_round_to``, ``_round_frames``). The class delegates all
-build + generate work to ``TripleStagesComfyUIMixin``.
+Holds ``LTXVideoGenerator`` (init, ``_ensure_mode``, ``generate``). The class
+delegates all build + generate work to ``TripleStagesComfyUIMixin``.
 """
 
 import gc
 import logging
 import os
 import time
+from typing import Literal
 
 import torch
 
@@ -18,14 +18,6 @@ from src.pipeline.triple_stages_comfyui_graph import DEFAULT_NEGATIVE_PROMPT
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def _round_to(value: int, divisor: int) -> int:
-    return (value // divisor) * divisor
-
-
-def _round_frames(n: int) -> int:
-    return ((n - 1) // 8) * 8 + 1
 
 
 _MODE_TRIPLE_STAGES_COMFYUI = "triple_stages_comfyui"
@@ -68,8 +60,7 @@ class LTXVideoGenerator(TripleStagesComfyUIMixin):
         self,
         prompt: str,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
-        width: int | None = None,
-        height: int | None = None,
+        aspect_ratio: Literal["16:9", "9:16", "auto"] = "auto",
         num_frames: int = 241,
         seed: int = 42,
         frame_rate: float = 24.0,
@@ -82,8 +73,7 @@ class LTXVideoGenerator(TripleStagesComfyUIMixin):
         return self._triple_stages_comfyui_generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=width,
-            height=height,
+            aspect_ratio=aspect_ratio,
             num_frames=num_frames,
             seed=seed,
             frame_rate=frame_rate,
