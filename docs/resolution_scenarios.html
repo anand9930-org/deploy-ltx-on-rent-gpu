@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LTX-2.3 resolution scenarios — what comes out for each request body</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --good: #56d364;
+    --warn: #f0b849;
+    --bad: #f85149;
+
+    --input: #8b949e;
+    --input-fill: rgba(139,148,158,.18);
+    --gen: #58a6ff;
+    --gen-fill: rgba(88,166,255,.14);
+    --out: #56d364;
+    --out-fill: rgba(86,211,100,.18);
+    --crop: #f85149;
+    --crop-fill: rgba(248,81,73,.18);
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 0 0 80px 0;
+    background: var(--bg); color: var(--text);
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 36px 28px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; margin: 20px 0 8px; color: var(--accent); }
+  p { color: var(--text); }
+  .lede { color: var(--muted); margin-bottom: 18px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; margin: 14px 0;
+  }
+  code, .mono { font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  pre {
+    background: #0b0e13; border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; margin: 8px 0; overflow-x: auto;
+    font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+  }
+  pre .k { color: #ff7b72; }
+  pre .s { color: #a5d6ff; }
+  pre .n { color: #79c0ff; }
+  pre .c { color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font: 13px ui-monospace, monospace; }
+
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font: 12px/1 ui-monospace, monospace; vertical-align: middle;
+  }
+  .pill.land { background: rgba(86,211,100,.16); color: var(--good); }
+  .pill.port { background: rgba(108,142,239,.18); color: #6c8eef; }
+  .pill.auto { background: rgba(240,184,73,.18); color: var(--warn); }
+  .pill.t2v { background: rgba(139,148,158,.18); color: var(--muted); }
+  .pill.i2v { background: rgba(210,145,224,.18); color: #d291e0; }
+  .pill.override { background: rgba(248,81,73,.18); color: var(--bad); }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    font: 12px/1.4 ui-monospace, monospace; color: var(--muted);
+    margin: 6px 0 14px;
+  }
+  .legend .swatch { display: inline-block; width: 12px; height: 12px;
+    border-radius: 2px; vertical-align: middle; margin-right: 6px;
+    border: 1px solid currentColor;
+  }
+  .legend .input  { color: var(--input); }
+  .legend .input  .swatch { background: var(--input-fill); }
+  .legend .gen    { color: var(--gen); }
+  .legend .gen    .swatch { background: var(--gen-fill); }
+  .legend .out    { color: var(--out); }
+  .legend .out    .swatch { background: var(--out-fill); }
+  .legend .crop   { color: var(--crop); }
+  .legend .crop   .swatch { background: var(--crop-fill); border-style: dashed; }
+
+  .key-takeaway {
+    background: rgba(88,166,255,.08);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px; margin: 16px 0; border-radius: 0 6px 6px 0;
+  }
+
+  /* Scenario card layout */
+  .scenario {
+    display: grid; grid-template-columns: 320px 1fr; gap: 18px; align-items: start;
+  }
+  @media (max-width: 720px) {
+    .scenario { grid-template-columns: 1fr; }
+  }
+  .scenario .meta .title { font-weight: 600; margin: 0 0 8px; font-size: 15px; }
+  .scenario .meta .pills { margin-bottom: 10px; }
+  .scenario .meta .pills .pill { margin-right: 6px; }
+  .scenario .meta .result { color: var(--muted); font: 12.5px/1.5 ui-monospace, monospace; }
+  .scenario .meta .result .good { color: var(--good); }
+
+  .svg-wrap svg { width: 100%; height: auto; display: block; }
+
+  .footer { color: var(--muted); font-size: 12px; margin-top: 30px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>Resolution scenarios</h1>
+  <p class="lede">How <code>aspect_ratio</code> resolves to the final video dimensions across T2V, I2V, auto, and explicit-override paths. Each scenario shows the request body, the path through the pipeline, and the dimensions the caller receives back.</p>
+
+  <div class="legend">
+    <span class="input"><span class="swatch"></span>input image</span>
+    <span class="gen"><span class="swatch"></span>generation size (<code>/128</code> grid)</span>
+    <span class="crop"><span class="swatch"></span>cropped away</span>
+    <span class="out"><span class="swatch"></span>output (post-crop, what the MP4 contains)</span>
+  </div>
+
+  <!-- ─── Section 1: the two buckets ─── -->
+
+  <h2>The two buckets</h2>
+
+  <div class="card">
+    <p>Every video the service produces is in <strong>exactly one of two sizes</strong>:</p>
+    <table>
+      <thead>
+        <tr><th><code>aspect_ratio</code></th><th>Internal gen size <span class="pill gen">/128 grid</span></th><th>Output (what you get)</th><th>Crop</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="pill land">"16:9"</span></td>
+          <td class="num">1920 × 1152</td>
+          <td class="num"><strong>1920 × 1080</strong></td>
+          <td>36 px off top + 36 px off bottom</td>
+        </tr>
+        <tr>
+          <td><span class="pill port">"9:16"</span></td>
+          <td class="num">1152 × 1920</td>
+          <td class="num"><strong>1080 × 1920</strong></td>
+          <td>36 px off left + 36 px off right</td>
+        </tr>
+        <tr>
+          <td><span class="pill auto">"auto"</span></td>
+          <td colspan="3">Resolves to <code>"16:9"</code> or <code>"9:16"</code> from the input-image orientation (W ≥ H → landscape). T2V with no image falls back to <code>"16:9"</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="svg-wrap" style="margin-top:14px;">
+      <svg viewBox="0 0 600 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The two output buckets at 1/10 scale">
+        <g transform="translate(40,20)">
+          <text x="96" y="-4" text-anchor="middle" fill="#8b949e" font-family="ui-monospace,monospace" font-size="11">"16:9"</text>
+          <rect x="0" y="11" width="192" height="115" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+          <rect x="0" y="11" width="192" height="3.6" fill="rgba(248,81,73,.45)"/>
+          <rect x="0" y="122.4" width="192" height="3.6" fill="rgba(248,81,73,.45)"/>
+          <rect x="0" y="14.6" width="192" height="108" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.5"/>
+          <text x="96" y="72" text-anchor="middle" fill="#e6edf3" font-family="ui-monospace,monospace" font-size="11">1920 × 1080</text>
+          <text x="96" y="86" text-anchor="middle" fill="#56d364" font-family="ui-monospace,monospace" font-size="10">output</text>
+          <text x="-10" y="68" text-anchor="end" fill="#f85149" font-family="ui-monospace,monospace" font-size="10">−36 ↑↓</text>
+          <text x="96" y="150" text-anchor="middle" fill="#58a6ff" font-family="ui-monospace,monospace" font-size="10">gen: 1920×1152</text>
+        </g>
+
+        <g transform="translate(360,20)">
+          <text x="60" y="-4" text-anchor="middle" fill="#8b949e" font-family="ui-monospace,monospace" font-size="11">"9:16"</text>
+          <rect x="0" y="0" width="115" height="192" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+          <rect x="0" y="0" width="3.6" height="192" fill="rgba(248,81,73,.45)"/>
+          <rect x="111.4" y="0" width="3.6" height="192" fill="rgba(248,81,73,.45)"/>
+          <rect x="3.6" y="0" width="108" height="192" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.5"/>
+          <text x="60" y="92" text-anchor="middle" fill="#e6edf3" font-family="ui-monospace,monospace" font-size="11">1080</text>
+          <text x="60" y="106" text-anchor="middle" fill="#e6edf3" font-family="ui-monospace,monospace" font-size="11">× 1920</text>
+          <text x="60" y="121" text-anchor="middle" fill="#56d364" font-family="ui-monospace,monospace" font-size="10">output</text>
+          <text x="-10" y="100" text-anchor="end" fill="#f85149" font-family="ui-monospace,monospace" font-size="10">−36 ←</text>
+          <text x="125" y="100" text-anchor="start" fill="#f85149" font-family="ui-monospace,monospace" font-size="10">→ −36</text>
+          <text x="60" y="216" text-anchor="middle" fill="#58a6ff" font-family="ui-monospace,monospace" font-size="10">gen: 1152×1920</text>
+        </g>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ─── Section 2: the pipeline path ─── -->
+
+  <h2>The pipeline path</h2>
+
+  <p>From request to MP4. Dimensions shown are for the landscape (<code>"16:9"</code>) case; portrait swaps width and height.</p>
+
+  <div class="card">
+    <div class="svg-wrap">
+      <svg viewBox="0 0 980 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline path from request to MP4">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+          </marker>
+        </defs>
+
+        <rect x="10" y="80" width="100" height="56" rx="6" fill="#1d2330" stroke="#30363d"/>
+        <text x="60" y="106" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">POST</text>
+        <text x="60" y="120" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">/generate_sync</text>
+        <line x1="110" y1="108" x2="124" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="125" y="80" width="100" height="56" rx="6" fill="rgba(240,184,73,.10)" stroke="#f0b849"/>
+        <text x="175" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">resolve</text>
+        <text x="175" y="114" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">aspect_ratio</text>
+        <text x="175" y="128" text-anchor="middle" fill="#f0b849" font-size="9.5" font-family="ui-monospace,monospace">→ (gen, out)</text>
+        <line x1="225" y1="108" x2="239" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="240" y="80" width="100" height="56" rx="6" fill="rgba(139,148,158,.10)" stroke="#8b949e" stroke-dasharray="4 3"/>
+        <text x="290" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">ResizeImage</text>
+        <text x="290" y="114" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">Mask 1536</text>
+        <text x="290" y="128" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">[I2V only]</text>
+        <line x1="340" y1="108" x2="354" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="355" y="80" width="92" height="56" rx="6" fill="rgba(88,166,255,.10)" stroke="#58a6ff"/>
+        <text x="401" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">Stage 1</text>
+        <text x="401" y="114" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">gen / 4</text>
+        <text x="401" y="128" text-anchor="middle" fill="#58a6ff" font-size="9.5" font-family="ui-monospace,monospace">480 × 288</text>
+        <line x1="447" y1="108" x2="461" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="462" y="80" width="92" height="56" rx="6" fill="rgba(88,166,255,.10)" stroke="#58a6ff"/>
+        <text x="508" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">Stage 2</text>
+        <text x="508" y="114" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">gen / 2</text>
+        <text x="508" y="128" text-anchor="middle" fill="#58a6ff" font-size="9.5" font-family="ui-monospace,monospace">960 × 576</text>
+        <line x1="554" y1="108" x2="568" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="569" y="80" width="92" height="56" rx="6" fill="rgba(88,166,255,.18)" stroke="#58a6ff"/>
+        <text x="615" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">Stage 3</text>
+        <text x="615" y="114" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">gen</text>
+        <text x="615" y="128" text-anchor="middle" fill="#58a6ff" font-size="9.5" font-family="ui-monospace,monospace">1920 × 1152</text>
+        <line x1="661" y1="108" x2="675" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="676" y="80" width="92" height="56" rx="6" fill="#1d2330" stroke="#30363d"/>
+        <text x="722" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">VAE</text>
+        <text x="722" y="114" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">Decode</text>
+        <text x="722" y="128" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">tiled</text>
+        <line x1="768" y1="108" x2="782" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="783" y="80" width="92" height="56" rx="6" fill="rgba(248,81,73,.10)" stroke="#f85149"/>
+        <text x="829" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">center</text>
+        <text x="829" y="114" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">crop</text>
+        <text x="829" y="128" text-anchor="middle" fill="#f85149" font-size="9.5" font-family="ui-monospace,monospace">→ out</text>
+        <line x1="875" y1="108" x2="889" y2="108" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <rect x="890" y="80" width="80" height="56" rx="6" fill="rgba(86,211,100,.14)" stroke="#56d364"/>
+        <text x="930" y="100" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">MP4</text>
+        <text x="930" y="114" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">CreateVideo</text>
+        <text x="930" y="128" text-anchor="middle" fill="#56d364" font-size="9.5" font-family="ui-monospace,monospace">1920 × 1080</text>
+
+        <text x="60" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">request</text>
+        <text x="175" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">decide bucket</text>
+        <text x="290" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">condition image</text>
+        <text x="508" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">3-stage cascade (latent)</text>
+        <text x="722" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">latent → pixel</text>
+        <text x="829" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">slice 36 top+bot</text>
+        <text x="930" y="60" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">deliver</text>
+
+        <text x="490" y="180" text-anchor="middle" fill="#e6edf3" font-size="12" font-family="ui-sans-serif,system-ui">
+          Gen-grid (blue) is what the diffusion + VAE see internally. Output (green) is what the MP4 contains.
+        </text>
+        <text x="490" y="200" text-anchor="middle" fill="#8b949e" font-size="11" font-family="ui-monospace,monospace">
+          The "ResizeImageMask 1536" step affects only the conditioning image; it does not change the output dims.
+        </text>
+        <text x="490" y="220" text-anchor="middle" fill="#8b949e" font-size="11" font-family="ui-monospace,monospace">
+          Portrait swaps W↔H throughout: Stage 1 = 288×480, Stage 3 = 1152×1920, output = 1080×1920.
+        </text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ─── Section 3: scenarios ─── -->
+
+  <h2>Scenario walkthroughs</h2>
+
+  <!-- ── S1: T2V default ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S1 — T2V, default</div>
+        <div class="pills">
+          <span class="pill t2v">T2V</span>
+          <span class="pill auto">aspect_ratio: "auto"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"A golden retriever..."</span>
+}</pre>
+        <div class="result">
+          <strong class="good">aspect_ratio</strong> ← <code>"16:9"</code> (T2V fallback)<br/>
+          <strong class="good">width × height</strong> ← <code>1920 × 1080</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 460 200" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(20,30)">
+            <rect x="0" y="40" width="110" height="60" rx="6" fill="rgba(240,184,73,.10)" stroke="#f0b849"/>
+            <text x="55" y="62" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">no image</text>
+            <text x="55" y="76" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">+ "auto"</text>
+            <text x="55" y="90" text-anchor="middle" fill="#f0b849" font-size="10" font-family="ui-monospace,monospace">→ "16:9"</text>
+          </g>
+          <line x1="135" y1="100" x2="158" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <defs>
+            <marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+            </marker>
+          </defs>
+          <g transform="translate(165,40)">
+            <rect x="0" y="0" width="135" height="81" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="78.5" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="2.5" width="135" height="76" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="67.5" y="38" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1920×1080</text>
+            <text x="67.5" y="50" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="67.5" y="98" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1920×1152</text>
+          </g>
+          <line x1="310" y1="100" x2="333" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(340,40)">
+            <rect x="0" y="0" width="100" height="81" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="50" y="35" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="50" y="52" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1920×1080</text>
+          </g>
+          <text x="146" y="92" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">resolve</text>
+          <text x="321" y="92" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">crop</text>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── S2: T2V explicit portrait ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S2 — T2V, explicit portrait</div>
+        <div class="pills">
+          <span class="pill t2v">T2V</span>
+          <span class="pill port">aspect_ratio: "9:16"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"A subway station..."</span>,
+  <span class="s">"aspect_ratio"</span>: <span class="s">"9:16"</span>
+}</pre>
+        <div class="result">
+          <strong class="good">aspect_ratio</strong> ← <code>"9:16"</code><br/>
+          <strong class="good">width × height</strong> ← <code>1080 × 1920</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 460 230" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(20,75)">
+            <rect x="0" y="0" width="110" height="60" rx="6" fill="rgba(108,142,239,.10)" stroke="#6c8eef"/>
+            <text x="55" y="22" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">no image</text>
+            <text x="55" y="36" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">+ "9:16"</text>
+            <text x="55" y="50" text-anchor="middle" fill="#6c8eef" font-size="10" font-family="ui-monospace,monospace">→ "9:16"</text>
+          </g>
+          <line x1="135" y1="105" x2="183" y2="105" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(190,25)">
+            <rect x="0" y="0" width="92" height="160" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="2.5" height="160" fill="rgba(248,81,73,.5)"/>
+            <rect x="89.5" y="0" width="2.5" height="160" fill="rgba(248,81,73,.5)"/>
+            <rect x="2.5" y="0" width="87" height="160" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="46" y="76" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1080</text>
+            <text x="46" y="90" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">× 1920</text>
+            <text x="46" y="104" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="46" y="178" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1152×1920</text>
+          </g>
+          <line x1="290" y1="105" x2="333" y2="105" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(340,55)">
+            <rect x="0" y="0" width="100" height="100" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="50" y="44" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="50" y="62" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1080×1920</text>
+          </g>
+          <text x="159" y="98" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">resolve</text>
+          <text x="312" y="98" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">crop</text>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── S3: I2V auto, landscape input ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S3 — I2V auto, landscape input</div>
+        <div class="pills">
+          <span class="pill i2v">I2V</span>
+          <span class="pill auto">aspect_ratio: "auto"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"Continue the scene..."</span>,
+  <span class="s">"image_url"</span>: <span class="s">"https://.../land.jpg"</span>
+  <span class="c">// 1920×1080 landscape input</span>
+}</pre>
+        <div class="result">
+          <strong class="good">orientation</strong> ← <code>derive(1920, 1080) = "16:9"</code><br/>
+          <strong class="good">aspect_ratio</strong> ← <code>"16:9"</code><br/>
+          <strong class="good">width × height</strong> ← <code>1920 × 1080</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 540 200" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(20,73)">
+            <rect x="0" y="0" width="96" height="54" fill="rgba(139,148,158,.18)" stroke="#8b949e" stroke-width="1.5"/>
+            <text x="48" y="32" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1920×1080</text>
+            <text x="48" y="70" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">input image</text>
+          </g>
+          <line x1="120" y1="100" x2="158" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <text x="139" y="92" text-anchor="middle" fill="#f0b849" font-size="9" font-family="ui-monospace,monospace">W≥H → "16:9"</text>
+          <g transform="translate(165,55)">
+            <rect x="0" y="0" width="135" height="81" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="78.5" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="2.5" width="135" height="76" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="67.5" y="38" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1920×1080</text>
+            <text x="67.5" y="50" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="67.5" y="98" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1920×1152</text>
+          </g>
+          <line x1="310" y1="100" x2="343" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <text x="326" y="92" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">crop</text>
+          <g transform="translate(350,55)">
+            <rect x="0" y="0" width="170" height="81" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="85" y="35" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="85" y="52" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1920×1080</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── S4: I2V auto, portrait input ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S4 — I2V auto, portrait input</div>
+        <div class="pills">
+          <span class="pill i2v">I2V</span>
+          <span class="pill auto">aspect_ratio: "auto"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"Continue the scene..."</span>,
+  <span class="s">"image_url"</span>: <span class="s">"https://.../port.jpg"</span>
+  <span class="c">// 1080×1920 portrait input</span>
+}</pre>
+        <div class="result">
+          <strong class="good">orientation</strong> ← <code>derive(1080, 1920) = "9:16"</code><br/>
+          <strong class="good">aspect_ratio</strong> ← <code>"9:16"</code><br/>
+          <strong class="good">width × height</strong> ← <code>1080 × 1920</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 540 230" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(40,67)">
+            <rect x="0" y="0" width="54" height="96" fill="rgba(139,148,158,.18)" stroke="#8b949e" stroke-width="1.5"/>
+            <text x="27" y="44" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1080</text>
+            <text x="27" y="58" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">×1920</text>
+            <text x="27" y="112" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">input image</text>
+          </g>
+          <line x1="100" y1="115" x2="158" y2="115" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <text x="129" y="107" text-anchor="middle" fill="#f0b849" font-size="9" font-family="ui-monospace,monospace">W&lt;H → "9:16"</text>
+          <g transform="translate(170,35)">
+            <rect x="0" y="0" width="92" height="160" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="2.5" height="160" fill="rgba(248,81,73,.5)"/>
+            <rect x="89.5" y="0" width="2.5" height="160" fill="rgba(248,81,73,.5)"/>
+            <rect x="2.5" y="0" width="87" height="160" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="46" y="76" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1080</text>
+            <text x="46" y="90" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">×1920</text>
+            <text x="46" y="104" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="46" y="178" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1152×1920</text>
+          </g>
+          <line x1="270" y1="115" x2="313" y2="115" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <text x="291" y="108" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">crop</text>
+          <g transform="translate(320,65)">
+            <rect x="0" y="0" width="200" height="100" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="100" y="44" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="100" y="62" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1080×1920</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── S5: I2V explicit override ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S5 — I2V explicit override</div>
+        <div class="pills">
+          <span class="pill i2v">I2V</span>
+          <span class="pill override">aspect_ratio: "16:9"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"Reframe to landscape..."</span>,
+  <span class="s">"image_url"</span>: <span class="s">"https://.../port.jpg"</span>,
+  <span class="c">// 1080×1920 portrait input</span>
+  <span class="s">"aspect_ratio"</span>: <span class="s">"16:9"</span>
+}</pre>
+        <div class="result">
+          <strong>image orientation</strong>: <code>"9:16"</code> — <em>ignored</em><br/>
+          <strong class="good">explicit aspect_ratio wins</strong>: <code>"16:9"</code><br/>
+          <strong class="good">width × height</strong> ← <code>1920 × 1080</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 540 220" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(20,67)">
+            <rect x="0" y="0" width="40" height="72" fill="rgba(139,148,158,.18)" stroke="#8b949e" stroke-width="1.5"/>
+            <text x="20" y="32" text-anchor="middle" fill="#e6edf3" font-size="9" font-family="ui-monospace,monospace">1080</text>
+            <text x="20" y="44" text-anchor="middle" fill="#e6edf3" font-size="9" font-family="ui-monospace,monospace">×1920</text>
+            <text x="20" y="86" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">input</text>
+          </g>
+          <g transform="translate(85,80)">
+            <text x="0" y="0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">image → "9:16"</text>
+            <line x1="-3" y1="-3" x2="105" y2="-13" stroke="#f85149" stroke-width="1.2"/>
+            <text x="0" y="20" fill="#f85149" font-size="10" font-family="ui-monospace,monospace">explicit → "16:9"</text>
+            <text x="0" y="38" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">↓ caller wins</text>
+          </g>
+          <line x1="200" y1="100" x2="223" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(230,55)">
+            <rect x="0" y="0" width="135" height="81" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="78.5" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="2.5" width="135" height="76" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="67.5" y="38" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1920×1080</text>
+            <text x="67.5" y="50" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="67.5" y="98" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1920×1152</text>
+          </g>
+          <line x1="370" y1="100" x2="393" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(400,55)">
+            <rect x="0" y="0" width="130" height="81" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="65" y="35" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="65" y="52" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1920×1080</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── S6: I2V auto, square input ── -->
+  <div class="card">
+    <div class="scenario">
+      <div class="meta">
+        <div class="title">S6 — I2V auto, square input</div>
+        <div class="pills">
+          <span class="pill i2v">I2V</span>
+          <span class="pill auto">aspect_ratio: "auto"</span>
+        </div>
+        <pre><span class="k">POST</span> /generate_sync
+{
+  <span class="s">"prompt"</span>: <span class="s">"Animate the painting..."</span>,
+  <span class="s">"image_url"</span>: <span class="s">"https://.../sq.jpg"</span>
+  <span class="c">// 512×512 square input</span>
+}</pre>
+        <div class="result">
+          <strong>image orientation</strong>: <code>W == H → "16:9"</code> (tie-breaker)<br/>
+          <strong class="good">aspect_ratio</strong> ← <code>"16:9"</code><br/>
+          <strong class="good">width × height</strong> ← <code>1920 × 1080</code>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 540 200" xmlns="http://www.w3.org/2000/svg">
+          <g transform="translate(20,70)">
+            <rect x="0" y="0" width="60" height="60" fill="rgba(139,148,158,.18)" stroke="#8b949e" stroke-width="1.5"/>
+            <text x="30" y="34" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">512×512</text>
+            <text x="30" y="76" text-anchor="middle" fill="#8b949e" font-size="9" font-family="ui-monospace,monospace">input image</text>
+          </g>
+          <line x1="85" y1="100" x2="158" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <text x="120" y="92" text-anchor="middle" fill="#f0b849" font-size="9" font-family="ui-monospace,monospace">W==H → "16:9"</text>
+          <g transform="translate(165,55)">
+            <rect x="0" y="0" width="135" height="81" fill="rgba(88,166,255,.14)" stroke="#58a6ff" stroke-width="1.5"/>
+            <rect x="0" y="0" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="78.5" width="135" height="2.5" fill="rgba(248,81,73,.5)"/>
+            <rect x="0" y="2.5" width="135" height="76" fill="rgba(86,211,100,.18)" stroke="#56d364" stroke-width="1.2"/>
+            <text x="67.5" y="38" text-anchor="middle" fill="#e6edf3" font-size="10" font-family="ui-monospace,monospace">1920×1080</text>
+            <text x="67.5" y="50" text-anchor="middle" fill="#56d364" font-size="9" font-family="ui-monospace,monospace">output</text>
+            <text x="67.5" y="98" text-anchor="middle" fill="#58a6ff" font-size="9" font-family="ui-monospace,monospace">gen 1920×1152</text>
+          </g>
+          <line x1="310" y1="100" x2="333" y2="100" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow1)"/>
+          <g transform="translate(340,55)">
+            <rect x="0" y="0" width="180" height="81" rx="6" fill="rgba(86,211,100,.10)" stroke="#56d364"/>
+            <text x="90" y="35" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">.mp4</text>
+            <text x="90" y="52" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1920×1080</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Section 4: the crop, in detail ─── -->
+
+  <h2>The crop, in detail</h2>
+
+  <p>The 3-stage cascade can only emit dimensions on a <code>/128</code> grid (Stage 1 runs at <code>final/4</code> and must itself be VAE-<code>/32</code> aligned). The smallest <code>/128</code> size that <em>contains</em> 1080 is 1152, so the pipeline generates at 1152 on the short axis and slices the symmetric 36-pixel margin off in pixel space, after VAE decode.</p>
+
+  <div class="card">
+    <h3>Landscape — 1920×1152 → 1920×1080</h3>
+    <div class="svg-wrap">
+      <svg viewBox="0 0 940 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Landscape crop detail at 1/3 scale">
+        <g transform="translate(150,15)">
+          <rect x="0" y="0" width="640" height="384" fill="rgba(88,166,255,.10)" stroke="#58a6ff" stroke-width="1.5"/>
+          <rect x="0" y="0" width="640" height="12" fill="rgba(248,81,73,.30)"/>
+          <line x1="0" y1="12" x2="640" y2="12" stroke="#f85149" stroke-width="1.2" stroke-dasharray="4 3"/>
+          <text x="320" y="9" text-anchor="middle" fill="#f85149" font-size="10" font-family="ui-monospace,monospace">36 rows cropped (top)</text>
+          <rect x="0" y="12" width="640" height="360" fill="rgba(86,211,100,.10)" stroke="#56d364" stroke-width="1.5"/>
+          <text x="320" y="195" text-anchor="middle" fill="#e6edf3" font-size="14" font-family="ui-monospace,monospace">1080 rows kept</text>
+          <text x="320" y="215" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1920 × 1080</text>
+          <rect x="0" y="372" width="640" height="12" fill="rgba(248,81,73,.30)"/>
+          <line x1="0" y1="372" x2="640" y2="372" stroke="#f85149" stroke-width="1.2" stroke-dasharray="4 3"/>
+          <text x="320" y="381" text-anchor="middle" fill="#f85149" font-size="10" font-family="ui-monospace,monospace">36 rows cropped (bottom)</text>
+        </g>
+        <text x="140" y="20" text-anchor="end" fill="#58a6ff" font-size="11" font-family="ui-monospace,monospace">gen y=0</text>
+        <text x="140" y="32" text-anchor="end" fill="#f85149" font-size="11" font-family="ui-monospace,monospace">cropped</text>
+        <text x="140" y="210" text-anchor="end" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">kept slice</text>
+        <text x="140" y="384" text-anchor="end" fill="#f85149" font-size="11" font-family="ui-monospace,monospace">cropped</text>
+        <text x="140" y="396" text-anchor="end" fill="#58a6ff" font-size="11" font-family="ui-monospace,monospace">gen y=1152</text>
+      </svg>
+    </div>
+
+    <h3>Portrait — 1152×1920 → 1080×1920</h3>
+    <div class="svg-wrap">
+      <svg viewBox="0 0 940 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Portrait crop detail at 1/7 scale">
+        <g transform="translate(385,4)">
+          <rect x="0" y="0" width="164" height="274" fill="rgba(88,166,255,.10)" stroke="#58a6ff" stroke-width="1.5"/>
+          <rect x="0" y="0" width="5.1" height="274" fill="rgba(248,81,73,.30)"/>
+          <line x1="5.1" y1="0" x2="5.1" y2="274" stroke="#f85149" stroke-width="1.2" stroke-dasharray="4 3"/>
+          <rect x="158.9" y="0" width="5.1" height="274" fill="rgba(248,81,73,.30)"/>
+          <line x1="158.9" y1="0" x2="158.9" y2="274" stroke="#f85149" stroke-width="1.2" stroke-dasharray="4 3"/>
+          <rect x="5.1" y="0" width="153.8" height="274" fill="rgba(86,211,100,.10)" stroke="#56d364" stroke-width="1.5"/>
+          <text x="82" y="132" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">1080 cols kept</text>
+          <text x="82" y="148" text-anchor="middle" fill="#56d364" font-size="11" font-family="ui-monospace,monospace">1080 × 1920</text>
+        </g>
+        <text x="384" y="142" text-anchor="end" fill="#f85149" font-size="11" font-family="ui-monospace,monospace">36 cols cropped (left)</text>
+        <text x="556" y="142" text-anchor="start" fill="#f85149" font-size="11" font-family="ui-monospace,monospace">36 cols cropped (right)</text>
+        <line x1="384" y1="146" x2="388" y2="146" stroke="#f85149" stroke-width="1.2"/>
+        <line x1="552" y1="146" x2="556" y2="146" stroke="#f85149" stroke-width="1.2"/>
+      </svg>
+    </div>
+
+    <div class="key-takeaway">
+      <strong>Why this is loss-free.</strong> The crop is a plain tensor slice on the decoded
+      <code>(N, H, W, 3)</code> IMAGE — no resampling, no VAE round-trip. See
+      <code>_center_crop_frames</code> in <code>src/pipeline/triple_stages_comfyui_graph.py</code>.
+    </div>
+  </div>
+
+  <!-- ─── Section 5: why not 1920×1080 directly ─── -->
+
+  <h2>Why not 1920×1080 directly?</h2>
+
+  <p><strong>LTX-2.3 itself accepts 1920×1080.</strong> 1080 is divisible by 32 (the VAE spatial factor), and Lightricks' one-stage and HDR pipelines both list it as a supported size. The reason <em>our</em> service can't emit 1920×1080 directly is one level up: this repo's ComfyUI workflow (<code>scripts/workflow_3mljpp.py</code>) places <strong>Stage 1 at <code>final/4</code></strong>, which means the final dims must be a multiple of <code>4 × 32 = 128</code>. The HQ two-stage preset Lightricks ships uses Stage 1 at <code>final/2</code> and so reaches its canonical <strong>1920×1088</strong> on the <code>/64</code> grid — <code>/128</code> is not an LTX-2.3 limit, it's a property of this specific workflow's Stage-1 downscale.</p>
+
+  <p>The closest <code>/128</code> options:</p>
+
+  <div class="card">
+    <div class="svg-wrap">
+      <svg viewBox="0 0 940 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparing 128-aligned options near 1080p at 1/10 scale">
+        <g transform="translate(40,90)">
+          <rect x="0" y="0" width="192" height="102" fill="rgba(108,142,239,.10)" stroke="#6c8eef" stroke-width="1.5"/>
+          <text x="96" y="56" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">1920 × 1024</text>
+          <text x="96" y="118" text-anchor="middle" fill="#6c8eef" font-size="10" font-family="ui-monospace,monospace">/128 ✓</text>
+          <text x="96" y="132" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">wider than 16:9 (1.875)</text>
+        </g>
+        <g transform="translate(265,84)">
+          <rect x="0" y="0" width="192" height="108" fill="rgba(86,211,100,.10)" stroke="#56d364" stroke-width="1.5"/>
+          <text x="96" y="60" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">1920 × 1080</text>
+          <text x="96" y="124" text-anchor="middle" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">LTX-2.3 accepts (/32 ✓)</text>
+          <text x="96" y="138" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">our 3-stage rejects (/128 ✗)</text>
+        </g>
+        <g transform="translate(490,83)">
+          <rect x="0" y="0" width="192" height="109" fill="rgba(240,184,73,.10)" stroke="#f0b849" stroke-width="1.5"/>
+          <text x="96" y="60" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">1920 × 1088</text>
+          <text x="96" y="124" text-anchor="middle" fill="#f0b849" font-size="10" font-family="ui-monospace,monospace">/64 ✓ (HQ 2-stage uses this)</text>
+          <text x="96" y="138" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">Lightricks HQ preset</text>
+        </g>
+        <g transform="translate(715,80)">
+          <rect x="0" y="0" width="192" height="115" fill="rgba(88,166,255,.18)" stroke="#58a6ff" stroke-width="2"/>
+          <text x="96" y="60" text-anchor="middle" fill="#e6edf3" font-size="11" font-family="ui-monospace,monospace">1920 × 1152</text>
+          <text x="96" y="128" text-anchor="middle" fill="#58a6ff" font-size="10" font-family="ui-monospace,monospace">/128 ✓ ← our gen</text>
+          <text x="96" y="142" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,monospace">crop to 1080 (loss-free)</text>
+        </g>
+
+        <text x="470" y="30" text-anchor="middle" fill="#e6edf3" font-size="13" font-family="ui-sans-serif,system-ui">
+          1080-ish landscape options
+        </text>
+        <text x="470" y="50" text-anchor="middle" fill="#8b949e" font-size="11" font-family="ui-monospace,monospace">
+          all 1920 wide; varying short side; sized at 1/10 to scale
+        </text>
+
+        <text x="470" y="220" text-anchor="middle" fill="#8b949e" font-size="11" font-family="ui-monospace,monospace">
+          1920×1152 + crop is the smallest /128 size that contains 1920×1080, so the crop loses no real pixels.
+        </text>
+      </svg>
+    </div>
+
+    <div class="key-takeaway">
+      <strong>This is a workflow choice, not an LTX-2.3 limit.</strong> A different ComfyUI workflow that places Stage 1 at <code>final/2</code> (matching Lightricks' own two-stage shape) would only need <code>/64</code> and could hit <strong>1920×1088</strong> natively — no crop. We stay on the current <code>final/4</code> workflow because it's the cascade we tuned + tested against.<br/><br/>
+      <strong>Cost of choosing 1152 over 1024 on the current workflow:</strong> ~12.5% more pixels at the long-frame Stage 3 and VAE-decode steps — paid once per request to honor the "true 1080p" promise in the public API.
+    </div>
+  </div>
+
+  <div class="footer">
+    Source of truth: <code>src/pipeline/triple_stages_comfyui.py</code> (<code>LANDSCAPE_BUCKET</code>, <code>PORTRAIT_BUCKET</code>, <code>_resolve_aspect_ratio</code>) and <code>src/pipeline/triple_stages_comfyui_graph.py</code> (<code>_center_crop_frames</code>, <code>encode_to_mp4</code>).
+  </div>
+
+</main>
+</body>
+</html>

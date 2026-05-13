@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 .claude/
+LTX-2-ref/
+# Local read-only checkout for verifying the triple_stages_comfyui-graph pipeline
+# against the real ComfyUI source. The Dockerfile clones ComfyUI fresh at build
+# time (pinned by COMFYUI_SHA), so the local copy is dev-only / not shipped —
+# same as LTX-2-ref/. (ComfyUI-ref/custom_nodes/ComfyUI-LTXVideo/ may be present
+# locally for cross-referencing but is unused at runtime — core nodes only.)
+ComfyUI-ref/
+.DS_Store
