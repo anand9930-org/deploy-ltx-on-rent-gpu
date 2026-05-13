@@ -1,51 +1,70 @@
 # ============================================================================
 # LTX-2.3 22B — BentoML video generation service (ComfyUI graph pipeline)
 # ============================================================================
-# Models are expected at $MODEL_DIR (default /models), typically mounted
-# as a volume.  Downloaded on first boot if not already present (~63 GB).
+# Targets RTX PRO 6000 Blackwell Server Edition (96 GB, sm_122).
+# Models expected at $MODEL_DIR (default /models), typically a mounted volume;
+# downloaded on first boot if not already present (~63 GB).
+#
+# Recipe is the community-proven stack for LTX-2 + ComfyUI on RTX PRO 6000
+# Blackwell (see f00d4tehg0dz/runpod_comfyui_ltx2_flux): NVIDIA CUDA 12.8 base
+# + stable PyTorch 2.8.0 from PyPI's cu128 index. No NGC alpha builds — keeps
+# torchaudio / torchvision ABI matched to torch out of the box.
 # ============================================================================
 
-FROM nvcr.io/nvidia/pytorch:25.06-py3
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    HF_HOME=/models/huggingface \
-    TORCH_LOGS=recompiles_verbose
+    HF_HOME=/models/huggingface
 
 # ---- System dependencies + uv ----------------------------------------------
+# Ubuntu 24.04 LTS ships Python 3.12 by default. PyTorch 2.8.0 cu128 has cp312
+# wheels so no pyenv / deadsnakes needed. uv handles pip with cache discipline.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg git-lfs gcc \
+        python3 python3-pip python3-venv \
+        ffmpeg git git-lfs gcc curl ca-certificates \
     && git lfs install \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
 
-# ---- NGC pip-constraint hygiene --------------------------------------------
-RUN sed -i '/^anyio/d' /etc/pip/constraint.txt
+# ---- PyTorch 2.8.0 stack (cu128 wheels) ------------------------------------
+# Single index, matched ABI across torch / torchvision / torchaudio. No NGC,
+# no stub bypass. PyTorch 2.7+ cu128 wheels include Blackwell architecture
+# support (sm_120 / compute_120 PTX) per the PyTorch 2.7 release blog.
+RUN uv pip install --system --break-system-packages --no-cache \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        'torch==2.8.0' 'torchvision==0.23.0' 'torchaudio==2.8.0'
 
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
 RUN uv pip install --system --break-system-packages --no-cache /app
 
 # ---- Boot-blocker assertions -----------------------------------------------
-# Upgrade anyio past NGC's pre-installed 4.8.x (httpx_ws needs
-# AsyncContextManagerMixin from 4.9.0) AND verify the stack in one shot.
-# Pin numpy<2 — NGC torch is built against NumPy 1.x.
-RUN uv pip install --system --break-system-packages --no-cache --upgrade 'anyio>=4.9' 'numpy<2' \
-    && python -c "\
+# Verify (1) anyio is current enough for httpx_ws (4.9+), (2) torch is the
+# cu128 build, and (3) the wheel ships kernels (or PTX) for Blackwell
+# workstation GPUs. The arch check is the load-bearing one: it catches a
+# regression or wrong-index install at build time, in GHA, with no GPU.
+# Accepted: sm_122, sm_120 (binary kernels) or compute_122 / compute_120 (PTX
+# that JITs forward to sm_122 at first kernel launch on RTX PRO 6000).
+RUN python -c "\
 import importlib.metadata as m, anyio, numpy, torch, torchvision; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
-assert numpy.__version__.split('.')[0] == '1', f'numpy must be 1.x for NGC torch ABI; got {numpy.__version__}'; \
-assert '.nv' in torch.__version__, f'NGC torch was replaced: {torch.__version__}'; \
-torchvision.ops.nms; \
-torch.zeros(2).numpy(); \
-print('anyio', m.version('anyio'), '/ numpy', numpy.__version__, '/ torch', torch.__version__, '/ torchvision', torchvision.__version__)"
+assert torch.__version__.startswith('2.8.'), f'expected torch 2.8.x; got {torch.__version__}'; \
+assert torch.version.cuda and torch.version.cuda.startswith('12.'), f'expected CUDA 12.x runtime; got {torch.version.cuda}'; \
+arch_list = torch.cuda.get_arch_list(); \
+needed = ('sm_122', 'compute_122', 'sm_120', 'compute_120'); \
+assert any(a in needed for a in arch_list), \
+    f'torch wheel lacks Blackwell workstation arch (sm_120/sm_122); got {arch_list!r}'; \
+torchvision.ops.nms; torch.zeros(2).numpy(); \
+print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ cuda', torch.version.cuda, '/ torchvision', torchvision.__version__, '/ numpy', numpy.__version__, '/ arch_list', arch_list)"
 
 # ---- ComfyUI ----------------------------------------------------------------
 # The pipeline runs real ComfyUI **core** node classes — no ComfyUI-LTXVideo.
 # Clone (not pip-install) so the SHA is pinnable. Strip torch / torchvision /
 # torchaudio / numpy / transformers / diffusers / Pillow from ComfyUI's
-# requirements so the NGC torch ABI pins survive.
+# requirements so our pinned cu128 wheels survive.
 ARG COMFYUI_SHA=64b8457f55cd7fb54ca7a956d9c73b505e903e0c
 RUN git init /app/ComfyUI \
     && git -C /app/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
@@ -56,77 +75,11 @@ RUN git init /app/ComfyUI \
     && uv pip install --system --break-system-packages --no-cache \
         -r /app/ComfyUI/requirements.txt \
     && python -c "\
-import torch, numpy, torchvision; \
-assert numpy.__version__.split('.')[0] == '1', f'numpy clobbered by ComfyUI install: {numpy.__version__}'; \
-assert '.nv' in torch.__version__, f'NGC torch clobbered by ComfyUI install: {torch.__version__}'; \
-torchvision.ops.nms; torch.zeros(2).numpy(); \
-print('NGC stack intact after ComfyUI install — torch', torch.__version__, '/ numpy', numpy.__version__, '/ torchvision', torchvision.__version__)"
-ENV COMFYUI_PATH=/app/ComfyUI
-
-# ---- Real torchaudio (--no-deps + C++ ext bypass) --------------------------
-# ComfyUI's audio_vae.py unconditionally imports torchaudio at module level
-# (nodes -> comfy.sd -> comfy.ldm.lightricks.vae.audio_vae -> import torchaudio).
-# The A2V pipeline needs torchaudio.transforms.MelSpectrogram and
-# torchaudio.functional.resample at runtime. Two obstacles with NGC's torch:
-#
-# 1. PyPI torchaudio pins torch==<exact>, which would replace NGC's torch.
-#    --no-deps sidesteps this.
-#
-# 2. PyPI torchaudio's libtorchaudio.so links c10::cuda::SetDevice(int8_t,bool)
-#    which NGC's torch doesn't export. Both APIs we need are pure-PyTorch
-#    (torch.stft / torch.nn.functional.conv1d). We overwrite
-#    _extension/__init__.py with a stub that sets
-#    _IS_TORCHAUDIO_EXT_AVAILABLE=False (filtering.py branches on this for
-#    the pure-Python path) and exports names other submodules import at load.
-RUN uv pip install --system --break-system-packages --no-cache --no-deps 'torchaudio>=2.8,<2.9' \
-    && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
-    && printf '%s\n' \
-        '"""Stubbed for NGC torch ABI compatibility — see Dockerfile."""' \
-        'import logging' \
-        '_LG = logging.getLogger(__name__)' \
-        '_IS_TORCHAUDIO_EXT_AVAILABLE = False' \
-        '_IS_RIR_AVAILABLE = False' \
-        '_IS_ALIGN_AVAILABLE = False' \
-        'def _check_cuda_version(): return None' \
-        'class _UnavailableExt:' \
-        '    def is_available(self): return False' \
-        '    def __getattr__(self, name):' \
-        '        raise RuntimeError(f"torchaudio C++ ext disabled: {name}")' \
-        '_unavailable_singleton = _UnavailableExt()' \
-        'def lazy_import_sox_ext(): return _unavailable_singleton' \
-        'def lazy_import_ffmpeg_ext(): return _unavailable_singleton' \
-        'def fail_if_no_rir(fn):' \
-        '    def _stub(*a, **k):' \
-        '        raise RuntimeError("torchaudio RIR not built")' \
-        '    return _stub' \
-        'def fail_if_no_align(fn):' \
-        '    def _stub(*a, **k):' \
-        '        raise RuntimeError("torchaudio align not built")' \
-        '    return _stub' \
-        '__all__ = ["_check_cuda_version", "_IS_TORCHAUDIO_EXT_AVAILABLE", "_IS_RIR_AVAILABLE", "lazy_import_sox_ext"]' \
-        > "$SITE/torchaudio/_extension/__init__.py" \
-    && if [ -d "$SITE/torio/_extension" ]; then \
-        printf '%s\n' \
-            '"""Stubbed for NGC torch ABI compatibility — see Dockerfile."""' \
-            'class _UnavailableExt:' \
-            '    def is_available(self): return False' \
-            '    def __getattr__(self, name):' \
-            '        raise RuntimeError(f"torio C++ ext disabled: {name}")' \
-            '_unavailable_singleton = _UnavailableExt()' \
-            'def lazy_import_ffmpeg_ext(): return _unavailable_singleton' \
-            > "$SITE/torio/_extension/__init__.py"; \
-    fi \
-    && python -c "\
-import torch, numpy, torchvision, torchaudio; \
-assert '.nv' in torch.__version__, f'NGC torch clobbered by torchaudio: {torch.__version__}'; \
-assert numpy.__version__.split('.')[0] == '1', f'numpy clobbered by torchaudio: {numpy.__version__}'; \
+import torch, torchvision, torchaudio; \
+assert torch.__version__.startswith('2.8.'), f'torch clobbered by ComfyUI install: {torch.__version__}'; \
 torchvision.ops.nms; \
-assert torchaudio._extension._IS_TORCHAUDIO_EXT_AVAILABLE is False, 'C++ ext bypass not in effect'; \
-mel = torchaudio.transforms.MelSpectrogram(sample_rate=22050, n_fft=1024, win_length=1024, hop_length=256, f_min=0.0, f_max=11025.0, n_mels=80, window_fn=torch.hann_window, center=True, pad_mode='reflect', power=1.0, mel_scale='slaney', norm='slaney')(torch.randn(1, 22050)); \
-assert mel.shape[-2] == 80, f'MelSpectrogram broken: shape={mel.shape}'; \
-rs = torchaudio.functional.resample(torch.randn(1, 22050), 22050, 16000); \
-assert rs.shape[-1] == 16000, f'resample broken: shape={rs.shape}'; \
-print('torchaudio', torchaudio.__version__, '(C++ ext bypassed) — MelSpectrogram + resample OK')"
+print('stack intact after ComfyUI install — torch', torch.__version__, '/ torchaudio', torchaudio.__version__)"
+ENV COMFYUI_PATH=/app/ComfyUI
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/

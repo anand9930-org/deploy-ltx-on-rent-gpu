@@ -20,7 +20,7 @@ src/download_models.py  Idempotent model downloader from HuggingFace
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 1 GB | `Lightricks/LTX-2.3` |
 | `gemma-3-12b-it-qat-q4_0-unquantized/` | 26 GB | `google/gemma-3-12b-it-qat-q4_0-unquantized` |
 
-**GPU requirement:** RTX 4090 or L4 (24GB VRAM, Ada Lovelace architecture for FP8 support).
+**GPU requirement (`feature/RTX-6000-pro-deployment` branch):** RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7, sm_122). For the legacy H100/Hopper or RTX 4090/Ada paths, see `main`.
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ export RUNPOD_API_KEY=your_key
 ./deploy/runpod/deploy.sh
 ```
 
-RTX 4090 Secure Cloud: $0.59/hr + $7/mo storage. See [deploy/runpod/README.md](deploy/runpod/README.md).
+RTX PRO 6000 Blackwell Server Edition on Secure Cloud. Check live rate with `runpodctl gpu list | grep -i 6000`; storage ~$7/mo. See [deploy/runpod/README.md](deploy/runpod/README.md).
 
 ### Vast.ai (cheapest hourly rate)
 
@@ -55,7 +55,7 @@ vastai set api-key YOUR_KEY
 ./deploy/vast/deploy.sh
 ```
 
-RTX 4090: ~$0.27/hr + $5.60/mo storage. See [deploy/vast/README.md](deploy/vast/README.md).
+RTX PRO 6000 Blackwell on Vast.ai. Discover the exact `gpu_name` with `vastai search offers 'gpu_ram>=95' -o 'dph_total'`. See [deploy/vast/README.md](deploy/vast/README.md).
 
 ### Any Docker host
 
@@ -63,7 +63,7 @@ RTX 4090: ~$0.27/hr + $5.60/mo storage. See [deploy/vast/README.md](deploy/vast/
 docker run --gpus all -p 8000:8000 \
   -e HF_TOKEN=hf_YOUR_TOKEN -e MODEL_DIR=/models \
   -v /path/to/models:/models \
-  anand9930/ltx-video:latest
+  anand9930/ltx-video-blackwell:latest
 ```
 
 ### Test the API
@@ -164,11 +164,15 @@ For initial testing, use fewer frames (resolution is fixed at 1920×1080 / 1080�
 
 ## Cost Estimate (Vast.ai)
 
-| Usage | GPU | Cost |
-|-------|-----|------|
-| Single test run | RTX 4090 | ~$0.05 (10 min total) |
-| Dev session (4 hours) | RTX 4090 | ~$1.20 |
-| Always-on (monthly) | RTX 4090 | ~$210–250 |
+Live pricing varies. RTX PRO 6000 Blackwell rates on Vast.ai have been observed in
+the ~$1.50-3.00/hr range in early 2026; run `vastai search offers 'gpu_ram>=95' -o 'dph_total' | head -10`
+for the current rate before committing to a long-running deployment.
+
+| Usage | GPU | Cost (approx) |
+|-------|-----|---------------|
+| Single test run (10 min) | RTX PRO 6000 Blackwell | check live rate |
+| Dev session (4 hours) | RTX PRO 6000 Blackwell | check live rate |
+| Always-on (monthly) | RTX PRO 6000 Blackwell | check live rate |
 
 ## Local Development
 

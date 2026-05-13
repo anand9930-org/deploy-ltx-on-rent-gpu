@@ -2,7 +2,7 @@
 # Deploy LTX-2.3 video generation service to Vast.ai with persistent volume.
 #
 # Usage:
-#   ./deploy/vast/deploy.sh                    # default: cheapest RTX 4090
+#   ./deploy/vast/deploy.sh                    # default: cheapest 96 GB Blackwell match
 #   ./deploy/vast/deploy.sh --bid 0.20         # interruptible (spot) instance
 #   ./deploy/vast/deploy.sh --offer 33953886   # specific offer ID
 #
@@ -14,11 +14,17 @@
 set -e
 
 # ---- Configuration ----------------------------------------------------------
-IMAGE="anand9930/ltx-video:latest"
+IMAGE="anand9930/ltx-video-blackwell:latest"
 VOLUME_NAME="ltx-models"
 VOLUME_SIZE=100  # GB
 DISK=50          # local disk (small — models go on volume)
-GPU_QUERY='gpu_name=RTX_4090 gpu_ram>=23 disk_space>=50 inet_down>=200 reliability>0.95'
+# Targets RTX PRO 6000 Blackwell Server Edition (96 GB GDDR7, sm_122).
+# Vast's exact gpu_name identifier for Blackwell RTX 6000 Pro is unverified at
+# the time of this commit — before first use, run:
+#   vastai search offers 'gpu_ram>=95' -o 'dph_total' | head -20
+# to discover the actual identifier (likely "RTX_6000_Blackwell" or
+# "RTX_PRO_6000"), then update this filter.
+GPU_QUERY='gpu_ram>=95 disk_space>=70 inet_down>=200 reliability>0.95'
 
 # ---- Load .env if present ---------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -79,7 +85,7 @@ fi
 
 # ---- Find offer --------------------------------------------------------------
 if [ -z "$OFFER_ID" ]; then
-    echo "Searching for cheapest RTX 4090..."
+    echo "Searching for cheapest RTX 6000 Pro Blackwell..."
     OFFER_ID=$(vastai search offers "$GPU_QUERY" -o 'dph_total' --raw 2>/dev/null \
         | python3 -c "import sys,json; offers=json.load(sys.stdin); print(offers[0]['id'])")
 fi
