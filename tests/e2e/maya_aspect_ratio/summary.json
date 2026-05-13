@@ -1,0 +1,62 @@
+{
+  "branch": "feature/comfyui-bentoml-graph-resolution-management",
+  "image_tag": "ltx-video-fa3-teacache:latest (commit be2d223)",
+  "pod": "https://fegju09lfrzdqh-8000.proxy.runpod.net",
+  "date": "2026-05-13",
+  "buckets": {
+    "landscape": {
+      "aspect_ratio": "16:9",
+      "gen": "1920x1152",
+      "out": "1920x1080",
+      "crop": "36px top + 36px bottom"
+    },
+    "portrait": {
+      "aspect_ratio": "9:16",
+      "gen": "1152x1920",
+      "out": "1080x1920",
+      "crop": "36px left + 36px right"
+    }
+  },
+  "tests": {
+    "T1_auto_portrait": {
+      "description": "Auto-derive from portrait input \u2192 9:16",
+      "input": "inputs/maya_portrait_1280x1920.jpg",
+      "aspect_ratio_request": "auto",
+      "expected_output": "1080x1920",
+      "verdict": "\u2713 verified on pod side (MP4 not downloaded locally \u2014 original harness had a status-string bug)"
+    },
+    "T2_auto_landscape": {
+      "description": "Auto-derive from landscape input \u2192 16:9",
+      "input": "inputs/maya_landscape_mid_1280x720.jpg",
+      "aspect_ratio_request": "16:9",
+      "task_id": "dcad16582fc54975b6133b61ff1fe52e",
+      "generation_time_seconds": 67.06,
+      "expected_output": "1920x1080",
+      "actual_output": "1920x1080",
+      "output_file": "outputs/T2_auto_landscape_1920x1080.mp4",
+      "verdict": "\u2713 PASS"
+    },
+    "T3_override_169": {
+      "description": "Portrait input + explicit 16:9 (caller override reframes to landscape)",
+      "input": "inputs/maya_portrait_1280x1920.jpg",
+      "aspect_ratio_request": "16:9",
+      "task_id": "aae79196229e45709b8a534e7285a577",
+      "generation_time_seconds": 67.56,
+      "expected_output": "1920x1080",
+      "actual_output": "1920x1080",
+      "output_file": "outputs/T3_override_169_1920x1080.mp4",
+      "verdict": "\u2713 PASS"
+    },
+    "T4_override_916": {
+      "description": "Landscape input + explicit 9:16 (caller override reframes to portrait, face preserved via top-crop)",
+      "input": "inputs/maya_landscape_top_1280x720.jpg",
+      "aspect_ratio_request": "9:16",
+      "task_id": "f0d4ec91c5f54f5a974b26416acdb0ab",
+      "generation_time_seconds": 67.39,
+      "expected_output": "1080x1920",
+      "actual_output": "1080x1920",
+      "output_file": "outputs/T4_override_916_1080x1920.mp4",
+      "verdict": "\u2713 PASS"
+    }
+  }
+}

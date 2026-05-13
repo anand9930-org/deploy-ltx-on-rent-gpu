@@ -25,21 +25,23 @@ LTX-2.3 22B BentoML video-generation service. NGC PyTorch 25.06 + ComfyUI graph 
 │   │   ├── triple_stages_comfyui.py      TripleStagesComfyUIMixin — build + generate
 │   │   ├── triple_stages_comfyui_graph.py  ComfyUI node cascade (loaders + 3-stage denoise + decode)
 │   │   └── inputs/               Request-time input materialisers (URL/b64 → tempfile)
-│   │       ├── __init__.py       re-exports materialize_image, derive_dims_from_image
-│   │       └── image.py          I2V image input (PIL validation, auto-AR dim derivation)
+│   │       ├── __init__.py       re-exports materialize_image, derive_orientation
+│   │       └── image.py          I2V image input (PIL validation, orientation derivation)
 │   ├── download_models.py        First-boot HF model download (~63 GB)
 │   └── storage.py                Supabase upload + signed URL
 │
 ├── tests/                        pytest suite (mocked — no GPU/ComfyUI needed)
 │   ├── conftest.py               MockGenerator fixture
 │   ├── test_service.py           BentoML endpoints
-│   ├── test_pipeline.py          round_to, round_frames, DEFAULT_NEGATIVE_PROMPT
+│   ├── test_pipeline.py          _round_frames_8k1, LANDSCAPE/PORTRAIT_BUCKET, _resolve_aspect_ratio
 │   ├── test_pipeline_triple_stages_comfyui.py   ComfyUI variant contract
-│   ├── test_triple_stages_comfyui_graph.py      workflow literals + seed derivation
+│   ├── test_triple_stages_comfyui_graph.py      workflow literals + seed derivation + center-crop
 │   ├── test_pipeline_inputs_image.py
 │   ├── test_comfyui_runtime.py
 │   ├── test_download_models.py
-│   └── test_storage.py
+│   ├── test_storage.py
+│   └── e2e/                      live-pod integration tests (not run by pytest; manual)
+│       └── maya_aspect_ratio/    Maya I2V x 4 aspect_ratio scenarios (run_tests.py + inputs/outputs/payloads/results)
 │
 ├── deploy/
 │   ├── runpod/{deploy.sh, README.md, CLAUDE.md}

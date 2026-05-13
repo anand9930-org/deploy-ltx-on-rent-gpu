@@ -9,3 +9,4 @@ LTX-2-ref/
 # same as LTX-2-ref/. (ComfyUI-ref/custom_nodes/ComfyUI-LTXVideo/ may be present
 # locally for cross-referencing but is unused at runtime — core nodes only.)
 ComfyUI-ref/
+.DS_Store
