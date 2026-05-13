@@ -1,0 +1,15 @@
+{
+  "generation_time_seconds": 67.06,
+  "parameters": {
+    "mode": "triple_comfyui_i2v",
+    "aspect_ratio": "16:9",
+    "width": 1920,
+    "height": 1080,
+    "num_frames": 121,
+    "seed": 42,
+    "frame_rate": 24.0,
+    "image_frame_idx": 0,
+    "enhance_prompt": false
+  },
+  "video_url": "https://qbcnoeoqzmjaxtusytjt.supabase.co/storage/v1/object/sign/ltx-videos/ltx_987b943dde92.mp4?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8yY2FmMmZjNy0xZWJkLTQwZWItOWU0Ni01MTU3ZDFiYjYzZWIiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJsdHgtdmlkZW9zL2x0eF85ODdiOTQzZGRlOTIubXA0IiwiaWF0IjoxNzc4NjY2MzEwLCJleHAiOjE3NzkyNzExMTB9.leVeDOY4F23mkZZue8ZBYhJHM9PXTs5CUa0jE6Nqcp4"
+}

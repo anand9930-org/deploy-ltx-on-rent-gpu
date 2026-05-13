@@ -1,0 +1,31 @@
+service: "service:LTXVideoService"
+
+include:
+  - "service.py"
+  - "src/*.py"
+
+python:
+  packages:
+    - bentoml>=1.4
+    - supabase>=2.0.0
+    - huggingface-hub>=0.27.0
+    - hf-xet>=0.1.0
+    - transformers>=4.52,<5.0
+
+docker:
+  distro: debian
+  python_version: "3.11"
+  system_packages:
+    - ffmpeg
+    - git-lfs
+  setup_script: "setup.sh"
+
+envs:
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: "expandable_segments:True"
+  - name: HF_HOME
+    value: "/models/huggingface"
+  - name: MODEL_DIR
+    value: "/models"
+  - name: PYTHONUNBUFFERED
+    value: "1"

@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Triple-Stage Pipeline Comparison — ComfyUI workflow vs TI2VidTripleStagesPipeline</title>
+<style>
+  :root {
+    --fg: #1d1d1f;
+    --muted: #6e6e73;
+    --panel: #ffffff;
+    --bg: #f5f5f7;
+    --line: #d2d2d7;
+    --line-soft: #e5e5ea;
+    --accent: #0066cc;
+    --comfy: #ff7a00;       /* ComfyUI side */
+    --vendor: #007aff;      /* Vendor side */
+    --comfy-bg: #fff5ec;
+    --vendor-bg: #eef5ff;
+    --shared: #1e9c4d;
+    --shared-bg: #e8f7ed;
+    --warn: #c1392b;
+    --warn-bg: #fdecea;
+    --note-bg: #fff8e1;
+    --note: #8a6d00;
+    --code-bg: #f4f4f6;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f5f5f7;
+      --muted: #9aa0a6;
+      --panel: #1c1c1e;
+      --bg: #000;
+      --line: #2c2c2e;
+      --line-soft: #3a3a3c;
+      --accent: #5ac8fa;
+      --comfy: #ff9f43;
+      --vendor: #64b5f6;
+      --comfy-bg: #2a1d10;
+      --vendor-bg: #11243a;
+      --shared: #6abf69;
+      --shared-bg: #16321b;
+      --warn: #ef6b5e;
+      --warn-bg: #3a1a17;
+      --note-bg: #2c2410;
+      --note: #f5d567;
+      --code-bg: #161618;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  h2 { font-size: 22px; margin: 36px 0 12px; letter-spacing: -0.01em; }
+  h3 { font-size: 16px; margin: 22px 0 8px; }
+  h4 { font-size: 14px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  p, li { font-size: 15px; }
+  small { color: var(--muted); }
+  code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; margin: 8px 0; border: 1px solid var(--line-soft); }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 32px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .lede { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+  .lede code { font-size: 12px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 12px 0; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 800px) {
+    .grid-2 { grid-template-columns: 1fr; }
+    .grid-3, .grid-4 { grid-template-columns: 1fr 1fr; }
+  }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .card .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 4px; letter-spacing: -0.01em; }
+  .card .d { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .col-comfy  { border-left: 3px solid var(--comfy); }
+  .col-vendor { border-left: 3px solid var(--vendor); }
+  .head-comfy  { color: var(--comfy);  font-weight: 600; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .head-vendor { color: var(--vendor); font-weight: 600; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  .bd { color: var(--comfy); }
+  .bv { color: var(--vendor); }
+  .badge { display: inline-block; padding: 2px 8px; font-size: 11.5px; border-radius: 999px; font-weight: 600; vertical-align: 1px; }
+  .badge.comfy   { background: var(--comfy-bg);   color: var(--comfy); }
+  .badge.vendor  { background: var(--vendor-bg);  color: var(--vendor); }
+  .badge.shared  { background: var(--shared-bg);  color: var(--shared); }
+  .badge.warn    { background: var(--warn-bg);    color: var(--warn); }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 16px; font-size: 14px; }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+  td.dim { color: var(--muted); }
+  td.diff { background: var(--note-bg); }
+  tr:hover td { background: rgba(0,0,0,0.02); }
+  @media (prefers-color-scheme: dark) { tr:hover td { background: rgba(255,255,255,0.03); } }
+
+  .callout { padding: 14px 16px; border-radius: 10px; margin: 14px 0; border: 1px solid; }
+  .callout h3 { margin-top: 0; }
+  .callout.warn { background: var(--warn-bg);  border-color: var(--warn); }
+  .callout.note { background: var(--note-bg);  border-color: var(--note); }
+  .callout.shared { background: var(--shared-bg); border-color: var(--shared); }
+
+  /* Flow diagram boxes */
+  .flow { display: grid; gap: 8px; padding: 6px; }
+  .node { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  .node .t { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .node .b { font-family: var(--mono); font-size: 12px; }
+  .arrow { text-align: center; color: var(--muted); font-size: 18px; line-height: 1; }
+  .stageblock { padding: 10px; border-radius: 10px; margin-bottom: 6px; }
+  .stage-comfy  { background: var(--comfy-bg);  border: 1px dashed var(--comfy); }
+  .stage-vendor { background: var(--vendor-bg); border: 1px dashed var(--vendor); }
+  .stage-title { font-weight: 600; margin-bottom: 6px; font-size: 13px; }
+
+  /* sigma sparkline */
+  .sigma-row { display: grid; grid-template-columns: 110px 1fr 70px; gap: 8px; align-items: center; font-size: 12px; }
+  .sigma-bar { display: flex; gap: 1px; height: 22px; align-items: end; }
+  .sigma-tick { background: var(--accent); width: 100%; min-width: 4px; border-radius: 2px 2px 0 0; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  ul.tight { margin: 6px 0 0 18px; padding: 0; }
+  ul.tight li { margin: 2px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Triple-Stage Pipeline Comparison</h1>
+  <p class="lede">
+    <strong>A side</strong> &nbsp;<span class="badge comfy">ComfyUI workflow</span> &nbsp;
+    <code>scripts/workflow_3mljpp.py</code> — auto-generated from <code>3mljpp-api.json</code> by <code>pydn/ComfyUI-to-Python-Extension</code> (876 lines).
+    <br>
+    <strong>B side</strong> &nbsp;<span class="badge vendor">Vendor pipeline</span> &nbsp;
+    <code>src/vendor/ti2vid_triple_stages.py</code> — class-based pipeline atop <code>ltx_pipelines</code> (438 lines).
+    <br>
+    Both produce a 3-stage LTX-2.3 22B audio-video output. The vendor file was authored "based on the ComfyUI three-stage workflow" (per its docstring).
+  </p>
+</header>
+
+<!-- ======================================================================= -->
+<!-- TL;DR -->
+<!-- ======================================================================= -->
+<div class="callout note">
+  <h3>TL;DR — they are <em>not</em> equivalent</h3>
+  <p style="margin: 6px 0 0">
+    Both files describe a three-stage diffusion flow with shared building blocks (text/image conditioning, sampling, latent upsampling, AV decode), but they differ on five load-bearing axes:
+  </p>
+  <ol style="margin: 6px 0 0">
+    <li><strong>Number of latent upsamples</strong>: ComfyUI does <strong>two</strong> (Stage 1→2 and 2→3, total 4× spatial). Vendor does <strong>one</strong> (Stage 1→2, total 2× spatial). Stages 2 and 3 in the vendor run at the same resolution.</li>
+    <li><strong>Distilled-LoRA scope</strong>: ComfyUI applies the distilled LoRA to <em>all three</em> stages (one shared <code>LoraLoaderModelOnly</code>). Vendor applies it to <em>Stage 3 only</em>.</li>
+    <li><strong>Image preprocessing</strong>: ComfyUI runs <code>LTXVPreprocess(img_compression=18)</code> on the conditioning image before Stage 1; Stages 2/3 use the raw resized image. Vendor passes <code>preprocessed_images=None</code> for every stage.</li>
+    <li><strong>Sigma schedule and step counts</strong>: ComfyUI uses three hand-authored sigma lists (8/3/3 steps). Vendor uses the project's <code>LTX2Scheduler</code> with default 16/8/8 steps — the docstring acknowledges this is more steps than the source workflow.</li>
+    <li><strong>Stage 3 initial state</strong>: vendor's Stage 3 omits <code>initial_latent</code> for both video and audio. <span class="badge warn">Likely bug</span>: <code>DiffusionStage.__call__</code> falls back to creating noise from scratch, so Stage 3 cannot refine the Stage-2 result the way the ComfyUI workflow does.</li>
+  </ol>
+</div>
+
+<!-- ======================================================================= -->
+<!-- METRIC CARDS -->
+<!-- ======================================================================= -->
+<h2>At a glance</h2>
+<div class="grid-4">
+  <div class="card col-comfy">
+    <div class="k">Latent upsamples</div>
+    <div class="v"><span class="bd">2</span> &nbsp;/&nbsp; <span class="bv">1</span></div>
+    <div class="d">ComfyUI: 2× then 2× = 4× total. Vendor: single 2×.</div>
+  </div>
+  <div class="card col-vendor">
+    <div class="k">Total denoise steps</div>
+    <div class="v"><span class="bd">8 + 3 + 3 = 14</span><br><span class="bv">16 + 8 + 8 = 32</span></div>
+    <div class="d">Default vendor stage1_steps=16, stage2_steps=8 (reused for 3).</div>
+  </div>
+  <div class="card col-comfy">
+    <div class="k">Image conditioning passes</div>
+    <div class="v"><span class="bd">3</span> &nbsp;/&nbsp; <span class="bv">2</span></div>
+    <div class="d">ComfyUI re-runs <code>LTXVImgToVideoConditionOnly</code> per stage. Vendor reuses Stage-2 conditionings in Stage 3.</div>
+  </div>
+  <div class="card col-vendor">
+    <div class="k">Distilled LoRA scope</div>
+    <div class="v"><span class="bd">all stages</span><br><span class="bv">stage 3 only</span></div>
+    <div class="d">ComfyUI strength=0.5; vendor takes <code>--distilled-lora</code> at default 0.8.</div>
+  </div>
+</div>
+
+<div class="grid-4" style="margin-top: 12px">
+  <div class="card col-comfy">
+    <div class="k">Stage 1 sampler</div>
+    <div class="v" style="font-size:14px">euler_ancestral_cfg_pp</div>
+    <div class="d">Ancestral noise injection at every step.</div>
+  </div>
+  <div class="card col-vendor">
+    <div class="k">Vendor Stage 1 denoiser</div>
+    <div class="v" style="font-size:14px">FactoryGuidedDenoiser</div>
+    <div class="d">Per-step CFG/STG/modality guider via <code>create_multimodal_guider_factory</code>.</div>
+  </div>
+  <div class="card col-comfy">
+    <div class="k">CFG</div>
+    <div class="v">1.0 (all stages)</div>
+    <div class="d">Both files; image conditioning drives output.</div>
+  </div>
+  <div class="card col-vendor">
+    <div class="k">Vendor Stage 3 denoiser</div>
+    <div class="v" style="font-size:14px">SimpleDenoiser</div>
+    <div class="d">No guidance, single transformer call. Matches the project convention for the last stage.</div>
+  </div>
+</div>
+
+<!-- ======================================================================= -->
+<!-- FLOW DIAGRAMS -->
+<!-- ======================================================================= -->
+<h2>End-to-end flow</h2>
+
+<div class="grid-2">
+
+  <!-- ComfyUI side -->
+  <div class="panel col-comfy">
+    <div class="head-comfy">A · ComfyUI workflow (workflow_3mljpp.py)</div>
+
+    <div class="stageblock stage-comfy" style="margin-top:10px">
+      <div class="stage-title">Setup &amp; constants</div>
+      <div class="flow">
+        <div class="node"><div class="t">CheckpointLoaderSimple</div><div class="b">ltx-2.3-22b-dev.safetensors</div></div>
+        <div class="node"><div class="t">LoraLoaderModelOnly</div><div class="b">ltx-2.3-22b-distilled-lora-384.safetensors @ 0.5</div></div>
+        <div class="node"><div class="t">LTXAVTextEncoderLoader</div><div class="b">gemma_3_12B_it.safetensors</div></div>
+        <div class="node"><div class="t">LTXVAudioVAELoader · LatentUpscaleModelLoader</div></div>
+        <div class="node"><div class="t">LoadImage → ResizeImageMaskNode</div><div class="b">longer-side 1536, lanczos</div></div>
+        <div class="node"><div class="t">CLIPTextEncode × 2</div><div class="b">positive=&quot;&quot;, negative=&lt;quality bag-of-words&gt;</div></div>
+        <div class="node"><div class="t">LTXVConditioning</div><div class="b">frame_rate=24</div></div>
+      </div>
+    </div>
+
+    <div class="stageblock stage-comfy">
+      <div class="stage-title">Stage 1 — low-res generation (group <code>5002</code> / <code>5013</code>)</div>
+      <div class="flow">
+        <div class="node"><div class="t">LTXVPreprocess</div><div class="b">img_compression=18 (H.264-ish)</div></div>
+        <div class="node"><div class="t">EmptyLTXVLatentVideo</div><div class="b">w=224, h=320, length=241 → latent [1,128,31,10,7]</div></div>
+        <div class="node"><div class="t">LTXVImgToVideoConditionOnly</div><div class="b">image=preprocessed, latent=empty, strength=1.0, bypass=False</div></div>
+        <div class="node"><div class="t">LTXVEmptyLatentAudio</div><div class="b">241 frames @ 24 fps</div></div>
+        <div class="node"><div class="t">LTXVConcatAVLatent</div></div>
+        <div class="node"><div class="t">SamplerCustomAdvanced</div><div class="b">euler_ancestral_cfg_pp, CFGGuider(cfg=1, model=distilled_lora_model)</div></div>
+        <div class="node"><div class="t">ManualSigmas</div><div class="b">9 values · 8 steps · front-loaded</div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-comfy">
+      <div class="stage-title">Stage 2 — upsample &amp; refine (group <code>5001</code>)</div>
+      <div class="flow">
+        <div class="node"><div class="t">LTXVSeparateAVLatent</div></div>
+        <div class="node"><div class="t">LTXVLatentUpsampler</div><div class="b">×2 spatial, model=ltx-2.3-spatial-upscaler-x2</div></div>
+        <div class="node"><div class="t">LTXVImgToVideoConditionOnly</div><div class="b">image=resized (NOT preprocessed), latent=upsampled, strength=1.0</div></div>
+        <div class="node"><div class="t">LTXVConcatAVLatent</div><div class="b">re-attaches stage-1 audio latent</div></div>
+        <div class="node"><div class="t">SamplerCustomAdvanced</div><div class="b">euler_cfg_pp, CFGGuider(cfg=1, distilled_lora model)</div></div>
+        <div class="node"><div class="t">ManualSigmas</div><div class="b">[0.85, 0.7250, 0.4219, 0.0] · 3 steps</div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-comfy">
+      <div class="stage-title">Stage 3 — upsample &amp; refine (group <code>5012</code>)</div>
+      <div class="flow">
+        <div class="node"><div class="t">LTXVSeparateAVLatent</div></div>
+        <div class="node"><div class="t">LTXVLatentUpsampler</div><div class="b">×2 spatial again — total 4× from Stage 1</div></div>
+        <div class="node"><div class="t">LTXVImgToVideoConditionOnly</div><div class="b">image=resized, latent=2×upsampled</div></div>
+        <div class="node"><div class="t">LTXVConcatAVLatent</div></div>
+        <div class="node"><div class="t">SamplerCustomAdvanced</div><div class="b">euler_cfg_pp, sigmas=[0.85, 0.7250, 0.4219, 0.0]</div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-comfy">
+      <div class="stage-title">Decode &amp; save</div>
+      <div class="flow">
+        <div class="node"><div class="t">LTXVSeparateAVLatent</div></div>
+        <div class="node"><div class="t">VAEDecodeTiled</div><div class="b">tile=512, overlap=64, T=512, T-overlap=4</div></div>
+        <div class="node"><div class="t">LTXVAudioVAEDecode</div></div>
+        <div class="node"><div class="t">CreateVideo · SaveVideo</div><div class="b">fps=24, format=auto, codec=auto</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Vendor side -->
+  <div class="panel col-vendor">
+    <div class="head-vendor">B · Vendor pipeline (TI2VidTripleStagesPipeline)</div>
+
+    <div class="stageblock stage-vendor" style="margin-top:10px">
+      <div class="stage-title">Construction (<code>__init__</code>)</div>
+      <div class="flow">
+        <div class="node"><div class="t">PromptEncoder</div><div class="b">checkpoint + Gemma root</div></div>
+        <div class="node"><div class="t">ImageConditioner</div></div>
+        <div class="node"><div class="t">VideoUpsampler</div><div class="b">checkpoint + spatial_upsampler_path</div></div>
+        <div class="node"><div class="t">VideoDecoder · AudioDecoder</div></div>
+        <div class="node"><div class="t">DiffusionStage × 3</div><div class="b">stage_1, stage_2: <code>loras=tuple(loras)</code><br>stage_3: <code>loras + distilled_lora</code></div></div>
+      </div>
+    </div>
+
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Per-call setup</div>
+      <div class="flow">
+        <div class="node"><div class="t">torch.Generator + GaussianNoiser</div></div>
+        <div class="node"><div class="t">PromptEncoder(prompt, negative_prompt)</div><div class="b">ctx_p, ctx_n → (v_context_p, a_context_p) × pos/neg</div></div>
+        <div class="node"><div class="t">LTX2Scheduler.execute(steps=stage1_steps)</div><div class="b">Karras-style. Default stage1_steps=16.</div></div>
+        <div class="node"><div class="t">LTX2Scheduler.execute(steps=stage2_steps)</div><div class="b">Default stage2_steps=8 — reused for both Stage 2 and Stage 3.</div></div>
+      </div>
+    </div>
+
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Stage 1 — half-res generation</div>
+      <div class="flow">
+        <div class="node"><div class="t">VideoPixelShape</div><div class="b">w=width//2, h=height//2 (e.g. 768×512 from 1536×1024 default)</div></div>
+        <div class="node"><div class="t">ImageConditioner(combined_image_conditionings)</div><div class="b">preprocessed_images=None — no H.264 preprocessing</div></div>
+        <div class="node"><div class="t">stage_1.__call__</div><div class="b">FactoryGuidedDenoiser, sigmas=stage_1_sigmas, noise_scale=1.0</div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Upsample (single)</div>
+      <div class="flow">
+        <div class="node"><div class="t">VideoUpsampler(video_state.latent[:1])</div><div class="b">×2 spatial — produces <code>upscaled_video_latent</code></div></div>
+      </div>
+    </div>
+
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Stage 2 — full-res refine</div>
+      <div class="flow">
+        <div class="node"><div class="t">ImageConditioner(combined_image_conditionings)</div><div class="b">at full (height, width); preprocessed_images=None</div></div>
+        <div class="node"><div class="t">stage_2.__call__</div><div class="b">FactoryGuidedDenoiser, sigmas=stage_2_sigmas</div></div>
+        <div class="node"><div class="t">video=ModalitySpec</div><div class="b">conditionings=stage_2, noise_scale=stage_2_sigmas[0], <strong>initial_latent=upscaled_video_latent</strong></div></div>
+        <div class="node"><div class="t">audio=ModalitySpec</div><div class="b">noise_scale=stage_2_sigmas[0], <strong>initial_latent=audio_state.latent</strong></div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Stage 3 — full-res refine (no second upsample)</div>
+      <div class="flow">
+        <div class="node"><div class="t">stage_3.__call__</div><div class="b">SimpleDenoiser, sigmas=stage_2_sigmas (re-used)</div></div>
+        <div class="node"><div class="t">video=ModalitySpec(context, conditionings=stage_2_conditionings)</div><div class="b" style="color:var(--warn)">no <code>initial_latent</code>, no <code>noise_scale</code></div></div>
+        <div class="node"><div class="t">audio=ModalitySpec(context=a_context_p)</div><div class="b" style="color:var(--warn)">no <code>initial_latent</code>, no <code>noise_scale</code></div></div>
+        <div class="node"><div class="t">distilled_lora active</div><div class="b">via stage_3 constructor only</div></div>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+    <div class="stageblock stage-vendor">
+      <div class="stage-title">Decode</div>
+      <div class="flow">
+        <div class="node"><div class="t">video_decoder(video_state.latent, tiling_config, generator)</div></div>
+        <div class="node"><div class="t">audio_decoder(audio_state.latent)</div></div>
+        <div class="node"><div class="t">main(): encode_video(...)</div><div class="b">writes to <code>--output-path</code></div></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ======================================================================= -->
+<!-- DETAIL TABLES -->
+<!-- ======================================================================= -->
+<h2>Stage-by-stage comparison</h2>
+
+<h3>Setup &amp; conditioning</h3>
+<table>
+  <thead><tr>
+    <th>Concern</th>
+    <th>ComfyUI workflow</th>
+    <th>Vendor pipeline</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td>Checkpoint</td>
+      <td><code>CheckpointLoaderSimple("ltx-2.3-22b-dev.safetensors")</code> — node 5025:5022, returns (model, clip, vae) at indices 0/1/2.</td>
+      <td><code>checkpoint_path</code> ctor arg fans out to <code>PromptEncoder</code>, <code>ImageConditioner</code>, <code>VideoUpsampler</code>, <code>VideoDecoder</code>, <code>AudioDecoder</code>, and three <code>DiffusionStage</code> instances. Each builds and frees its own model on call.</td>
+    </tr>
+    <tr>
+      <td>Distilled LoRA</td>
+      <td class="diff"><code>LoraLoaderModelOnly</code> @ <strong>strength 0.5</strong>, applied <strong>once</strong> to the model — every <code>CFGGuider</code> across all three stages references the same <code>loraloadermodelonly_5025_5023</code>.</td>
+      <td class="diff">Constructor arg <code>distilled_lora: list[LoraPathStrengthAndSDOps]</code>; CLI default strength 0.8. Attached to <strong>only Stage 3</strong>: <code>self.stage_3 = DiffusionStage(..., loras=(*loras, *distilled_lora))</code>.</td>
+    </tr>
+    <tr>
+      <td>Text encoder</td>
+      <td><code>LTXAVTextEncoderLoader("gemma_3_12B_it.safetensors", ...)</code></td>
+      <td><code>PromptEncoder(checkpoint_path, gemma_root, ...)</code></td>
+    </tr>
+    <tr>
+      <td>Prompts</td>
+      <td>Hard-coded — positive=<code>""</code>, negative=long quality bag-of-words ("camera zooming out, low resolution, blurry, ...").</td>
+      <td>Args <code>--prompt</code> / <code>--negative-prompt</code>; default negative = <code>""</code>.</td>
+    </tr>
+    <tr>
+      <td>Image input</td>
+      <td><code>LoadImage("8QJE3YYRN196A1CD5D6MSJ0AW0.jpeg")</code> → <code>ResizeImageMaskNode("scale longer dimension", longer_size=1536, "lanczos")</code>.</td>
+      <td><code>--image</code> repeatable, parsed into <code>ImageConditioningInput(path, frame_idx, strength, crf)</code>. Resize is encapsulated upstream by <code>combined_image_conditionings</code>.</td>
+    </tr>
+    <tr>
+      <td>Output dimensions (pixels)</td>
+      <td class="diff">Latent built at w=224, h=320 (latent shape <code>[1,128,31,10,7]</code> per <code>EmptyLTXVLatentVideo.execute</code>). After two ×2 upsamples in Stages 2/3, the final latent decodes to roughly <strong>896×1280</strong> px (portrait).</td>
+      <td class="diff">Args <code>--height 1024</code>, <code>--width 1536</code> (landscape default); Stage 1 generates at <code>height//2 × width//2 = 512×768</code>; Stages 2/3 at full <strong>1024×1536</strong>.</td>
+    </tr>
+    <tr>
+      <td>Frames / fps</td>
+      <td class="diff">241 frames at 24 fps (<code>PrimitiveInt(241)</code>, <code>PrimitiveFloat(24)</code>). <code>LTXFloatToInt</code> bridges fps→<code>LTXVEmptyLatentAudio.frame_rate</code>.</td>
+      <td class="diff"><code>--num-frames</code> default 121, <code>--frame-rate</code> default 24.0. Frame count must satisfy <code>(8*K)+1</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Stage 1</h3>
+<table>
+  <thead><tr><th style="width:24%">Concern</th><th>ComfyUI</th><th>Vendor</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Resolution policy</td>
+      <td>Empty latent at 224×320 px (very low base; the conditioning image is downscaled when matched against this latent).</td>
+      <td><code>VideoPixelShape(width=width//2, height=height//2)</code>.</td>
+    </tr>
+    <tr>
+      <td>Image preprocessing</td>
+      <td class="diff"><code>LTXVPreprocess(img_compression=18)</code> — H.264-style compression on the conditioning image <em>only at Stage 1</em>.</td>
+      <td class="diff"><code>preprocessed_images=None</code> — no analog of H.264 preprocessing in any stage.</td>
+    </tr>
+    <tr>
+      <td>Image conditioning op</td>
+      <td><code>LTXVImgToVideoConditionOnly</code> with <code>strength=1.0</code> (inferred — original UI subgraph leaked an "UNKNOWN" field; default 1.0 used). <code>bypass=False</code>.</td>
+      <td><code>combined_image_conditionings(images=images, height=stage_1.height, width=stage_1.width, ...)</code>; <code>frame_idx=0</code> images replace the latent, others are keyframe guides.</td>
+    </tr>
+    <tr>
+      <td>Sampler / step solver</td>
+      <td class="diff"><code>euler_ancestral_cfg_pp</code> via <code>KSamplerSelect</code> + <code>SamplerCustomAdvanced</code>. Ancestral noise injection.</td>
+      <td class="diff">Default <code>EulerDiffusionStep</code> + <code>euler_denoising_loop</code> (per <code>DiffusionStage.run</code>). Non-ancestral.</td>
+    </tr>
+    <tr>
+      <td>Sigmas</td>
+      <td class="diff">9 hand-set values, 8 steps:<br><code>1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0</code><br>Heavily front-loaded — ~5 of 8 steps live in σ ∈ [0.975, 1.0].</td>
+      <td class="diff"><code>LTX2Scheduler().execute(steps=stage1_steps)</code> — Karras-style; default stage1_steps=<strong>16</strong>. The docstring acknowledges "ComfyUI uses 8".</td>
+    </tr>
+    <tr>
+      <td>Guidance</td>
+      <td><code>CFGGuider(cfg=1, model=distilled_lora_model, positive, negative)</code> — CFG=1 is a no-op blend, output is driven by image conditioning + the distilled LoRA.</td>
+      <td><code>FactoryGuidedDenoiser(v_context, a_context, video_guider_factory, audio_guider_factory)</code>. <code>video_cfg_scale=1.0</code>, <code>video_stg_scale=0.0</code> by default — same effective behavior, but the abstraction supports STG/modality scaling if turned on.</td>
+    </tr>
+    <tr>
+      <td>Audio</td>
+      <td><code>LTXVEmptyLatentAudio(frames=241, fps=24, audio_vae)</code> + <code>LTXVConcatAVLatent</code>; sampler runs the AV-concat latent jointly.</td>
+      <td><code>audio=ModalitySpec(context=a_context_p)</code> — empty initial state, cross-modal context only. <code>DiffusionStage.run</code> builds an audio noised state internally via <code>AudioLatentTools.from_video_pixel_shape</code>.</td>
+    </tr>
+    <tr>
+      <td>Random seed</td>
+      <td>3 separate <code>RandomNoise</code> nodes (5002:4832, 5001:4967, 5012:5009). Each is <em>re-randomized</em> every call by the converter (<code>random.randint(1, 2**64)</code>) to keep multi-run queues distinct.</td>
+      <td>Single <code>--seed</code>; one <code>torch.Generator(device).manual_seed(seed)</code> drives a single <code>GaussianNoiser</code> shared across all stages.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Inter-stage operations</h3>
+<table>
+  <thead><tr><th style="width:24%">Concern</th><th>ComfyUI</th><th>Vendor</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Stage 1 → 2 upsample</td>
+      <td><code>LTXVLatentUpsampler(samples, upscale_model=ltx-2.3-spatial-upscaler-x2-1.0, vae=ckpt_vae)</code> — fixed ×2 spatial.</td>
+      <td><code>self.upsampler(video_state.latent[:1])</code> — <code>VideoUpsampler</code> applies ×2 spatial on the same upsampler weights. Slices first batch only.</td>
+    </tr>
+    <tr>
+      <td>Stage 2 → 3 upsample</td>
+      <td class="diff">Yes — second <code>LTXVLatentUpsampler</code> call (<strong>×2 again, total 4×</strong>). The conditioning image is fed in unchanged at full longer-side=1536 resolution; <code>LTXVImgToVideoConditionOnly</code> handles the resize internally.</td>
+      <td class="diff"><strong>None.</strong> Stage 3 runs at the same resolution as Stage 2.</td>
+    </tr>
+    <tr>
+      <td>Audio carry-through</td>
+      <td>After each <code>SamplerCustomAdvanced</code>, <code>LTXVSeparateAVLatent</code> splits AV; audio is re-concatenated into the next stage's input via <code>LTXVConcatAVLatent</code>.</td>
+      <td class="diff">Stage 2: <code>audio=ModalitySpec(initial_latent=audio_state.latent, noise_scale=stage_2_sigmas[0])</code> — explicit re-noising of the prior audio latent. Stage 3: <code>audio=ModalitySpec(context=a_context_p)</code> only — <strong>no carry-through</strong>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Stage 2</h3>
+<table>
+  <thead><tr><th style="width:24%">Concern</th><th>ComfyUI</th><th>Vendor</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Image conditioning</td>
+      <td><code>LTXVImgToVideoConditionOnly</code> again — image is the <em>resized</em> output, not the preprocessed one. <code>strength=1.0</code> (inferred), <code>bypass=False</code>.</td>
+      <td><code>self.image_conditioner(combined_image_conditionings(...))</code> recomputed at full (height, width).</td>
+    </tr>
+    <tr>
+      <td>Initial state</td>
+      <td>Latent input is <code>LTXVConcatAVLatent(upsampled_video_from_stage1, audio_latent_from_stage1)</code> — sampler is re-noised from σ[0]=0.85.</td>
+      <td><code>ModalitySpec(initial_latent=upscaled_video_latent, noise_scale=stage_2_sigmas[0])</code> — equivalent to "start at σ[0]".</td>
+    </tr>
+    <tr>
+      <td>Sampler</td>
+      <td><code>euler_cfg_pp</code> (no ancestral noise).</td>
+      <td>Same Euler step in <code>DiffusionStage</code>, but goes through <code>FactoryGuidedDenoiser</code> rather than CFG-as-classifier-blend.</td>
+    </tr>
+    <tr>
+      <td>Sigmas / steps</td>
+      <td class="diff">3 steps, 4 values: <code>0.85, 0.7250, 0.4219, 0.0</code>.</td>
+      <td class="diff">Default <code>stage2_steps=8</code> via <code>LTX2Scheduler</code>.</td>
+    </tr>
+    <tr>
+      <td>Denoiser</td>
+      <td>(Same CFGGuider as Stage 1; uses distilled LoRA model.)</td>
+      <td class="diff"><code>FactoryGuidedDenoiser</code> (still guided). Note the project convention is "all guidance is stage 1 only; stage 2 uses SimpleDenoiser" — this triple-stage variant is unique in keeping guidance through Stage 2.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Stage 3</h3>
+<table>
+  <thead><tr><th style="width:24%">Concern</th><th>ComfyUI</th><th>Vendor</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Image conditioning</td>
+      <td>Yet another <code>LTXVImgToVideoConditionOnly</code> on the resized image with the now-double-upsampled latent.</td>
+      <td><code>conditionings=stage_2_conditionings</code> reused — no recomputation, no new resolution match.</td>
+    </tr>
+    <tr>
+      <td>Initial state</td>
+      <td class="diff"><code>LTXVConcatAVLatent(double_upsampled_video, stage2_audio)</code>; sampler re-noises from σ[0]=0.85 of the same 4-value list.</td>
+      <td class="diff"><strong>No initial_latent for either modality.</strong> <code>_build_state</code> in <code>blocks.py</code> calls <code>create_noised_state(initial_latent=None)</code>, so the stage starts from random noise. The denoising loop then runs 8 steps of σ from 1.0→0 over a fresh noise tensor — Stage-2 output is discarded as input.</td>
+    </tr>
+    <tr>
+      <td>Sampler</td>
+      <td><code>euler_cfg_pp</code>, sigmas <code>0.85, 0.7250, 0.4219, 0.0</code>.</td>
+      <td><code>SimpleDenoiser(v_context, a_context)</code> + <code>stage_2_sigmas</code> (default 8 steps from <code>LTX2Scheduler</code>).</td>
+    </tr>
+    <tr>
+      <td>Distilled LoRA</td>
+      <td>Same model as Stages 1 &amp; 2 (LoRA loaded once).</td>
+      <td class="diff">Active here only — <code>self.stage_3 = DiffusionStage(..., loras=(*tuple(loras), *distilled_lora))</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Decode &amp; output</h3>
+<table>
+  <thead><tr><th style="width:24%">Concern</th><th>ComfyUI</th><th>Vendor</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Video decode</td>
+      <td><code>VAEDecodeTiled(tile_size=512, overlap=64, temporal_size=512, temporal_overlap=4)</code>.</td>
+      <td><code>self.video_decoder(video_state.latent, tiling_config, generator)</code> — <code>tiling_config = TilingConfig.default()</code> (project default).</td>
+    </tr>
+    <tr>
+      <td>Audio decode</td>
+      <td><code>LTXVAudioVAEDecode(samples, audio_vae)</code>.</td>
+      <td><code>self.audio_decoder(audio_state.latent)</code>.</td>
+    </tr>
+    <tr>
+      <td>Mux + write</td>
+      <td><code>CreateVideo(fps, images, audio)</code> → <code>SaveVideo(filename_prefix="output", format="auto", codec="auto")</code> — writes to ComfyUI's <code>output/</code> dir.</td>
+      <td><code>encode_video(video, fps, audio, output_path, video_chunks_number)</code> — caller-supplied path.</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ======================================================================= -->
+<!-- SIGMA VISUALIZATION -->
+<!-- ======================================================================= -->
+<h2>Sigma schedules side-by-side</h2>
+
+<div class="panel">
+  <h4>Stage 1</h4>
+  <div class="sigma-row"><div><span class="badge comfy">ComfyUI</span></div>
+    <div class="sigma-bar">
+      <div class="sigma-tick" style="height:100%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:99.4%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:98.8%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:98.1%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:97.5%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:90.9%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:72.5%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:42.2%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:0%;    background:var(--comfy); min-width:4px"></div>
+    </div>
+    <div class="dim">8 steps</div>
+  </div>
+  <div class="legend">σ = 1.0, 0.994, 0.988, 0.981, 0.975, 0.909, 0.725, 0.422, 0 — front-loaded, six of eight steps stay in σ ≥ 0.9.</div>
+
+  <div style="height:8px"></div>
+
+  <div class="sigma-row"><div><span class="badge vendor">Vendor</span></div>
+    <div class="sigma-bar" style="--v: var(--vendor)">
+      <!-- approximate Karras-shape 16-step bars (smooth linear-ish in log space) -->
+      <div class="sigma-tick" style="height:100%; background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:96%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:90%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:82%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:74%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:65%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:56%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:48%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:40%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:33%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:26%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:20%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:14%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:9%;   background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:4%;   background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:0%;   background:var(--vendor); min-width:4px"></div>
+    </div>
+    <div class="dim">16 steps (default)</div>
+  </div>
+  <div class="legend">Approximate <code>LTX2Scheduler.execute(steps=16)</code> shape — Karras-style decay, evenly distributed across the σ range.</div>
+</div>
+
+<div class="panel">
+  <h4>Stages 2 &amp; 3</h4>
+  <div class="sigma-row"><div><span class="badge comfy">ComfyUI</span></div>
+    <div class="sigma-bar">
+      <div class="sigma-tick" style="height:85%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:72.5%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:42.2%; background:var(--comfy)"></div>
+      <div class="sigma-tick" style="height:0%;   background:var(--comfy); min-width:4px"></div>
+    </div>
+    <div class="dim">3 steps each</div>
+  </div>
+  <div class="legend">Same list reused for Stage 2 and Stage 3: σ = 0.85, 0.725, 0.422, 0.</div>
+
+  <div style="height:8px"></div>
+
+  <div class="sigma-row"><div><span class="badge vendor">Vendor</span></div>
+    <div class="sigma-bar">
+      <div class="sigma-tick" style="height:100%; background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:84%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:68%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:52%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:36%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:22%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:10%;  background:var(--vendor)"></div>
+      <div class="sigma-tick" style="height:0%;   background:var(--vendor); min-width:4px"></div>
+    </div>
+    <div class="dim">8 steps (default)</div>
+  </div>
+  <div class="legend">Vendor uses the full <code>LTX2Scheduler</code> output — starts at σ ≈ 1.0, not 0.85. Combined with the missing <code>initial_latent</code> in Stage 3, this is consistent with starting from full noise.</div>
+</div>
+
+<!-- ======================================================================= -->
+<!-- DIVERGENCES / CALLOUTS -->
+<!-- ======================================================================= -->
+<h2>Major divergences</h2>
+
+<div class="callout warn">
+  <h3>1 · Vendor Stage 3 likely starts from pure noise</h3>
+  <p style="margin:6px 0 0">
+    In <code>blocks.py</code>:<br>
+    <code>_build_state(spec, ...)</code> calls <code>create_noised_state(initial_latent=spec.initial_latent, noise_scale=spec.noise_scale)</code>.
+    When <code>spec.initial_latent is None</code> (vendor Stage 3 for both video and audio), the state is built from a fresh Gaussian noise tensor — Stage 2's output is dropped on the floor.
+  </p>
+  <p style="margin:8px 0 0">
+    Compare:
+  </p>
+<pre>// vendor stage 2 (correct refinement pattern)
+video=ModalitySpec(
+    context=v_context_p,
+    conditionings=stage_2_conditionings,
+    noise_scale=stage_2_sigmas[0].item(),
+    <span style="color:var(--shared)">initial_latent=upscaled_video_latent</span>,
+)
+
+// vendor stage 3 (no carry-through)
+video=ModalitySpec(
+    context=v_context_p,
+    conditionings=stage_2_conditionings,
+    <span style="color:var(--warn)"># no initial_latent, no noise_scale</span>
+)</pre>
+  <p style="margin:8px 0 0">
+    The ComfyUI workflow's Stage 3, in contrast, takes the upsampled Stage-2 latent as <code>latent_image</code> for <code>SamplerCustomAdvanced</code> and re-noises it from σ[0]=0.85 — a textbook refinement pass. The vendor docstring describes Stage 3 as "another full-resolution refinement pass" but the implementation does not refine; it generates from scratch with the same prompts and 8 Karras-style steps.
+  </p>
+  <p style="margin:8px 0 0; font-size: 13px; color: var(--muted)">
+    The fix is one line per modality — pass <code>initial_latent=video_state.latent</code> and the audio equivalent, plus <code>noise_scale=stage_2_sigmas[0].item()</code>, to make the vendor's Stage 3 mirror the ComfyUI semantics. Worth confirming with whoever authored the file before editing — there may be a deliberate intent that I'm missing.
+  </p>
+</div>
+
+<div class="callout warn">
+  <h3>2 · Vendor performs only one latent upsample</h3>
+  <p style="margin:6px 0 0">
+    The ComfyUI workflow chains <em>two</em> <code>LTXVLatentUpsampler</code> calls (×2 → ×2 = ×4 spatial). Stage 1 generates at <strong>~7×10</strong> latent dims; the final decoded video is at <strong>~28×40</strong> latent dims (≈896×1280 px).
+  </p>
+  <p style="margin:6px 0 0">
+    The vendor pipeline upsamples once (Stage 1 → Stage 2). Stage 2 and Stage 3 share the same resolution. With default args (<code>--width 1536 --height 1024</code>), Stage 1 runs at 768×512 and Stages 2–3 at 1536×1024 — only a 2× spatial increase.
+  </p>
+  <p style="margin:6px 0 0">
+    These produce different artifacts: ComfyUI uses Stage-3 not just to refine but to push spatial detail further; the vendor file uses Stage-3 purely as a refinement (or, given the bug above, as a generation pass at full res).
+  </p>
+</div>
+
+<div class="callout note">
+  <h3>3 · Distilled LoRA scope is inverted</h3>
+  <p style="margin:6px 0 0">
+    Project convention (per <code>packages/ltx-pipelines/CLAUDE.md</code>):
+  </p>
+  <ul class="tight">
+    <li>Two-stage pipelines: distilled LoRA on <strong>Stage 2 only</strong>.</li>
+    <li>HQ pipeline: distilled LoRA on <strong>both stages</strong>, with separate strengths.</li>
+  </ul>
+  <p style="margin:6px 0 0">
+    The triple-stage vendor places it on <strong>Stage 3 only</strong>, while the ComfyUI workflow loads it once at the top and applies it to <strong>all three stages</strong>. If the design intent was "distilled LoRA polishes the final pass", the vendor matches that intent; if the intent was "use distilled LoRA throughout to keep step count low", the vendor doesn't.
+  </p>
+</div>
+
+<div class="callout note">
+  <h3>4 · Image preprocessing is asymmetric in ComfyUI, absent in vendor</h3>
+  <p style="margin:6px 0 0">
+    The ComfyUI workflow runs <code>LTXVPreprocess(img_compression=18)</code> on the conditioning image only at Stage 1. Stages 2 and 3 use the <em>resized</em> image directly. The H.264-style compression at the lowest-resolution stage is a deliberate technique: the model learns to lift quality stage-by-stage, so feeding a degraded image at the start lets it commit to coarse structure without over-fitting to high-frequency artifacts.
+  </p>
+  <p style="margin:6px 0 0">
+    The vendor pipeline passes <code>preprocessed_images=None</code> to every <code>combined_image_conditionings</code> call — there is no analog of this stage-1-only degradation. The docstring mentions "no H.264 preprocessing" as an intentional simplification.
+  </p>
+</div>
+
+<div class="callout note">
+  <h3>5 · Sampler family differs (ancestral vs non-ancestral)</h3>
+  <p style="margin:6px 0 0">
+    ComfyUI Stage 1 uses <code>euler_ancestral_cfg_pp</code> — ancestral sampling re-injects noise at every step, raising stochasticity (and seed sensitivity). Stages 2 and 3 use <code>euler_cfg_pp</code> (no ancestral noise).
+  </p>
+  <p style="margin:6px 0 0">
+    The vendor pipeline goes through <code>EulerDiffusionStep</code> + <code>euler_denoising_loop</code> for all three stages — non-ancestral. The single <code>GaussianNoiser</code> is reused across stages; multiplying step count by 2× (16 vs 8) compensates partly for the loss of ancestral diversity, but the runs are not directly comparable.
+  </p>
+</div>
+
+<!-- ======================================================================= -->
+<!-- NODE → ABSTRACTION MAPPING -->
+<!-- ======================================================================= -->
+<h2>ComfyUI nodes ↔ vendor abstractions</h2>
+
+<table>
+  <thead><tr>
+    <th>ComfyUI node</th>
+    <th>Vendor equivalent</th>
+    <th>Notes</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td><code>CheckpointLoaderSimple</code></td>
+      <td>Implicit — checkpoint path is consumed by every block (<code>PromptEncoder</code>, <code>ImageConditioner</code>, <code>VideoUpsampler</code>, <code>VideoDecoder</code>, <code>AudioDecoder</code>, <code>DiffusionStage × 3</code>).</td>
+      <td>Vendor blocks rebuild from disk per call; no shared state.</td>
+    </tr>
+    <tr>
+      <td><code>LoraLoaderModelOnly</code></td>
+      <td><code>LoraPathStrengthAndSDOps</code> arg into <code>DiffusionStage(loras=...)</code>.</td>
+      <td>Vendor differentiates "regular loras" (every stage) from "distilled_lora" (Stage 3 only).</td>
+    </tr>
+    <tr>
+      <td><code>LTXAVTextEncoderLoader</code> + <code>CLIPTextEncode × 2</code> + <code>LTXVConditioning</code></td>
+      <td><code>PromptEncoder.__call__([prompt, negative_prompt], ...)</code> → returns <code>(ctx_p, ctx_n)</code> with <code>video_encoding</code> and <code>audio_encoding</code> attributes.</td>
+      <td>Vendor is a single call that yields both modalities. Supports <code>enhance_first_prompt</code> (image-aware Gemma rewrite) — no equivalent in the ComfyUI flow.</td>
+    </tr>
+    <tr>
+      <td><code>LoadImage</code> + <code>ResizeImageMaskNode</code> + <code>LTXVPreprocess</code></td>
+      <td><code>ImageConditioningInput</code> + <code>combined_image_conditionings</code>.</td>
+      <td>Vendor encapsulates resize and conditioning; preprocessing path is missing.</td>
+    </tr>
+    <tr>
+      <td><code>EmptyLTXVLatentVideo</code></td>
+      <td><code>VideoLatentShape.from_pixel_shape(VideoPixelShape(...))</code> inside <code>DiffusionStage.run</code> — no explicit "empty latent" object, the noised state is built directly.</td>
+      <td>Both end up with shape <code>[B, 128, ((F-1)//8)+1, H//32, W//32]</code>.</td>
+    </tr>
+    <tr>
+      <td><code>LTXVImgToVideoConditionOnly</code></td>
+      <td><code>combined_image_conditionings(images=..., height=..., width=..., video_encoder=enc, ...)</code></td>
+      <td>Vendor has no <code>bypass</code> equivalent — it always conditions when <code>images</code> is non-empty.</td>
+    </tr>
+    <tr>
+      <td><code>LTXVEmptyLatentAudio</code> + <code>LTXVConcatAVLatent</code> + <code>LTXVSeparateAVLatent</code></td>
+      <td>Implicit in <code>DiffusionStage.run</code> via <code>AudioLatentShape.from_video_pixel_shape</code> + <code>ModalitySpec(audio=...)</code>.</td>
+      <td>Vendor never materializes an explicit AV-concat tensor; modalities are tracked separately and run jointly inside <code>euler_denoising_loop</code>.</td>
+    </tr>
+    <tr>
+      <td><code>KSamplerSelect</code> + <code>SamplerCustomAdvanced</code> + <code>CFGGuider</code> + <code>RandomNoise</code></td>
+      <td><code>DiffusionStage.__call__(denoiser=..., sigmas=..., noiser=...)</code></td>
+      <td>One vendor call replaces five ComfyUI nodes per stage.</td>
+    </tr>
+    <tr>
+      <td><code>ManualSigmas</code></td>
+      <td><code>LTX2Scheduler().execute(steps=N)</code> (or any <code>torch.Tensor</code> passed via <code>sigmas=</code>).</td>
+      <td>Vendor never exposes a path to inject the ComfyUI hand-authored sigmas; you'd have to bypass <code>LTX2Scheduler</code> and build the tensor manually.</td>
+    </tr>
+    <tr>
+      <td><code>LTXVLatentUpsampler</code></td>
+      <td><code>VideoUpsampler.__call__(latent)</code></td>
+      <td>Both wrap <code>ltx-2.3-spatial-upscaler-x2-1.0.safetensors</code> at fixed ×2.</td>
+    </tr>
+    <tr>
+      <td><code>VAEDecodeTiled</code></td>
+      <td><code>VideoDecoder.__call__(latent, tiling_config, generator)</code></td>
+      <td>Vendor's <code>TilingConfig.default()</code> may differ from ComfyUI's tile=512/overlap=64/T=512/T-overlap=4 — worth a head-to-head numerical check before blessing equivalence.</td>
+    </tr>
+    <tr>
+      <td><code>LTXVAudioVAEDecode</code></td>
+      <td><code>AudioDecoder.__call__(latent)</code></td>
+      <td>Direct equivalent.</td>
+    </tr>
+    <tr>
+      <td><code>CreateVideo</code> + <code>SaveVideo</code></td>
+      <td><code>encode_video(video, fps, audio, output_path, video_chunks_number)</code></td>
+      <td>ComfyUI writes via its server's filesystem layer; vendor uses the project's media_io helper.</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ======================================================================= -->
+<!-- CODE STRUCTURE -->
+<!-- ======================================================================= -->
+<h2>Code structure</h2>
+
+<div class="grid-2">
+  <div class="panel col-comfy">
+    <div class="head-comfy">workflow_3mljpp.py</div>
+    <ul class="tight">
+      <li>Lines 1–180: ComfyUI bootstrap (sys.path, server stub, custom node import, allocator env).</li>
+      <li>Lines 183–548: <code>build_workflow()</code> — the API JSON re-emitted as a Python dict; passed back into <code>SaveVideo</code> as <code>prompt</code> metadata.</li>
+      <li>Lines 555–558: module-level statements — <code>workflow</code>, <code>prompt</code>, <code>extra_pnginfo</code> evaluated at import time.</li>
+      <li>Lines 561–871: <code>main(unload_models)</code> — the only execution path. <code>for q in range(1)</code> wraps everything (the <code>--queue_size</code> argument); each iteration randomizes the three <code>RandomNoise</code> seeds.</li>
+      <li>Hard-coded everywhere: image filename, prompts, frame count, sigma values, dimensions. To change inputs, edit the dict in <code>build_workflow()</code> or feed a different JSON to the converter.</li>
+    </ul>
+  </div>
+
+  <div class="panel col-vendor">
+    <div class="head-vendor">ti2vid_triple_stages.py</div>
+    <ul class="tight">
+      <li>Lines 22–51: imports from <code>ltx_core</code> / <code>ltx_pipelines</code>. All upstream symbols normally land via <code>src/upstream.py</code>; this file imports directly because it lives in <code>src/vendor/</code> (a vendored, lightly-edited copy from the upstream repo).</li>
+      <li>Lines 54–117: <code>TI2VidTripleStagesPipeline.__init__</code> — declarative ownership of every model component, with three <code>DiffusionStage</code> instances differing only in their <code>loras</code> tuple.</li>
+      <li>Lines 119–278: <code>__call__</code> — the actual pipeline. Six logical steps (prompt encode → stage 1 → upsample → stage 2 → stage 3 → decode), one assertion, no branching.</li>
+      <li>Lines 281–341: <code>build_arg_parser</code> — every knob is an explicit CLI flag with a default and a docstring.</li>
+      <li>Lines 344–438: <code>main</code> — argparse plumbing into the pipeline call + <code>encode_video</code> at the end.</li>
+      <li>Knobs that don't exist in the ComfyUI side: <code>--quantization {fp8-cast, fp8-scaled-mm}</code>, <code>--compile</code>, <code>--streaming-prefetch-count</code>, <code>--max-batch-size</code>. The pipeline is wired into the BentoML service through these.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================================= -->
+<!-- WHAT WOULD MAKE THEM EQUIVALENT -->
+<!-- ======================================================================= -->
+<h2>If you wanted byte-equivalent output</h2>
+<p>
+  The two pipelines are built to different goals — ComfyUI's flow is one specific run, the vendor's is a parameterized library. Even so, here's the minimum diff if you wanted the vendor file to reproduce the ComfyUI workflow's exact behavior:
+</p>
+<ol>
+  <li>Add a second <code>VideoUpsampler</code> step between Stage 2 and Stage 3, and pass the result as <code>initial_latent</code> to Stage 3.</li>
+  <li>Pass <code>initial_latent=upscaled_stage2</code> + <code>noise_scale=stage_2_sigmas[0].item()</code> to Stage 3's video <code>ModalitySpec</code> (and the audio analog). <strong>This fixes the implementation regardless of whether the second upsample is added.</strong></li>
+  <li>Add a <code>preprocessed_images</code> code path so Stage 1 can consume an H.264-degraded image (mirror <code>LTXVPreprocess(img_compression=18)</code>). Stages 2 and 3 keep the raw image.</li>
+  <li>Apply distilled LoRA to Stages 1 and 2 as well (or, equivalently, drop it from Stage 3 and load it as part of <code>loras</code> at construction).</li>
+  <li>Allow injecting hand-authored sigma tensors per stage (the existing <code>LTX2Scheduler.execute(steps=N)</code> path is fine for production but not bit-for-bit equivalent).</li>
+  <li>Use ancestral Euler for Stage 1 only — currently no path through <code>DiffusionStage</code> exposes the <code>stepper</code> override from the public <code>__call__</code> signature, so this requires a small plumbing change.</li>
+</ol>
+
+<!-- ======================================================================= -->
+<!-- FOOTER -->
+<!-- ======================================================================= -->
+<hr>
+<p style="font-size:13px; color:var(--muted)">
+  Source files: <code>scripts/workflow_3mljpp.py</code> (876 LOC) and <code>src/vendor/ti2vid_triple_stages.py</code> (438 LOC).
+  Reference upstream contract: <code>LTX-2-ref/packages/ltx-pipelines/CLAUDE.md</code> and
+  <code>LTX-2-ref/packages/ltx-pipelines/src/ltx_pipelines/utils/blocks.py</code>.
+  Custom-node sources used during conversion: <code>Lightricks/ComfyUI-LTXVideo</code> and
+  <code>comfyanonymous/ComfyUI@v0.20.1</code>.
+</p>
+</div>
+</body>
+</html>
