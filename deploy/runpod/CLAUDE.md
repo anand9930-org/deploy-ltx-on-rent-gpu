@@ -16,7 +16,7 @@ export RUNPOD_API_KEY=your_key
 Network volumes persist across pod restarts. They are region-based (not machine-bound like Vast.ai).
 
 ```bash
-# List datacenters with RTX 4090 availability
+# List datacenters with RTX 6000 Pro Blackwell availability
 runpodctl datacenter list
 
 # Create 100GB volume (volume + pod MUST be in same datacenter)
@@ -37,8 +37,8 @@ source .env
 # Create pod (Secure Cloud — required for network volumes)
 runpodctl create pod \
   --name ltx-video \
-  --imageName anand9930/ltx-video:latest \
-  --gpuType "NVIDIA GeForce RTX 4090" \
+  --imageName anand9930/ltx-video-blackwell:latest \
+  --gpuType "NVIDIA RTX PRO 6000 Blackwell Server Edition" \
   --gpuCount 1 \
   --containerDiskSize 20 \
   --networkVolumeId <VOLUME_ID> \
@@ -124,11 +124,14 @@ runpodctl network-volume delete <VOLUME_ID>
 
 ## Cost Summary
 
-| Component | Cost |
-|-----------|------|
-| RTX 4090 Secure Cloud | $0.59/hr |
+Live pricing varies — check `runpodctl gpu list` for the current rate. As of branch
+creation, RTX PRO 6000 Blackwell Server Edition (96 GB) was ~$1.50-2.50/hr on
+RunPod Secure Cloud; storage pricing unchanged from RTX 4090 era.
+
+| Component | Cost (approx) |
+|-----------|---------------|
+| RTX 6000 Pro Blackwell Server Edition (Secure Cloud) | check `runpodctl gpu list` |
 | Network Volume (100GB) | $7.00/month |
-| 4-hour session | ~$2.36 + storage |
 
 ## Key Differences from Vast.ai
 
@@ -138,5 +141,4 @@ runpodctl network-volume delete <VOLUME_ID>
 | Volume portability | Any pod in same datacenter | Same physical machine only |
 | Cold start | FlashBoot (~seconds) | Docker pull (~minutes) |
 | Endpoint URL | HTTPS proxy auto-assigned | Random IP:port |
-| GPU pricing (RTX 4090) | $0.59/hr (Secure) | $0.27-0.34/hr |
 | Storage pricing | $0.07/GB/mo | ~$0.07/GB/mo |

@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-LTX-2.3 22B BentoML video-generation service. NGC PyTorch 25.06 + ComfyUI graph pipeline. Targets H100/H200 RunPod pods.
+LTX-2.3 22B BentoML video-generation service. NVIDIA CUDA + ComfyUI graph pipeline.
+
+> **Branch `feature/RTX-6000-pro-deployment`**: retargets to RTX PRO 6000 Blackwell Server Edition (96 GB, sm_122) on `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` + stable PyTorch 2.8.0 (cu128). H100/Hopper / NGC PyTorch path lives on `main`.
 
 ## Project layout
 

@@ -40,11 +40,9 @@ jobs:
         with:
           context: .
           push: true
-          # Separate image name so this combined branch doesn't clobber
-          # either parent's published image. RunPod templates for this
-          # branch should point at
-          #   <DOCKERHUB_USERNAME>/ltx-video-fa3-teacache:latest
+          # Blackwell branch — RTX PRO 6000 Blackwell (sm_122) build, NGC 26.04
+          # base. Deploy scripts point at <DOCKERHUB_USERNAME>/ltx-video-blackwell:latest.
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-fa3-teacache:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-fa3-teacache:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-blackwell:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx-video-blackwell:${{ github.sha }}
           no-cache: true

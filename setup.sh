@@ -1,13 +1,12 @@
 #!/bin/bash
 # BentoML setup script — runs during Docker image build.
-# Clones the official LTX-2 repo and installs ltx-core / ltx-pipelines.
-# The [fp8-trtllm] extra pulls tensorrt-llm==1.0.0 for the H100 W8A8
-# scaled_mm path; fetched from pypi.nvidia.com.
+#
+# No-op on the Blackwell branch: the ComfyUI graph pipeline
+# (`src/pipeline/triple_stages_comfyui_graph.py`) runs ComfyUI **core** nodes
+# and explicitly opts out of `ltx-core` / `ltx-pipelines` (see its module
+# docstring). Installing them only drags in `tensorrt-llm==1.0.0`, which is
+# H100/Hopper (sm_90) only and unavailable for Blackwell sm_122. The H100 W8A8
+# path lives on `main`.
 set -e
 
-git lfs install
-git clone --depth 1 https://github.com/Lightricks/LTX-2.git /app/LTX-2
-pip install --no-cache-dir \
-    --extra-index-url https://pypi.nvidia.com \
-    -e "/app/LTX-2/packages/ltx-core[fp8-trtllm]" \
-    -e /app/LTX-2/packages/ltx-pipelines
+echo "(setup.sh no-op on Blackwell branch — ComfyUI path does not use ltx-core)"

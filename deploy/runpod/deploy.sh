@@ -14,8 +14,10 @@
 set -e
 
 # ---- Configuration ----------------------------------------------------------
-IMAGE="anand9930/ltx-video:latest"
-GPU_TYPE="NVIDIA GeForce RTX 4090"
+IMAGE="anand9930/ltx-video-blackwell:latest"
+# RTX 6000 Pro Blackwell Server Edition (96 GB GDDR7, sm_122). Verify the exact
+# label on first deploy with: runpodctl gpu list | grep -i 6000
+GPU_TYPE="NVIDIA RTX PRO 6000 Blackwell Server Edition"
 CONTAINER_DISK=20     # GB — small, models go on network volume
 VOLUME_SIZE=100       # GB — persistent storage for models
 VOLUME_NAME="ltx-models"
@@ -119,8 +121,8 @@ POD_ID=$(runpodctl create pod \
     -o json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 
 if [ -z "$POD_ID" ]; then
-    echo "Error: Failed to create pod. RTX 4090 may not be available in $DATACENTER."
-    echo "  Check GPU availability: runpodctl gpu list"
+    echo "Error: Failed to create pod. RTX 6000 Pro Blackwell may not be available in $DATACENTER."
+    echo "  Check GPU availability: runpodctl gpu list | grep -i 6000"
     echo "  List datacenters: runpodctl datacenter list"
     exit 1
 fi
