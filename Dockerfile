@@ -1,14 +1,18 @@
 # ============================================================================
 # LTX-2.3 22B — BentoML video generation service (ComfyUI graph pipeline)
 # ============================================================================
-# Targets RTX PRO 6000 Blackwell Server Edition (96 GB, sm_122).
+# Targets RTX PRO 6000 Blackwell Server Edition (96 GB, sm_120 — verified
+# live, despite earlier docs saying sm_122).
 # Models expected at $MODEL_DIR (default /models), typically a mounted volume;
 # downloaded on first boot if not already present (~63 GB).
 #
-# Recipe is the community-proven stack for LTX-2 + ComfyUI on RTX PRO 6000
-# Blackwell (see f00d4tehg0dz/runpod_comfyui_ltx2_flux): NVIDIA CUDA 12.8 base
-# + stable PyTorch 2.8.0 from PyPI's cu128 index. No NGC alpha builds — keeps
-# torchaudio / torchvision ABI matched to torch out of the box.
+# Stack: NVIDIA CUDA 12.8 base image + stable PyTorch **2.10.0 from PyPI's
+# cu130 index**. The cu130 wheels carry their own runtime CUDA 13 libs
+# (libcudart, cuBLAS, cuDNN) and only need a CUDA-13-compatible host driver,
+# which RunPod's Blackwell pods ship (driver >= 575). cu130 unlocks ComfyUI's
+# `comfy_kitchen` CUDA backend (FP8 scaled matmul on Blackwell) — gated by
+# `cuda_version >= (13,)` in ComfyUI's comfy/quant_ops.py. With cu128 the
+# LTX-2.3 FP8 weights are silently dequantized to BF16 at every matmul.
 # ============================================================================
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
@@ -19,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/models/huggingface
 
 # ---- System dependencies + uv ----------------------------------------------
-# Ubuntu 24.04 LTS ships Python 3.12 by default. PyTorch 2.8.0 cu128 has cp312
+# Ubuntu 24.04 LTS ships Python 3.12 by default. PyTorch 2.10.0 cu130 has cp312
 # wheels so no pyenv / deadsnakes needed. uv handles pip with cache discipline.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,13 +33,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
 
-# ---- PyTorch 2.8.0 stack (cu128 wheels) ------------------------------------
-# Single index, matched ABI across torch / torchvision / torchaudio. No NGC,
-# no stub bypass. PyTorch 2.7+ cu128 wheels include Blackwell architecture
-# support (sm_120 / compute_120 PTX) per the PyTorch 2.7 release blog.
+# ---- PyTorch 2.10.0 stack (cu130 wheels) -----------------------------------
+# Single index, matched ABI across torch / torchvision / torchaudio. cu130
+# unlocks ComfyUI's `comfy_kitchen` CUDA backend (FP8 scaled matmul on
+# Blackwell sm_120) — gated by `torch.version.cuda >= (13,)` in
+# comfy/quant_ops.py. Without this, FP8 LTX-2.3 weights are silently
+# dequantized to BF16 at every matmul, costing ~30-50% throughput on the
+# diffusion hot path (per ComfyUI Blackwell discussion #6643).
 RUN uv pip install --system --break-system-packages --no-cache \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        'torch==2.8.0' 'torchvision==0.23.0' 'torchaudio==2.8.0'
+        --index-url https://download.pytorch.org/whl/cu130 \
+        'torch==2.10.0' 'torchvision==0.25.0' 'torchaudio==2.10.0'
 
 # ---- Install project dependencies ------------------------------------------
 COPY pyproject.toml /app/pyproject.toml
@@ -43,11 +50,12 @@ RUN uv pip install --system --break-system-packages --no-cache /app
 
 # ---- Boot-blocker assertions -----------------------------------------------
 # Verify (1) anyio is current enough for httpx_ws (4.9+), (2) torch is the
-# cu128 build, and (3) the wheel ships kernels (or PTX) for Blackwell
-# workstation GPUs. The arch check is the load-bearing one: it catches a
+# cu130 build (NOT cu128 — the FP8 backend gate trips at cu < 13), and (3) the
+# wheel ships kernels (or PTX) for Blackwell sm_120. The arch check catches a
 # regression or wrong-index install at build time, in GHA, with no GPU.
-# Accepted: sm_122, sm_120 (binary kernels) or compute_122 / compute_120 (PTX
-# that JITs forward to sm_122 at first kernel launch on RTX PRO 6000).
+# Accepted: sm_120 (binary) or compute_120 (PTX; JITs at first kernel launch
+# on RTX PRO 6000 Blackwell). sm_122 / compute_122 also accepted defensively
+# in case NVIDIA ships a re-tagged variant.
 #
 # Why _C._cuda_getArchFlags() and not torch.cuda.get_arch_list()?
 # get_arch_list() gates on torch.cuda.is_available(), which returns False on
@@ -58,8 +66,8 @@ RUN uv pip install --system --break-system-packages --no-cache /app
 RUN python -c "\
 import importlib.metadata as m, anyio, numpy, torch, torchvision; \
 assert hasattr(anyio, 'AsyncContextManagerMixin'), f'anyio too old: {m.version(\"anyio\")}'; \
-assert torch.__version__.startswith('2.8.'), f'expected torch 2.8.x; got {torch.__version__}'; \
-assert torch.version.cuda and torch.version.cuda.startswith('12.'), f'expected CUDA 12.x runtime; got {torch.version.cuda}'; \
+assert torch.__version__.startswith('2.10.'), f'expected torch 2.10.x; got {torch.__version__}'; \
+assert torch.version.cuda and torch.version.cuda.startswith('13.'), f'expected CUDA 13.x runtime (cu130 wheel); got {torch.version.cuda}'; \
 arch_flags = torch._C._cuda_getArchFlags() or ''; \
 arch_list = arch_flags.split(); \
 needed = ('sm_122', 'compute_122', 'sm_120', 'compute_120'); \
@@ -72,7 +80,7 @@ print('anyio', m.version('anyio'), '/ torch', torch.__version__, '/ cuda', torch
 # The pipeline runs real ComfyUI **core** node classes — no ComfyUI-LTXVideo.
 # Clone (not pip-install) so the SHA is pinnable. Strip torch / torchvision /
 # torchaudio / numpy / transformers / diffusers / Pillow from ComfyUI's
-# requirements so our pinned cu128 wheels survive.
+# requirements so our pinned cu130 wheels survive.
 ARG COMFYUI_SHA=64b8457f55cd7fb54ca7a956d9c73b505e903e0c
 RUN git init /app/ComfyUI \
     && git -C /app/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
@@ -84,10 +92,22 @@ RUN git init /app/ComfyUI \
         -r /app/ComfyUI/requirements.txt \
     && python -c "\
 import torch, torchvision, torchaudio; \
-assert torch.__version__.startswith('2.8.'), f'torch clobbered by ComfyUI install: {torch.__version__}'; \
+assert torch.__version__.startswith('2.10.'), f'torch clobbered by ComfyUI install: {torch.__version__}'; \
 torchvision.ops.nms; \
 print('stack intact after ComfyUI install — torch', torch.__version__, '/ torchaudio', torchaudio.__version__)"
 ENV COMFYUI_PATH=/app/ComfyUI
+
+# ---- ComfyUI FP8 backend gate verification ---------------------------------
+# Verify cu130 actually unlocked ComfyUI's comfy_kitchen CUDA backend.
+# ComfyUI's comfy/quant_ops.py disables the 'cuda' backend (and logs the
+# "You need pytorch with cu130 or higher" warning) when torch.version.cuda is
+# < (13,). With our cu130 wheel this should pass; if it doesn't, the install
+# regressed and we'd silently run on BF16 dequant — same as the cu128 build.
+RUN python -c "\
+import torch; \
+cv = tuple(map(int, str(torch.version.cuda).split('.'))); \
+assert cv >= (13, 0), f'torch CUDA runtime is {torch.version.cuda} — must be >= 13.0 for ComfyUI FP8 backend'; \
+print('FP8 backend gate cleared — torch.version.cuda =', torch.version.cuda, '(>= 13.0)')"
 
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
