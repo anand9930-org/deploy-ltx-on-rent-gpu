@@ -94,29 +94,23 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     #                           resident; we never want model_management
     #                           swapping weights between requests.
     #   --reserve-vram 2        Keep ~2 GB headroom for transient allocations.
-    #   --fast fp8_matrix_mult  Route FP8 weights through torch._scaled_mm
-    #                           (cuBLAS FP8 scaled matmul) instead of
-    #                           dequantizing to BF16 at every matmul. LTX-2.3
-    #                           ships as FP8 — this is the *correct* compute
-    #                           path, not a precision-lossy hack. Works on
-    #                           cu128 + sm_120 (RTX PRO 6000 Blackwell);
-    #                           ComfyUI auto-falls-back to BF16 if
-    #                           _scaled_mm errors at runtime, so the flag is
-    #                           strictly an opt-in for the fast path with no
-    #                           crash risk. ComfyUI's separate `comfy_kitchen`
-    #                           CUDA backend (cuda_version >= (13,) gate in
-    #                           comfy/quant_ops.py) requires cu130 and is the
-    #                           future-work upgrade gated on RunPod fleet
-    #                           moving to driver 580+.
+    #
+    # `--fast fp8_matrix_mult` was tried in Phase 1.6d (commit e27c941) for a
+    # ~16% speedup on the FP8 matmul path, then rolled back in Phase 1.6g after
+    # live verification showed it regresses I2V image conditioning at frame
+    # counts >= 241. The flag routes activations through torch._scaled_mm with
+    # a per-tensor FP8 cast (E4M3fn, range ~[6e-8, 448]); at longer sequence
+    # lengths the activation dynamic range saturates and cross-attention loses
+    # the image-conditioning signal — the model "free-runs" from the prompt.
+    # The proper future-work FP8 path is cu130 + ComfyUI's `comfy_kitchen` CUDA
+    # backend (gated at `torch.version.cuda >= (13,)` in comfy/quant_ops.py),
+    # which has per-module FP8 enable lists that skip cross-attention. Gated
+    # on RunPod fleet driver upgrade to 580+.
     #
     # The build-time node-contract check (cpu_only=True) doesn't load weights,
     # so these flags are no-ops there — keep the clean argv to avoid surprises.
     saved_argv = sys.argv
-    sys.argv = (
-        ["comfyui"]
-        if cpu_only
-        else ["comfyui", "--highvram", "--reserve-vram", "2", "--fast", "fp8_matrix_mult"]
-    )
+    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--highvram", "--reserve-vram", "2"]
     try:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
