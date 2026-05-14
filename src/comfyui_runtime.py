@@ -85,8 +85,20 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
 
     # ComfyUI's cli_args parses sys.argv at first import; under `bentoml serve`
     # that's the wrong argv. Feed a clean one for the duration of the bootstrap.
+    #
+    # On the runtime path (cpu_only=False), inject:
+    #   --highvram        Disable ComfyUI's dynamic model offload (see
+    #                     comfy/cli_args.py and comfy/model_management.py::
+    #                     enables_dynamic_vram). The 96 GB RTX PRO 6000
+    #                     Blackwell fits the entire ~64 GB cascade resident; we
+    #                     never want model_management swapping weights between
+    #                     requests.
+    #   --reserve-vram 2  Keep ~2 GB headroom for transient allocations.
+    #
+    # The build-time node-contract check (cpu_only=True) doesn't load weights,
+    # so these flags are no-ops there — keep the clean argv to avoid surprises.
     saved_argv = sys.argv
-    sys.argv = ["comfyui"]
+    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--highvram", "--reserve-vram", "2"]
     try:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
