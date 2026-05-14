@@ -13,16 +13,18 @@
 # fleet rolls forward to driver 580+ (likely once 580 becomes the production
 # branch later in 2026).
 #
-# FP8 perf is preserved via ComfyUI's `--fast fp8_matrix_mult` flag, which
-# routes FP8 weights through `torch._scaled_mm` (cuBLAS-backed FP8 scaled
-# matmul, supports sm_120 on cu128). Without this flag, ComfyUI dequantizes
-# the LTX-2.3 FP8 weights to BF16 at every matmul. ComfyUI auto-falls-back
-# to BF16 if `_scaled_mm` errors at runtime — so the flag is strictly an
-# opt-in for the fast path, never a crash risk.
+# FP8 weights in LTX-2.3 are dequantized to BF16 at every matmul on this
+# cu128 stack. Phase 1.6d tried recovering the FP8 fast path via ComfyUI's
+# `--fast fp8_matrix_mult` flag (torch._scaled_mm); rolled back in Phase 1.6g
+# after live verification found it regresses I2V image conditioning at frame
+# counts >= 241 (per-tensor FP8 activation cast saturates cross-attention).
+# See src/comfyui_runtime.py for the full rationale.
 #
 # Future-work: when RunPod's fleet upgrades to driver 580+, revisit cu130 to
 # unlock ComfyUI's `comfy_kitchen` CUDA backend (FP8 path gated by
-# `cuda_version >= (13,)` in comfy/quant_ops.py).
+# `cuda_version >= (13,)` in comfy/quant_ops.py). That path has per-module
+# FP8 enable lists that skip cross-attention, avoiding the regression we hit
+# with the blanket `--fast fp8_matrix_mult` flag.
 # ============================================================================
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
