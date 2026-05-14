@@ -10,6 +10,8 @@ local ``.env``.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +33,20 @@ class Settings(BaseSettings):
 
     # ── ComfyUI graph runtime ───────────────────────────────────────────
     comfyui_path: str = "/app/ComfyUI"
+
+    # ── SageAttention (opt-in) ──────────────────────────────────────────
+    # Master switch. Default OFF; flipping SAGE_ATTENTION=1 in the pod env
+    # makes bootstrap_once monkey-patch comfy.ldm.modules.attention to use
+    # an explicit Blackwell-safe SageAttention CUDA kernel (avoids the
+    # auto-dispatcher's Triton path implicated in Comfy-Org/ComfyUI#11583).
+    sage_attention: bool = False
+    # Selects which CUDA kernel the monkey-patch installs.
+    #   "int8" → sageattn_qk_int8_pv_fp16_cuda  (conservative; best match
+    #            against the Phase 1.6d failure mode — per-block INT8 with
+    #            K-smoothing, ~10× FP8 E4M3 headroom in QK).
+    #   "fp8"  → sageattn_qk_int8_pv_fp8_cuda   (faster, but FP8 PV stage
+    #            carries residual cross-attention risk on long sequences).
+    sage_attention_kernel: Literal["int8", "fp8"] = "int8"
 
     # ── Supabase Storage ────────────────────────────────────────────────
     supabase_url: str | None = None

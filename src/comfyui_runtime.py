@@ -146,6 +146,8 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
         folder_paths.set_output_directory(tempfile.mkdtemp(prefix="comfyui_out_"))
         if hasattr(folder_paths, "set_temp_directory"):
             folder_paths.set_temp_directory(tempfile.mkdtemp(prefix="comfyui_tmp_"))
+
+        _maybe_install_sage_attention(cpu_only=cpu_only)
     finally:
         sys.argv = saved_argv
 
@@ -154,6 +156,69 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
         "ComfyUI runtime bootstrapped: path=%s, models=%s, input_dir=%s, cpu_only=%s",
         comfyui_path, model_dir, _input_dir, cpu_only,
     )
+
+
+def _maybe_install_sage_attention(cpu_only: bool) -> None:
+    """Replace ComfyUI's attention dispatcher with an explicit SageAttention
+    Blackwell-safe CUDA kernel when ``SAGE_ATTENTION=1``. No-op otherwise.
+
+    Two-step force:
+
+    1. Replace ``sageattention.sageattn`` so ComfyUI's
+       ``from sageattention import sageattn`` captures our explicit CUDA kernel.
+       This sidesteps SageAttention's internal auto-dispatcher, which on Blackwell
+       can pick the Triton backend (the alleged black-frame path in
+       Comfy-Org/ComfyUI discussion #11583).
+
+    2. Flip ``comfy.cli_args.args.use_sage_attention = True`` so attention.py's
+       module-level dispatcher binds ``optimized_attention[_masked] = attention_sage``
+       when it is first imported (lazily, at model-construction time).
+
+    Fail-loud philosophy: if the env var asks for SageAttention but the package
+    or the requested kernel isn't available, raise at bootstrap rather than fall
+    back silently. Silent fallback is the Phase 1.6d failure mode we avoid here.
+    """
+    from src.config import get_settings  # local import: keep this module
+                                          # importable without pydantic_settings.
+
+    settings = get_settings()
+    if not settings.sage_attention:
+        return
+    if cpu_only:
+        logger.info("SAGE_ATTENTION=1 but cpu_only=True; skipping (CUDA kernel)")
+        return
+
+    import sageattention
+
+    kernel_name = settings.sage_attention_kernel.lower()
+    if kernel_name == "int8":
+        kernel = sageattention.sageattn_qk_int8_pv_fp16_cuda
+    elif kernel_name == "fp8":
+        # sm_120-capable kernel (no `_sm90` suffix; `_sm90` is Hopper-only).
+        kernel = sageattention.sageattn_qk_int8_pv_fp8_cuda
+    else:
+        # pydantic-settings validates the Literal, so this branch is unreachable
+        # unless someone instantiates Settings directly with an off-Literal value.
+        raise ValueError(
+            f"SAGE_ATTENTION_KERNEL={kernel_name!r}; expected 'int8' or 'fp8'"
+        )
+
+    sageattention.sageattn = kernel
+
+    import comfy.cli_args
+
+    comfy.cli_args.args.use_sage_attention = True
+
+    # Defensive: if comfy.ldm.modules.attention was already imported (e.g., by a
+    # future ComfyUI bump that pulls it in during node setup), rebind in place.
+    attn_mod = sys.modules.get("comfy.ldm.modules.attention")
+    if attn_mod is not None:
+        attn_mod.sageattn = kernel
+        if hasattr(attn_mod, "attention_sage"):
+            attn_mod.optimized_attention = attn_mod.attention_sage
+            attn_mod.optimized_attention_masked = attn_mod.attention_sage
+
+    logger.info("SageAttention installed (kernel=%s)", kernel_name)
 
 
 def is_bootstrapped() -> bool:

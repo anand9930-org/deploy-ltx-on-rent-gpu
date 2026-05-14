@@ -109,6 +109,33 @@ torchvision.ops.nms; \
 print('stack intact after ComfyUI install — torch', torch.__version__, '/ torchaudio', torchaudio.__version__)"
 ENV COMFYUI_PATH=/app/ComfyUI
 
+# ---- SageAttention (optional, gated by SAGE_ATTENTION env var at runtime) --
+# Built from source — no Linux wheel exists on PyPI for sm_120. The compiled
+# extension adds ~80 MB to the image; the import has zero runtime cost when
+# SAGE_ATTENTION is unset/0, so this layer is safe to bake in across all pods.
+# Flipping SAGE_ATTENTION=1 in a pod env makes bootstrap_once monkey-patch
+# comfy.ldm.modules.attention to use an explicit Blackwell-safe CUDA kernel
+# (sageattn_qk_int8_pv_fp16_cuda by default, or sageattn_qk_int8_pv_fp8_cuda
+# if SAGE_ATTENTION_KERNEL=fp8). See src/comfyui_runtime.py for the
+# monkey-patch rationale and Comfy-Org/ComfyUI#11583 for why we avoid
+# SageAttention's auto-dispatcher.
+#
+# Pinned SHA d1a57a5 (main as of 2026-01-17). thu-ml/SageAttention upstream
+# officially supports sm_120 (setup.py: SUPPORTED_ARCHS includes "12.0",
+# CUDA >= 12.8 gate per issue #219). TORCH_CUDA_ARCH_LIST scopes the build
+# to Blackwell only — Ampere/Hopper SASS would just bloat the image.
+ARG SAGEATTENTION_SHA=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
+RUN TORCH_CUDA_ARCH_LIST="12.0+PTX" \
+    MAX_JOBS=4 \
+    NVCC_THREADS=8 \
+    uv pip install --system --break-system-packages --no-cache --no-build-isolation \
+        "git+https://github.com/thu-ml/SageAttention.git@${SAGEATTENTION_SHA}"
+RUN python -c "\
+import sageattention; \
+assert hasattr(sageattention, 'sageattn_qk_int8_pv_fp16_cuda'), 'int8 kernel missing'; \
+assert hasattr(sageattention, 'sageattn_qk_int8_pv_fp8_cuda'), 'fp8 kernel missing'; \
+print('sageattention', getattr(sageattention, '__version__', '(no __version__)'), '— int8+fp8 kernels present')"
+
 # ---- Copy application code -------------------------------------------------
 COPY src/ /app/src/
 COPY service.py /app/service.py
