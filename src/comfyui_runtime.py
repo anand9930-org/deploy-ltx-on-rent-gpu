@@ -87,18 +87,36 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     # that's the wrong argv. Feed a clean one for the duration of the bootstrap.
     #
     # On the runtime path (cpu_only=False), inject:
-    #   --highvram        Disable ComfyUI's dynamic model offload (see
-    #                     comfy/cli_args.py and comfy/model_management.py::
-    #                     enables_dynamic_vram). The 96 GB RTX PRO 6000
-    #                     Blackwell fits the entire ~64 GB cascade resident; we
-    #                     never want model_management swapping weights between
-    #                     requests.
-    #   --reserve-vram 2  Keep ~2 GB headroom for transient allocations.
+    #   --highvram              Disable ComfyUI's dynamic model offload (see
+    #                           comfy/cli_args.py and comfy/model_management.py::
+    #                           enables_dynamic_vram). The 96 GB RTX PRO 6000
+    #                           Blackwell fits the entire ~64 GB cascade
+    #                           resident; we never want model_management
+    #                           swapping weights between requests.
+    #   --reserve-vram 2        Keep ~2 GB headroom for transient allocations.
+    #   --fast fp8_matrix_mult  Route FP8 weights through torch._scaled_mm
+    #                           (cuBLAS FP8 scaled matmul) instead of
+    #                           dequantizing to BF16 at every matmul. LTX-2.3
+    #                           ships as FP8 — this is the *correct* compute
+    #                           path, not a precision-lossy hack. Works on
+    #                           cu128 + sm_120 (RTX PRO 6000 Blackwell);
+    #                           ComfyUI auto-falls-back to BF16 if
+    #                           _scaled_mm errors at runtime, so the flag is
+    #                           strictly an opt-in for the fast path with no
+    #                           crash risk. ComfyUI's separate `comfy_kitchen`
+    #                           CUDA backend (cuda_version >= (13,) gate in
+    #                           comfy/quant_ops.py) requires cu130 and is the
+    #                           future-work upgrade gated on RunPod fleet
+    #                           moving to driver 580+.
     #
     # The build-time node-contract check (cpu_only=True) doesn't load weights,
     # so these flags are no-ops there — keep the clean argv to avoid surprises.
     saved_argv = sys.argv
-    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--highvram", "--reserve-vram", "2"]
+    sys.argv = (
+        ["comfyui"]
+        if cpu_only
+        else ["comfyui", "--highvram", "--reserve-vram", "2", "--fast", "fp8_matrix_mult"]
+    )
     try:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
