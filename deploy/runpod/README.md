@@ -15,7 +15,7 @@ export RUNPOD_API_KEY=your_key   # from https://www.runpod.io/console/user/setti
 
 This will:
 1. Create a 100GB network volume (first time only, $7/month)
-2. Deploy an RTX 4090 pod with the volume mounted
+2. Deploy an RTX PRO 6000 Blackwell Server Edition pod (96 GB, sm_122) with the volume mounted
 3. Download models on first boot (~15 min), cached on subsequent boots (~1 min)
 4. Print the HTTPS endpoint when ready
 
@@ -31,10 +31,12 @@ See [CLAUDE.md](CLAUDE.md) for step-by-step CLI commands.
 
 ## Cost
 
+Live pricing varies — run `runpodctl gpu list | grep -i 6000` for the current rate
+before committing. Storage is unchanged from RTX 4090 era.
+
 | Usage | Cost |
 |-------|------|
-| Single 4-hour session | ~$2.36 |
 | Storage (monthly) | $7.00 |
-| Always-on (monthly) | ~$425 |
+| GPU rate | check `runpodctl gpu list` |
 
-RTX 4090 on Secure Cloud: $0.59/hr (required for network volumes).
+RTX PRO 6000 Blackwell Server Edition on Secure Cloud (required for network volumes).

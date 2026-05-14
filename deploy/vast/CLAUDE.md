@@ -12,7 +12,7 @@ vastai set api-key YOUR_API_KEY
 Volumes are **machine-bound** — they persist across instance restarts but only work on the same physical machine.
 
 ```bash
-# Search for volume offers (look for Norway host_id 1276, or pick any machine)
+# Search for volume offers on any machine with enough disk
 vastai search volumes "disk_space>100"
 
 # Create an 100GB volume (pick an offer_id from the search above)
@@ -24,11 +24,16 @@ vastai show volumes
 
 Save the volume name (`ltx-models`) — you'll use it in every instance creation.
 
-## 2. Find an RTX 4090 on the Same Machine
+## 2. Find an RTX 6000 Pro Blackwell on the Same Machine
 
 ```bash
-# Search for RTX 4090 offers — filter by the same machine as your volume
-vastai search offers 'gpu_name=RTX_4090 gpu_ram>=23 disk_space>=50 inet_down>=200 reliability>0.95' -o 'dph_total'
+# IMPORTANT: Vast's exact gpu_name identifier for RTX 6000 Pro Blackwell is
+# unverified at the time of writing. Run a broad search first to discover the
+# identifier — likely "RTX_6000_Blackwell", "RTX_PRO_6000", or similar:
+vastai search offers 'gpu_ram>=95' -o 'dph_total' | head -20
+
+# Then narrow with the right identifier — example:
+vastai search offers 'gpu_name=RTX_6000_Blackwell gpu_ram>=95 disk_space>=70 inet_down>=200 reliability>0.95' -o 'dph_total'
 ```
 
 Pick an offer on the **same machine_id** where you created the volume.
@@ -38,7 +43,7 @@ Pick an offer on the **same machine_id** where you created the volume.
 ```bash
 # Full command with all env vars and volume mounted at /models
 vastai create instance <OFFER_ID> \
-  --image anand9930/ltx-video:latest \
+  --image anand9930/ltx-video-blackwell:latest \
   --env "-p 8000:8000 \
     -e HF_TOKEN=$HF_TOKEN \
     -e MODEL_DIR=/models \
@@ -134,7 +139,7 @@ vastai show volumes
 
 | What | Command |
 |------|---------|
-| Search GPUs | `vastai search offers 'gpu_name=RTX_4090 ...' -o 'dph_total'` |
+| Search GPUs | `vastai search offers 'gpu_ram>=95 ...' -o 'dph_total'` (discover Blackwell `gpu_name`) |
 | Search volumes | `vastai search volumes "disk_space>100"` |
 | Create volume | `vastai create volume <ID> -s 100 -n ltx-models` |
 | Create instance | See step 3 above |
@@ -144,14 +149,3 @@ vastai show volumes
 | Destroy (keep volume) | `vastai destroy instance <ID>` |
 | Delete volume | `vastai delete volume --template-id <ID>` |
 
-## Norway Machines (Proven Reliable)
-
-These Norway machines (host_id 1276) have worked reliably in testing:
-
-| Offer Pattern | Machine | VRAM | Speed |
-|--------------|---------|------|-------|
-| `machine_id=838` | Norway 1x RTX 4090 | 24GB | ~800 Mbps |
-| `machine_id=4905` | Norway 1x RTX 4090 | 24GB | ~860 Mbps |
-| `machine_id=8328` | Norway 1x RTX 4090 | 24GB | ~875 Mbps |
-
-Filter for these: `vastai search offers 'gpu_name=RTX_4090 reliability>0.95' -o 'dph_total' | grep Norway`

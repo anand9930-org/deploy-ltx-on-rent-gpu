@@ -11,13 +11,21 @@ echo "MODEL_DIR=${MODEL_DIR:-/models}"
 echo "COMFYUI_PATH=${COMFYUI_PATH}"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'not available')"
 
-# Download models (idempotent — skips if already present).
-# Module form (`-m src.download_models`) is load-bearing: the script-form
-# `python3 /app/src/download_models.py` puts /app/src/ on sys.path instead
-# of /app, breaking `from src.config import get_settings` (added in the
-# pydantic-settings refactor). WORKDIR=/app in the Dockerfile makes the
-# module form resolve correctly without an explicit PYTHONPATH.
+# Boot-time diagnostic: print image build requirements vs host machine
+# specs, then verdict. Uses nvidia-smi (NVML) for host inspection — does NOT
+# trigger torch.cuda._lazy_init, so a driver/runtime mismatch surfaces as a
+# clear "DRIVER TOO OLD: image needs CUDA X.Y+, host supports CUDA A.B max"
+# verdict in the log instead of a Python traceback. Exits 2 on driver
+# mismatch, 3 on unsupported compute capability — both cases are caught by
+# the script's `set -e` and propagate cleanly to the container exit code.
+#
+# `cd /app` lands us where `src.diagnostics` resolves (WORKDIR=/app in the
+# Dockerfile). Module form is preferred over script-form for the same
+# sys.path reason that `python3 -m src.download_models` is below.
 cd /app
+python3 -u -m src.diagnostics
+
+# Download models (idempotent — skips if already present).
 echo "=== Checking/downloading models ==="
 python3 -u -m src.download_models
 
