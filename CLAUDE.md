@@ -2,7 +2,7 @@
 
 LTX-2.3 22B BentoML video-generation service. NVIDIA CUDA + ComfyUI graph pipeline.
 
-> **Branch `feature/RTX-6000-pro-deployment`**: retargets to RTX PRO 6000 Blackwell Server Edition (96 GB, sm_122) on `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` + stable PyTorch 2.8.0 (cu128). H100/Hopper / NGC PyTorch path lives on `main`.
+> **Branch `feature/RTX-6000-pro-deployment`**: retargets to RTX PRO 6000 Blackwell Server Edition (96 GB, **sm_120** — verified live; earlier docs said sm_122 but the actual `torch.cuda.get_device_capability()` returns `(12, 0)`) on `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` + stable PyTorch **2.10.0 (cu130)**. cu130 unlocks ComfyUI's `comfy_kitchen` FP8 scaled matmul backend (gated at `torch.version.cuda >= (13,)`); without it LTX-2.3's FP8 weights are silently dequantized to BF16 each matmul. ComfyUI runs with `--highvram --reserve-vram 2`. H100/Hopper / NGC PyTorch path lives on `main`.
 
 ## Project layout
 
