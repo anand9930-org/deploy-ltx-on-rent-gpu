@@ -39,8 +39,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # wheels so no pyenv / deadsnakes needed. uv handles pip with cache discipline.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv \
-        ffmpeg git git-lfs gcc curl ca-certificates \
+        python3 python3-pip python3-venv python3-dev \
+        ffmpeg git git-lfs gcc ninja-build curl ca-certificates \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
@@ -110,6 +110,12 @@ print('stack intact after ComfyUI install — torch', torch.__version__, '/ torc
 ENV COMFYUI_PATH=/app/ComfyUI
 
 # ---- SageAttention (optional, gated by SAGE_ATTENTION env var at runtime) --
+# Build deps: requires python3-dev (Python.h) and ninja-build in the system
+# apt install above. Without ninja the distutils fallback misroutes cxx
+# flags to nvcc for CUDAExtension .cpp sources → 'nvcc fatal: Unknown option
+# -fopenmp'. Both are added at the apt-get install layer alongside other
+# system deps so this layer doesn't need its own apt step.
+#
 # Built from source — no Linux wheel exists on PyPI for sm_120. The compiled
 # extension adds ~80 MB to the image; the import has zero runtime cost when
 # SAGE_ATTENTION is unset/0, so this layer is safe to bake in across all pods.
