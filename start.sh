@@ -12,21 +12,24 @@ echo "COMFYUI_PATH=${COMFYUI_PATH}"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'not available')"
 
 # Verify the GPU compute capability before any 63 GB download.
-# This branch targets RTX PRO 6000 Blackwell (sm_122). Non-target Blackwell or
-# Hopper pass through with a warning; pre-Hopper hard-fails.
+# This branch targets RTX PRO 6000 Blackwell (sm_120). The RTX PRO 6000
+# Blackwell Server *and* Workstation Editions report cap == (12, 0); the
+# pytorch/pytorch#157549 issue's "SM122" label was misleading (verified live
+# against the actual hardware). Non-Blackwell GPUs pass with a warning;
+# pre-Hopper hard-fails.
 python3 -c "
 import torch
 cap = torch.cuda.get_device_capability()
 name = torch.cuda.get_device_name()
 print(f'GPU: {name}, compute capability sm_{cap[0]}{cap[1]}')
-if cap == (12, 2):
-    print('RTX PRO 6000 Blackwell detected (sm_122) — expected target')
-elif cap == (12, 0):
-    print('Consumer Blackwell detected (sm_120) — RTX 50 series, not the primary target for this branch')
+if cap == (12, 0):
+    print('Blackwell sm_120 detected — RTX PRO 6000 Blackwell or RTX 50 series (expected target on this branch)')
+elif cap[0] == 12:
+    print(f'Other Blackwell variant sm_{cap[0]}{cap[1]} detected — should still run')
 elif cap[0] >= 9:
     print(f'Non-Blackwell GPU sm_{cap[0]}{cap[1]} — this branch is Blackwell-tuned but should still run')
 else:
-    raise SystemExit(f'Unsupported GPU sm_{cap[0]}{cap[1]} — this branch targets Blackwell sm_122')
+    raise SystemExit(f'Unsupported GPU sm_{cap[0]}{cap[1]} — this branch targets Blackwell sm_120')
 "
 
 # Download models (idempotent — skips if already present).
