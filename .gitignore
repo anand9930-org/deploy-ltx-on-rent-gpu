@@ -10,3 +10,9 @@ LTX-2-ref/
 # locally for cross-referencing but is unused at runtime — core nodes only.)
 ComfyUI-ref/
 .DS_Store
+
+# deploy/gpuhub bootstrap helpers — kept local-only because they carry
+# hardcoded HF / Supabase / R2 tokens. Edit locally, scp to a pod to test.
+# Restore content from /tmp/*.preserved if you accidentally delete them.
+deploy/gpuhub/bootstrap.sh
+deploy/gpuhub/hf_download_to_fs_system.sh
