@@ -55,7 +55,15 @@ class LTXVideoGenerator(TripleStagesComfyUIMixin):
         self._build_triple_stages_comfyui()
         self._active_mode = mode
 
-    @torch.inference_mode()
+    # @torch.no_grad() (not @torch.inference_mode()) — torch 2.11+ rejects
+    # wrapping inference tensors in nn.Parameter, and ComfyUI's lazy
+    # first-request GPU model upload (model_management.partially_load -> .to())
+    # goes through `torch.nn.Parameter(p, requires_grad=False)` on every moved
+    # FP8 weight. inference_mode would mark those tensors as inference tensors,
+    # then Parameter.__new__ would fail with "Cannot set version_counter for
+    # inference tensor". no_grad has the same gradient-tracking-off semantics
+    # without the inference-tensor marking.
+    @torch.no_grad()
     def generate(
         self,
         prompt: str,
