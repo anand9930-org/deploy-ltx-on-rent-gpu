@@ -54,6 +54,37 @@ _input_dir: str | None = None
 _MODEL_FOLDERS_AT_ROOT = ("checkpoints", "loras", "latent_upscale_models")
 
 
+def _patch_comfyui_vae_inplace(comfyui_path: str) -> None:
+    """Workaround for ComfyUI PR #13028 (commit 735a046, 2026-03-18) which
+    introduced in-place ops on a tensor returned from ComfyUI's internal
+    ``torch.inference_mode()`` block at ``comfy/sd.py`` line ~95. On torch
+    2.10+ that combination raises::
+
+        RuntimeError: Inplace update to inference tensor outside InferenceMode
+                      is not allowed.
+
+    during VAE decode. We rewrite the expression to its non-in-place pre-#13028
+    form (``torch.clamp((image + 1.0) / 2.0, 0.0, 1.0)``). The ~3 GB peak-RAM
+    regression per PR #13028's own profiling is negligible on the 96 GB
+    Blackwell pod. Must run BEFORE any ``comfy.*`` import — Python caches
+    modules in ``sys.modules`` after first import, so modifying the .py file
+    afterward has no effect on this process. Idempotent: a second call finds
+    the BAD pattern already gone and returns silently.
+    """
+    sd_py = os.path.join(comfyui_path, "comfy", "sd.py")
+    if not os.path.isfile(sd_py):
+        return  # let the natural import-time error surface
+    bad = "image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)"
+    good = "torch.clamp((image + 1.0) / 2.0, 0.0, 1.0)"
+    with open(sd_py, "r", encoding="utf-8") as f:
+        src = f.read()
+    if bad not in src:
+        return  # already patched OR upstream changed the pattern
+    with open(sd_py, "w", encoding="utf-8") as f:
+        f.write(src.replace(bad, good))
+    logger.info("Patched %s: in-place VAE post-process -> non-in-place clamp", sd_py)
+
+
 def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) -> None:
     """Make the cloned ComfyUI checkout importable and point ``folder_paths``
     at the model dir + temp input/output dirs. Idempotent.
@@ -78,6 +109,9 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
             f"COMFYUI_PATH={comfyui_path!r} is not a directory — the ComfyUI "
             "checkout is missing from the image (see Dockerfile)."
         )
+
+    # Patch comfy/sd.py BEFORE any comfy.* import (see helper docstring for why).
+    _patch_comfyui_vae_inplace(comfyui_path)
 
     # Put the cloned ComfyUI checkout on sys.path BEFORE any comfy import.
     if comfyui_path not in sys.path:
