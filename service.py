@@ -7,6 +7,7 @@ an image is supplied).
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -120,8 +121,14 @@ class LTXVideoService:
         }
 
         if upload_to_supabase and storage.is_configured():
+            _t_upload = time.perf_counter()
             response["video_url"] = storage.upload_video(
                 result["output_path"], result["output_filename"],
+            )
+            logger.info(
+                "Supabase upload %.2fs (%s)",
+                time.perf_counter() - _t_upload,
+                result["output_filename"],
             )
             try:
                 os.remove(result["output_path"])

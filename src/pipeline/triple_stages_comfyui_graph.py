@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from collections.abc import Iterator
 from typing import Any, NamedTuple
@@ -335,11 +336,26 @@ class TripleStagesComfyUIGraphPipeline:
                 "for the 4×-chain (Stage 1 = final/4 must be a multiple of the VAE's 32)."
             )
 
+        # CUDA-synchronized clock for per-stage timing. CUDA kernel launches return
+        # immediately to Python; without sync, perf_counter would credit kernel work
+        # to whichever section followed it. Sync inserts a single GPU-side fence per
+        # boundary — negligible cost on this cascade since stages are strictly
+        # sequential (no overlap to forfeit).
+        import torch
+
+        def _now() -> float:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        timings: dict[str, float] = {}
+
         seed_1, seed_2, seed_3 = _derive_stage_seeds(seed)
 
         # ── Image: stage into ComfyUI's input dir, LoadImage → ResizeImageMaskNode.
         # T2V (no image) → a neutral-gray placeholder (the workflow is fundamentally
         # I2V; LoadImage → ResizeImageMaskNode → LTXVImgToVideoConditionOnly always run).
+        _t = _now()
         image_name = self._stage_input_image(images, width, height)
         (loaded_image, _mask) = _invoke(self._n["LoadImage"], image=image_name)
         # ResizeImageMaskNode is V3 with a DynamicCombo `resize_type` — execute() wants
@@ -352,8 +368,10 @@ class TripleStagesComfyUIGraphPipeline:
             scale_method="lanczos",
             resize_type={"resize_type": "scale longer dimension", "longer_size": COMFY_IMAGE_LONGER_DIM},
         )
+        timings["image_prep"] = _now() - _t
 
         # ── Text conditioning.
+        _t = _now()
         (pos_cond,) = _invoke(self._n["CLIPTextEncode"], text=prompt, clip=self._clip)
         (neg_cond,) = _invoke(self._n["CLIPTextEncode"], text=negative_prompt, clip=self._clip)
         ltxv_pos, ltxv_neg = _invoke(
@@ -362,17 +380,21 @@ class TripleStagesComfyUIGraphPipeline:
         (guider,) = _invoke(
             self._n["CFGGuider"], cfg=COMFY_CFG, model=self._model, positive=ltxv_pos, negative=ltxv_neg,
         )
+        timings["text_encode"] = _now() - _t
 
         # ── Audio (empty latent, threaded through all stages). The workflow uses
         # LTXVideo's LTXFloatToInt(a) — its body is literally `round(a)`; inlined
         # here so we don't pull in ComfyUI-LTXVideo for one trivial node.
+        _t = _now()
         frame_rate_int = round(frame_rate)
         (empty_audio,) = _invoke(
             self._n["LTXVEmptyLatentAudio"],
             frames_number=num_frames, frame_rate=frame_rate_int, batch_size=1, audio_vae=self._audio_vae,
         )
+        timings["audio_init"] = _now() - _t
 
         # ── Stage 1 — final/4, euler_ancestral_cfg_pp, CRF-18 image preprocess.
+        _t = _now()
         (preprocessed,) = _invoke(self._n["LTXVPreprocess"], img_compression=COMFY_STAGE_1_IMAGE_CRF, image=resized_image)
         (empty_latent,) = _invoke(
             self._n["EmptyLTXVLatentVideo"],
@@ -384,26 +406,45 @@ class TripleStagesComfyUIGraphPipeline:
             video_cond_latent=cond_1, audio_latent=empty_audio, guider=guider,
             sampler_name=COMFY_STAGE_1_SAMPLER, sigmas=COMFY_STAGE_1_SIGMAS, seed=seed_1,
         )
+        timings["stage_1"] = _now() - _t
 
         # ── Stage 2 — final/2, euler_cfg_pp, image re-conditioned (no preprocess).
+        _t = _now()
         cond_2 = self._img_cond(image=resized_image, latent=self._upscale(video_1))
         video_2, audio_2 = self._denoise_stage(
             video_cond_latent=cond_2, audio_latent=audio_1, guider=guider,
             sampler_name=COMFY_STAGE_23_SAMPLER, sigmas=COMFY_STAGE_23_SIGMAS, seed=seed_2,
         )
+        timings["stage_2"] = _now() - _t
 
         # ── Stage 3 — final res, euler_cfg_pp, image re-conditioned (no preprocess).
+        _t = _now()
         cond_3 = self._img_cond(image=resized_image, latent=self._upscale(video_2))
         video_3, audio_3 = self._denoise_stage(
             video_cond_latent=cond_3, audio_latent=audio_2, guider=guider,
             sampler_name=COMFY_STAGE_23_SAMPLER, sigmas=COMFY_STAGE_23_SIGMAS, seed=seed_3,
         )
+        timings["stage_3"] = _now() - _t
 
         # ── Decode.
+        _t = _now()
         (frames,) = _invoke(
             self._n["VAEDecodeTiled"], samples=video_3, vae=self._vae, **COMFY_DECODE_TILING,
         )
+        timings["vae_decode"] = _now() - _t
+
+        _t = _now()
         (audio,) = _invoke(self._n["LTXVAudioVAEDecode"], samples=audio_3, audio_vae=self._audio_vae)
+        timings["audio_decode"] = _now() - _t
+
+        # Structured per-stage timing log for Round 3 diagnostics. Sum approximates
+        # the pipeline call's wall time (the wrapper in triple_stages_comfyui.py
+        # reports the total separately).
+        logger.info(
+            "stage_timings=%s sum=%.2fs",
+            {k: round(v, 2) for k, v in timings.items()},
+            sum(timings.values()),
+        )
         return frames, audio
 
     def encode_to_mp4(

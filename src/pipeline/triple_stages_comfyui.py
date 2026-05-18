@@ -101,7 +101,14 @@ class TripleStagesComfyUIMixin:
             if has_image:
                 from src.pipeline.inputs import materialize_image
 
+                _t_image = time.perf_counter()
                 image_path = materialize_image(image_url, image_b64)
+                logger.info(
+                    "Job %s: image materialize %.2fs (src=%s)",
+                    job_id,
+                    time.perf_counter() - _t_image,
+                    "url" if image_url is not None else "b64",
+                )
 
             gen_w, gen_h, out_w, out_h = _resolve_aspect_ratio(
                 aspect_ratio, image_path,
