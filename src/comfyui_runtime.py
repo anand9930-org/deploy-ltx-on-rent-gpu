@@ -79,7 +79,19 @@ def _patch_comfyui_vae_inplace(comfyui_path: str) -> None:
     with open(sd_py, "r", encoding="utf-8") as f:
         src = f.read()
     if bad not in src:
-        return  # already patched OR upstream changed the pattern
+        # Either already patched or the pattern shifted upstream. We do NOT
+        # rely on this patch being the only protection: see the instance-level
+        # `vae.process_output = ...` reassignment in
+        # src/pipeline/triple_stages_comfyui_graph.py, added after a 2026-05-18
+        # incident where this file-content patch silently no-op'd on a fresh
+        # GPU Hub pod. Log loudly here so we never silently fall back again.
+        logger.warning(
+            "comfy/sd.py at %s does not contain the expected in-place pattern; "
+            "skipping file-content patch (instance-level patch in "
+            "triple_stages_comfyui_graph.py is load-bearing)",
+            sd_py,
+        )
+        return
     with open(sd_py, "w", encoding="utf-8") as f:
         f.write(src.replace(bad, good))
     logger.info("Patched %s: in-place VAE post-process -> non-in-place clamp", sd_py)

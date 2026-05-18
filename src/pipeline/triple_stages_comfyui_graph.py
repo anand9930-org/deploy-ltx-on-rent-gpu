@@ -255,6 +255,21 @@ class TripleStagesComfyUIGraphPipeline:
         # ── Loaders (once) ──────────────────────────────────────────────────
         (upscaler,) = _invoke(LatentUpscaleModelLoader, model_name=COMFY_UPSCALER_NAME)
         model, _clip_unused, vae = _invoke(CheckpointLoaderSimple, ckpt_name=COMFY_CKPT_NAME)
+
+        # Defensive: replace the VAE's in-place process_output lambda with a
+        # non-in-place equivalent. ComfyUI's default at comfy/sd.py:458 (SHA
+        # 64b8457f) does `image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)` which
+        # raises "Inplace update to inference tensor outside InferenceMode is
+        # not allowed" on torch 2.10+ — the path VAEDecodeTiled hits via
+        # decode_tiled_3d. The companion file-content patch in
+        # src/comfyui_runtime.py::_patch_comfyui_vae_inplace silently no-op'd
+        # on a fresh pod boot (2026-05-18 incident on u7658-55cy-ce8c409d)
+        # and the bug resurfaced. Patching the instance is deterministic —
+        # no dependence on file state, encoding, or boot ordering.
+        import torch  # noqa: PLC0415 — keep module-level import-free (no-torch test env)
+
+        vae.process_output = lambda image: torch.clamp((image + 1.0) / 2.0, 0.0, 1.0)
+
         (lora_model,) = _invoke(
             LoraLoaderModelOnly,
             lora_name=COMFY_DISTILLED_LORA_NAME,
