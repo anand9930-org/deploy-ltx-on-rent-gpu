@@ -110,6 +110,27 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
             "checkout is missing from the image (see Dockerfile)."
         )
 
+    # Pre-comfy torch knobs (no-op on cpu_only build-time check).
+    # - cudnn.benchmark: autotunes the conv algorithm per input shape. Our
+    #   3-stage cascade runs identical shapes on every request, so requests
+    #   2..N reuse the cached plans. First-request cost is a one-time
+    #   ~100-400 ms autotune per unique shape; subsequent calls hit cache.
+    #   cudnn picks among numerically-equivalent algorithms (selection by
+    #   wall-clock, not output), so the chosen kernel is deterministic at
+    #   fixed shape — no quality regression. Avoided via `--fast autotune`
+    #   because ComfyUI issue #9779 reports a 123 s first-run stall on long
+    #   workflows under that umbrella; setting the torch flag directly is
+    #   surgical and won't drift if upstream rebundles `autotune`.
+    # - set_float32_matmul_precision("high"): no-op on the BF16/FP8 cascade
+    #   today (no FP32 matmul nodes), but cheap insurance + documents intent
+    #   if a future node introduces an FP32 path. Already the torch 2.11
+    #   default on Ampere+; explicit setting equals status quo.
+    if not cpu_only:
+        import torch
+
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     # Patch comfy/sd.py BEFORE any comfy.* import (see helper docstring for why).
     _patch_comfyui_vae_inplace(comfyui_path)
 
@@ -121,13 +142,25 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     # that's the wrong argv. Feed a clean one for the duration of the bootstrap.
     #
     # On the runtime path (cpu_only=False), inject:
-    #   --highvram              Disable ComfyUI's dynamic model offload (see
-    #                           comfy/cli_args.py and comfy/model_management.py::
-    #                           enables_dynamic_vram). The 96 GB RTX PRO 6000
-    #                           Blackwell fits the entire ~64 GB cascade
-    #                           resident; we never want model_management
-    #                           swapping weights between requests.
-    #   --reserve-vram 2        Keep ~2 GB headroom for transient allocations.
+    #   --gpu-only              Pin the entire pipeline (UNet, VAE, text encoder)
+    #                           to GPU and disable ComfyUI's dynamic model
+    #                           offload. Strictly stronger than `--highvram`:
+    #                           both map to VRAMState.HIGH_VRAM in
+    #                           comfy/model_management.py (lines 423-429 at SHA
+    #                           64b8457f), but `--gpu-only` additionally forces
+    #                           the Gemma 12B text encoder / CLIP to stay GPU-
+    #                           resident across requests instead of getting
+    #                           bounced back to CPU by the smart-memory path.
+    #                           Single-pipeline BentoML worker on a 96 GB pod —
+    #                           zero risk, removes one CPU↔GPU round-trip per
+    #                           request.
+    #   --reserve-vram 0.5      Headroom for transient allocations. ComfyUI's
+    #                           Linux default is 400 MB; we previously carried
+    #                           2 GB without measured justification. On a 96 GB
+    #                           pod with ~60 GB resident cascade footprint,
+    #                           dropping to 0.5 GB returns 1.5 GB of transient
+    #                           headroom and never approaches the residual
+    #                           ~30 GB free pool.
     #
     # `--fast fp8_matrix_mult` was tried in Phase 1.6d (commit e27c941) for a
     # ~16% speedup on the FP8 matmul path, then rolled back in Phase 1.6g after
@@ -138,13 +171,15 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     # the image-conditioning signal — the model "free-runs" from the prompt.
     # The proper future-work FP8 path is cu130 + ComfyUI's `comfy_kitchen` CUDA
     # backend (gated at `torch.version.cuda >= (13,)` in comfy/quant_ops.py),
-    # which has per-module FP8 enable lists that skip cross-attention. Gated
-    # on RunPod fleet driver upgrade to 580+.
+    # which has per-module FP8 enable lists that skip cross-attention. Whether
+    # the kitchen path is already routing FP8 matmuls on our cu130 stack (i.e.
+    # whether the LTX-2.3 safetensors carries `quant_config` metadata) is a
+    # pending probe — see plan mutable-orbiting-hickey.md Phase 2.
     #
     # The build-time node-contract check (cpu_only=True) doesn't load weights,
     # so these flags are no-ops there — keep the clean argv to avoid surprises.
     saved_argv = sys.argv
-    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--highvram", "--reserve-vram", "2"]
+    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--gpu-only", "--reserve-vram", "0.5"]
     try:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
