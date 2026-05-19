@@ -10,6 +10,8 @@ local ``.env``.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +33,12 @@ class Settings(BaseSettings):
 
     # ── ComfyUI graph runtime ───────────────────────────────────────────
     comfyui_path: str = "/app/ComfyUI"
+    # VRAM mode passed to ComfyUI at boot. `gpu-only` (default): everything
+    # GPU-resident, no offload. `normalvram`: dynamic offload; unlocks
+    # PR #13618's LTX block prefetch in ComfyUI >= 783782d5d7. `highvram`:
+    # same VRAM state as gpu-only but doesn't pin text encoders. Toggled via
+    # COMFYUI_VRAM_MODE env var for A/B testing without code edits.
+    comfyui_vram_mode: Literal["gpu-only", "normalvram", "highvram"] = "gpu-only"
 
     # ── Supabase Storage ────────────────────────────────────────────────
     supabase_url: str | None = None

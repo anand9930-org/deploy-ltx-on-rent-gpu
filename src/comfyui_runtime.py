@@ -153,26 +153,32 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     # ComfyUI's cli_args parses sys.argv at first import; under `bentoml serve`
     # that's the wrong argv. Feed a clean one for the duration of the bootstrap.
     #
-    # On the runtime path (cpu_only=False), inject:
-    #   --gpu-only              Pin the entire pipeline (UNet, VAE, text encoder)
-    #                           to GPU and disable ComfyUI's dynamic model
-    #                           offload. Strictly stronger than `--highvram`:
-    #                           both map to VRAMState.HIGH_VRAM in
-    #                           comfy/model_management.py (lines 423-429 at SHA
-    #                           64b8457f), but `--gpu-only` additionally forces
-    #                           the Gemma 12B text encoder / CLIP to stay GPU-
-    #                           resident across requests instead of getting
-    #                           bounced back to CPU by the smart-memory path.
-    #                           Single-pipeline BentoML worker on a 96 GB pod —
-    #                           zero risk, removes one CPU↔GPU round-trip per
-    #                           request.
-    #   --reserve-vram 0.5      Headroom for transient allocations. ComfyUI's
-    #                           Linux default is 400 MB; we previously carried
-    #                           2 GB without measured justification. On a 96 GB
-    #                           pod with ~60 GB resident cascade footprint,
-    #                           dropping to 0.5 GB returns 1.5 GB of transient
-    #                           headroom and never approaches the residual
-    #                           ~30 GB free pool.
+    # On the runtime path (cpu_only=False), the VRAM mode is settings-driven
+    # (COMFYUI_VRAM_MODE env var; default "gpu-only"). Options:
+    #
+    #   --gpu-only    Default. Pin the entire pipeline (UNet, VAE, text
+    #                 encoder) to GPU and disable ComfyUI's dynamic model
+    #                 offload. Strictly stronger than `--highvram`: both map
+    #                 to VRAMState.HIGH_VRAM in comfy/model_management.py
+    #                 (lines 423-429 at SHA 64b8457f), but `--gpu-only`
+    #                 additionally forces the Gemma 12B text encoder / CLIP
+    #                 to stay GPU-resident across requests.
+    #
+    #   --normalvram  Enables ComfyUI's dynamic VRAM management — and on
+    #                 ComfyUI >= 783782d5d7 (PR #13618, 2026-05-02), unlocks
+    #                 the LTX block prefetch + async LoRA load. PR claims
+    #                 ~12-14% speedup on LTX-2 FP8 (RTX 4090/5090). Trade-off
+    #                 is CPU<->GPU offload latency that may or may not be
+    #                 net-positive on our 96 GB resident-pipeline setup.
+    #                 A/B vs --gpu-only after bumping COMFYUI_SHA.
+    #
+    #   --highvram    Same VRAM state as --gpu-only but doesn't pin text
+    #                 encoders. Provided for completeness; rarely useful
+    #                 for our pattern.
+    #
+    #   --reserve-vram 0.5      Headroom for transient allocations on the
+    #                           96 GB pod. ComfyUI's Linux default is 400 MB;
+    #                           0.5 GB is comfortable for our cascade.
     #
     # `--fast fp8_matrix_mult` was tried in Phase 1.6d (commit e27c941) for a
     # ~16% speedup on the FP8 matmul path, then rolled back in Phase 1.6g after
@@ -191,7 +197,14 @@ def bootstrap_once(comfyui_path: str, model_dir: str, cpu_only: bool = False) ->
     # The build-time node-contract check (cpu_only=True) doesn't load weights,
     # so these flags are no-ops there — keep the clean argv to avoid surprises.
     saved_argv = sys.argv
-    sys.argv = ["comfyui"] if cpu_only else ["comfyui", "--gpu-only", "--reserve-vram", "0.5"]
+    if cpu_only:
+        sys.argv = ["comfyui"]
+    else:
+        from src.config import get_settings  # noqa: PLC0415 — lazy, settings reads env
+
+        vram_flag = f"--{get_settings().comfyui_vram_mode}"
+        sys.argv = ["comfyui", vram_flag, "--reserve-vram", "0.5"]
+        logger.info("ComfyUI launch args: %s", sys.argv[1:])
     try:
         import comfy.options  # must precede any other comfy import (so cli_args parses our clean argv)
 
